@@ -1,23 +1,17 @@
-# ============================================================
-# AI VOICE BOT
 # voice.py
 # ============================================================
-#
-# نظام الصوت الكامل للبوت
-#
-# المسؤوليات:
-# - استقبال صوت Discord
-# - إنشاء Audio Sink
-# - تجميع الصوت لكل مستخدم
-# - اكتشاف نهاية الكلام
-# - حماية الذاكرة
-# - تحويل صوت Discord إلى صيغة Gemini
+# Cloud Voice AI — Discord Voice Engine
+# ============================================================
+# مسؤول عن:
+# - دخول الروم الصوتي
+# - استقبال صوت المستخدمين
+# - تجميع PCM
+# - تحويل Discord Audio إلى 16kHz Mono WAV
 # - إرسال الصوت إلى Gemini
-# - تشغيل رد Gemini الصوتي
-# - إدارة Voice Session
-# - إدارة الذاكرة
-# - تغيير صوت البوت
-#
+# - استقبال الرد الصوتي
+# - تحويل Gemini TTS إلى Discord PCM
+# - تشغيل الرد داخل الروم
+# - إدارة الذاكرة والإحصائيات
 # ============================================================
 
 from __future__ import annotations
@@ -27,18 +21,14 @@ import io
 import logging
 import time
 import wave
-
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
 from discord.ext import commands, voice_recv
 
 from config import (
-    VOICE_SILENCE_TIMEOUT,
-    MIN_AUDIO_SECONDS,
-    MAX_AUDIO_SECONDS,
-    MAX_AUDIO_BUFFER_BYTES,
     MAX_MEMORY_MESSAGES,
     DEFAULT_GEMINI_VOICE,
     GEMINI_VOICES,
@@ -47,228 +37,350 @@ from config import (
 from gemini import GeminiEngine
 
 
-# ============================================================
-# LOGGER
-# ============================================================
-
-logger = logging.getLogger(
-    "ai_voice_bot.voice"
-)
+logger = logging.getLogger("cloud_voice_ai.voice")
 
 
 # ============================================================
-# DISCORD AUDIO FORMAT
+# AUDIO FORMAT
 # ============================================================
 
+# Discord voice receive/playback format
 PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2
 
-
-# ============================================================
-# GEMINI AUDIO FORMAT
-# ============================================================
-
+# Gemini STT input
 GEMINI_SAMPLE_RATE = 16000
 GEMINI_CHANNELS = 1
 GEMINI_SAMPLE_WIDTH = 2
 
-
-# ============================================================
-# GEMINI TTS AUDIO FORMAT
-# ============================================================
-
+# Gemini TTS output
 TTS_SAMPLE_RATE = 24000
 TTS_CHANNELS = 1
 TTS_SAMPLE_WIDTH = 2
 
 
 # ============================================================
-# USER AUDIO BUFFER
+# AUDIO LIMITS
+# ============================================================
+
+# لا نعتمد على متغيرات config القديمة.
+SILENCE_TIMEOUT = 1.20
+MIN_AUDIO_SECONDS = 0.35
+MAX_AUDIO_SECONDS = 15.0
+
+MAX_AUDIO_BUFFER_BYTES = (
+    PCM_SAMPLE_RATE
+    * PCM_CHANNELS
+    * PCM_SAMPLE_WIDTH
+    * int(MAX_AUDIO_SECONDS)
+)
+
+MAX_USERS_TRACKED = 50
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def pcm_duration(
+    pcm: bytes,
+    sample_rate: int = PCM_SAMPLE_RATE,
+    channels: int = PCM_CHANNELS,
+    sample_width: int = PCM_SAMPLE_WIDTH,
+) -> float:
+    if not pcm:
+        return 0.0
+
+    bytes_per_second = sample_rate * channels * sample_width
+
+    if bytes_per_second <= 0:
+        return 0.0
+
+    return len(pcm) / bytes_per_second
+
+
+def pcm_to_wav(pcm_data: bytes) -> bytes:
+    """
+    Discord:
+        48000 Hz
+        stereo
+        signed 16-bit PCM
+
+    Gemini STT:
+        16000 Hz
+        mono
+        signed 16-bit PCM
+
+    نحول الصوت يدويًا بدون audioop/audioop-lts
+    حتى يشتغل على Python 3.11 في FadeHost.
+    """
+
+    if not pcm_data:
+        raise ValueError("PCM data is empty.")
+
+    # --------------------------------------------------------
+    # 48k stereo -> 16k mono
+    # --------------------------------------------------------
+
+    source_frame_size = PCM_CHANNELS * PCM_SAMPLE_WIDTH
+
+    usable_length = (
+        len(pcm_data) // source_frame_size
+    ) * source_frame_size
+
+    pcm_data = pcm_data[:usable_length]
+
+    if not pcm_data:
+        raise ValueError("PCM data has no complete frames.")
+
+    output = bytearray()
+
+    # كل 3 frames من 48k = frame واحد تقريبًا من 16k
+    for index in range(0, len(pcm_data), source_frame_size * 3):
+        frame_block = pcm_data[
+            index:index + source_frame_size * 3
+        ]
+
+        if len(frame_block) < source_frame_size:
+            break
+
+        # أخذ frame واحد من كل 3 frames
+        frame = frame_block[:source_frame_size]
+
+        left = int.from_bytes(
+            frame[0:2],
+            byteorder="little",
+            signed=True,
+        )
+
+        right = int.from_bytes(
+            frame[2:4],
+            byteorder="little",
+            signed=True,
+        )
+
+        mono = (left + right) // 2
+
+        mono = int(
+            clamp(
+                mono,
+                -32768,
+                32767,
+            )
+        )
+
+        output.extend(
+            int(mono).to_bytes(
+                2,
+                byteorder="little",
+                signed=True,
+            )
+        )
+
+    if not output:
+        raise ValueError("Audio conversion produced no data.")
+
+    # --------------------------------------------------------
+    # WAV wrapper
+    # --------------------------------------------------------
+
+    buffer = io.BytesIO()
+
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(GEMINI_CHANNELS)
+        wav.setsampwidth(GEMINI_SAMPLE_WIDTH)
+        wav.setframerate(GEMINI_SAMPLE_RATE)
+        wav.writeframes(bytes(output))
+
+    return buffer.getvalue()
+
+
+def tts_pcm_to_discord_pcm(tts_pcm: bytes) -> bytes:
+    """
+    Gemini TTS:
+        24000 Hz
+        mono
+        16-bit PCM
+
+    Discord playback:
+        48000 Hz
+        stereo
+        16-bit PCM
+
+    بدون audioop.
+    """
+
+    if not tts_pcm:
+        raise ValueError("TTS PCM data is empty.")
+
+    usable_length = (
+        len(tts_pcm) // TTS_SAMPLE_WIDTH
+    ) * TTS_SAMPLE_WIDTH
+
+    tts_pcm = tts_pcm[:usable_length]
+
+    if not tts_pcm:
+        raise ValueError("Invalid TTS PCM data.")
+
+    output = bytearray()
+
+    # --------------------------------------------------------
+    # 24k -> 48k
+    # --------------------------------------------------------
+    # نكرر كل sample مرتين.
+    #
+    # Mono -> Stereo:
+    # نفس sample في Left + Right
+    # --------------------------------------------------------
+
+    for index in range(0, len(tts_pcm), 2):
+        sample = tts_pcm[index:index + 2]
+
+        if len(sample) < 2:
+            break
+
+        output.extend(sample)
+        output.extend(sample)
+
+        output.extend(sample)
+        output.extend(sample)
+
+    return bytes(output)
+
+
+def normalize_voice_name(name: str) -> str:
+    """
+    يحاول إيجاد اسم الصوت الصحيح من القائمة.
+    """
+
+    if not name:
+        return DEFAULT_GEMINI_VOICE
+
+    value = str(name).strip().lower()
+
+    for voice in GEMINI_VOICES:
+        if voice.lower() == value:
+            return voice
+
+    # aliases شائعة
+    aliases = {
+        "default": DEFAULT_GEMINI_VOICE,
+        "افتراضي": DEFAULT_GEMINI_VOICE,
+        "kore": "Kore",
+        "k": "Kore",
+    }
+
+    return aliases.get(
+        value,
+        DEFAULT_GEMINI_VOICE,
+    )
+
+
+# ============================================================
+# USER AUDIO STATE
 # ============================================================
 
 @dataclass
-class UserAudioBuffer:
-    """
-    مخزن صوت مؤقت لمستخدم واحد.
-
-    لا يتم حفظ الصوت بشكل دائم.
-    """
-
+class UserAudioState:
     user_id: int
 
-    username: str
+    username: str = "Unknown"
 
-    data: bytearray
+    chunks: list[bytes] = field(
+        default_factory=list
+    )
 
-    started_at: float
+    total_bytes: int = 0
 
-    last_packet_at: float
+    started_at: float = 0.0
 
-    packet_count: int = 0
+    last_audio_at: float = 0.0
 
-    # --------------------------------------------------------
-    # ADD
-    # --------------------------------------------------------
+    processing: bool = False
 
-    def add(
-        self,
-        pcm: bytes,
-    ) -> None:
+    lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock
+    )
 
+    def start(self, username: str) -> None:
+        self.username = username
+        self.started_at = time.monotonic()
+        self.last_audio_at = self.started_at
+        self.total_bytes = 0
+        self.chunks.clear()
+
+    def append(self, pcm: bytes) -> None:
         if not pcm:
             return
 
-        self.data.extend(
-            pcm
-        )
+        self.chunks.append(pcm)
+        self.total_bytes += len(pcm)
+        self.last_audio_at = time.monotonic()
 
-        self.last_packet_at = (
-            time.monotonic()
-        )
+    def build_audio(self) -> bytes:
+        return b"".join(self.chunks)
 
-        self.packet_count += 1
+    def clear(self) -> None:
+        self.chunks.clear()
+        self.total_bytes = 0
+        self.started_at = 0.0
+        self.last_audio_at = 0.0
 
-    # --------------------------------------------------------
-    # CLEAR
-    # --------------------------------------------------------
-
-    def clear(
-        self,
-    ) -> None:
-
-        self.data.clear()
-
-        now = time.monotonic()
-
-        self.started_at = now
-
-        self.last_packet_at = now
-
-        self.packet_count = 0
-
-    # --------------------------------------------------------
-    # SIZE
-    # --------------------------------------------------------
-
-    def size(
-        self,
-    ) -> int:
-
-        return len(
-            self.data
-        )
-
-    # --------------------------------------------------------
-    # DURATION
-    # --------------------------------------------------------
-
-    def duration(
-        self,
-    ) -> float:
-
-        if not self.data:
-            return 0.0
-
-        bytes_per_second = (
-            PCM_SAMPLE_RATE
-            * PCM_CHANNELS
-            * PCM_SAMPLE_WIDTH
-        )
-
-        return (
-            len(self.data)
-            / bytes_per_second
-        )
-
-    # --------------------------------------------------------
-    # SILENCE
-    # --------------------------------------------------------
-
-    def silence_duration(
-        self,
-    ) -> float:
-
-        return (
-            time.monotonic()
-            - self.last_packet_at
-        )
-
-    # --------------------------------------------------------
-    # SNAPSHOT
-    # --------------------------------------------------------
-
-    def snapshot(
-        self,
-    ) -> bytes:
-
-        return bytes(
-            self.data
+    @property
+    def duration(self) -> float:
+        return pcm_duration(
+            self.total_bytes.to_bytes(
+                8,
+                "little",
+            )
+            if False
+            else b"",
         )
 
 
 # ============================================================
-# AUDIO SINK
+# DISCORD AUDIO SINK
 # ============================================================
 
-class VoiceAISink(
-    voice_recv.AudioSink
-):
+class VoiceAISink(voice_recv.AudioSink):
     """
-    يستقبل PCM من Discord.
-
-    Discord
-        ↓
-    VoiceAISink
-        ↓
-    UserAudioBuffer
-        ↓
-    VoiceSession
+    يستقبل صوت المستخدمين من Discord.
     """
 
     def __init__(
         self,
         session: "VoiceSession",
     ):
-
         super().__init__()
 
         self.session = session
 
-        self.buffers: dict[
+        self.users: dict[
             int,
-            UserAudioBuffer,
+            UserAudioState,
         ] = {}
-
-        self.processing_users: set[
-            int
-        ] = set()
 
         self.closed = False
 
-        self.monitor_task = (
-            asyncio.create_task(
-                self.monitor_buffers()
-            )
-        )
+        self._monitor_task: Optional[
+            asyncio.Task
+        ] = None
 
-    # ========================================================
-    # WANTS OPUS
-    # ========================================================
+    # --------------------------------------------------------
+    # Discord voice receive
+    # --------------------------------------------------------
 
-    def wants_opus(
-        self,
-    ) -> bool:
-
+    def wants_opus(self) -> bool:
         return False
-
-    # ========================================================
-    # WRITE
-    # ========================================================
 
     def write(
         self,
-        user,
+        user: discord.User | discord.Member,
         data,
     ) -> None:
 
@@ -278,281 +390,225 @@ class VoiceAISink(
         if user is None:
             return
 
-        # ----------------------------------------------------
-        # تجاهل البوتات
-        # ----------------------------------------------------
+        user_id = user.id
 
-        if getattr(
-            user,
-            "bot",
-            False,
-        ):
+        # ----------------------------------------------
+        # PCM packet
+        # ----------------------------------------------
 
-            return
-
-        # ----------------------------------------------------
-        # الحصول على PCM
-        # ----------------------------------------------------
-
-        pcm = getattr(
-            data,
-            "pcm",
-            None,
-        )
+        pcm = getattr(data, "pcm", None)
 
         if not pcm:
             return
 
-        user_id = int(
-            user.id
-        )
+        if len(pcm) <= 0:
+            return
 
-        username = getattr(
-            user,
-            "display_name",
-            getattr(
-                user,
-                "name",
-                str(user_id),
-            ),
-        )
+        # ----------------------------------------------
+        # Get/create user state
+        # ----------------------------------------------
 
-        # ----------------------------------------------------
-        # إنشاء Buffer
-        # ----------------------------------------------------
+        state = self.users.get(user_id)
 
-        buffer = self.buffers.get(
-            user_id
-        )
+        if state is None:
+            if len(self.users) >= MAX_USERS_TRACKED:
+                return
 
-        if buffer is None:
-
-            now = time.monotonic()
-
-            buffer = UserAudioBuffer(
+            state = UserAudioState(
                 user_id=user_id,
-                username=username,
-                data=bytearray(),
-                started_at=now,
-                last_packet_at=now,
             )
 
-            self.buffers[
-                user_id
-            ] = buffer
+            self.users[user_id] = state
 
-        # ----------------------------------------------------
-        # حماية الذاكرة
-        # ----------------------------------------------------
+        # ----------------------------------------------
+        # Start new speech segment
+        # ----------------------------------------------
+
+        if not state.chunks:
+            state.start(
+                getattr(
+                    user,
+                    "display_name",
+                    getattr(
+                        user,
+                        "name",
+                        "Unknown",
+                    ),
+                )
+            )
+
+        # ----------------------------------------------
+        # Prevent giant buffers
+        # ----------------------------------------------
 
         if (
-            buffer.size()
-            + len(pcm)
+            state.total_bytes + len(pcm)
             > MAX_AUDIO_BUFFER_BYTES
         ):
-
-            logger.warning(
-                "Audio buffer limit reached for %s",
-                username,
-            )
-
             asyncio.create_task(
-                self.flush_user(
-                    user_id
+                self._flush_user(
+                    user_id,
+                    reason="max_buffer",
                 )
             )
 
             return
 
-        # ----------------------------------------------------
-        # إضافة الصوت
-        # ----------------------------------------------------
+        # ----------------------------------------------
+        # Store PCM
+        # ----------------------------------------------
 
-        buffer.add(
-            pcm
+        state.append(pcm)
+
+        # ----------------------------------------------
+        # Maximum duration
+        # ----------------------------------------------
+
+        duration = (
+            state.total_bytes
+            / (
+                PCM_SAMPLE_RATE
+                * PCM_CHANNELS
+                * PCM_SAMPLE_WIDTH
+            )
         )
 
-    # ========================================================
-    # MONITOR
-    # ========================================================
+        if duration >= MAX_AUDIO_SECONDS:
+            asyncio.create_task(
+                self._flush_user(
+                    user_id,
+                    reason="max_duration",
+                )
+            )
 
-    async def monitor_buffers(
-        self,
-    ) -> None:
+    # --------------------------------------------------------
+    # Monitor
+    # --------------------------------------------------------
 
+    async def start_monitor(self) -> None:
+        if self._monitor_task is not None:
+            return
+
+        self._monitor_task = asyncio.create_task(
+            self._monitor_loop()
+        )
+
+    async def _monitor_loop(self) -> None:
         try:
-
             while not self.closed:
+                await asyncio.sleep(0.15)
 
-                await asyncio.sleep(
-                    0.20
-                )
+                now = time.monotonic()
 
-                now = (
-                    time.monotonic()
-                )
-
-                for user_id, buffer in list(
-                    self.buffers.items()
+                for user_id, state in list(
+                    self.users.items()
                 ):
-
-                    # ----------------------------------------
-                    # لا تعالج نفس المستخدم مرتين
-                    # ----------------------------------------
-
-                    if (
-                        user_id
-                        in self.processing_users
-                    ):
-
+                    if not state.chunks:
                         continue
 
-                    duration = (
-                        buffer.duration()
-                    )
+                    if state.processing:
+                        continue
 
                     silence = (
-                        now
-                        - buffer.last_packet_at
+                        now - state.last_audio_at
                     )
 
-                    # ----------------------------------------
-                    # المقطع قصير جدًا
-                    # ----------------------------------------
-
-                    if (
-                        duration
-                        < MIN_AUDIO_SECONDS
-                    ):
-
-                        continue
-
-                    # ----------------------------------------
-                    # الحد الأقصى
-                    # ----------------------------------------
-
-                    if (
-                        duration
-                        >= MAX_AUDIO_SECONDS
-                    ):
-
-                        await self.flush_user(
-                            user_id
-                        )
-
-                        continue
-
-                    # ----------------------------------------
-                    # نهاية الكلام
-                    # ----------------------------------------
-
-                    if (
-                        silence
-                        >= VOICE_SILENCE_TIMEOUT
-                    ):
-
-                        await self.flush_user(
-                            user_id
+                    if silence >= SILENCE_TIMEOUT:
+                        await self._flush_user(
+                            user_id,
+                            reason="silence",
                         )
 
         except asyncio.CancelledError:
-
-            return
+            pass
 
         except Exception:
-
             logger.exception(
-                "Audio monitor crashed"
+                "Voice monitor crashed."
             )
 
-    # ========================================================
-    # FLUSH USER
-    # ========================================================
+    # --------------------------------------------------------
+    # Flush user
+    # --------------------------------------------------------
 
-    async def flush_user(
+    async def _flush_user(
         self,
         user_id: int,
+        reason: str = "unknown",
     ) -> None:
 
-        buffer = self.buffers.get(
-            user_id
-        )
+        state = self.users.get(user_id)
 
-        if buffer is None:
+        if state is None:
             return
 
-        if (
-            user_id
-            in self.processing_users
-        ):
+        async with state.lock:
 
-            return
+            if state.processing:
+                return
 
-        audio = (
-            buffer.snapshot()
-        )
+            if not state.chunks:
+                return
 
-        username = (
-            buffer.username
-        )
+            state.processing = True
 
-        buffer.clear()
+            try:
+                audio = state.build_audio()
 
-        if not audio:
-            return
+                duration = (
+                    len(audio)
+                    / (
+                        PCM_SAMPLE_RATE
+                        * PCM_CHANNELS
+                        * PCM_SAMPLE_WIDTH
+                    )
+                )
 
-        if (
-            len(audio)
-            < 1000
-        ):
+                logger.debug(
+                    "Captured %.2fs from user %s (%s).",
+                    duration,
+                    state.username,
+                    reason,
+                )
 
-            return
+                # تجاهل المقاطع القصيرة جدًا
+                if duration < MIN_AUDIO_SECONDS:
+                    state.clear()
+                    return
 
-        self.processing_users.add(
-            user_id
-        )
+                state.clear()
 
-        try:
+                await self.session.process_user_audio(
+                    user_id=user_id,
+                    username=state.username,
+                    pcm=audio,
+                )
 
-            await self.session.process_user_audio(
-                user_id=user_id,
-                username=username,
-                pcm=audio,
-            )
+            except Exception:
+                logger.exception(
+                    "Failed processing audio from user %s.",
+                    user_id,
+                )
 
-        except Exception:
+            finally:
+                state.processing = False
 
-            logger.exception(
-                "Failed processing audio from %s",
-                username,
-            )
+    # --------------------------------------------------------
+    # Cleanup
+    # --------------------------------------------------------
 
-        finally:
-
-            self.processing_users.discard(
-                user_id
-            )
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
-
-    def cleanup(
-        self,
-    ) -> None:
-
-        if self.closed:
-            return
-
+    def cleanup(self) -> None:
         self.closed = True
 
-        self.buffers.clear()
+        if self._monitor_task:
+            self._monitor_task.cancel()
 
-        if self.monitor_task:
+            self._monitor_task = None
 
-            self.monitor_task.cancel()
+        for state in self.users.values():
+            state.clear()
 
-            self.monitor_task = None
+        self.users.clear()
 
 
 # ============================================================
@@ -561,144 +617,144 @@ class VoiceAISink(
 
 class VoiceSession:
     """
-    جلسة AI Voice كاملة لسيرفر واحد.
-
-    كل Guild له Session واحدة.
+    جلسة Voice AI كاملة لسيرفر واحد.
     """
 
     def __init__(
         self,
-        bot,
+        bot: commands.Bot,
         guild: discord.Guild,
-        voice_client: voice_recv.VoiceRecvClient,
-        text_channel: discord.abc.Messageable,
     ):
-
         self.bot = bot
-
         self.guild = guild
 
-        self.voice_client = (
-            voice_client
-        )
-
-        self.text_channel = (
-            text_channel
-        )
-
-        # ----------------------------------------------------
-        # Gemini
-        # ----------------------------------------------------
-
-        self.ai = GeminiEngine()
-
-        # ----------------------------------------------------
-        # Sink
-        # ----------------------------------------------------
+        self.voice_client: Optional[
+            voice_recv.VoiceRecvClient
+        ] = None
 
         self.sink: Optional[
             VoiceAISink
         ] = None
 
-        # ----------------------------------------------------
-        # Listening
-        # ----------------------------------------------------
+        self.ai = GeminiEngine()
 
-        self.listening = False
-
-        # ----------------------------------------------------
-        # Processing
-        # ----------------------------------------------------
-
-        self.processing = False
-
-        self.processing_lock = (
-            asyncio.Lock()
-        )
-
-        # ----------------------------------------------------
-        # Memory
-        # ----------------------------------------------------
-
-        self.memory: list[
-            dict
-        ] = []
-
-        # ----------------------------------------------------
-        # Voice
-        # ----------------------------------------------------
-
-        self.voice_name = (
+        self.voice_name = normalize_voice_name(
             DEFAULT_GEMINI_VOICE
         )
 
-        # ----------------------------------------------------
-        # Statistics
-        # ----------------------------------------------------
+        self.memory: dict[
+            int,
+            deque,
+        ] = defaultdict(
+            lambda: deque(
+                maxlen=MAX_MEMORY_MESSAGES
+            )
+        )
+
+        self.processing_users: set[int] = set()
+
+        self.started_at = time.monotonic()
 
         self.messages_processed = 0
 
-        self.audio_received = 0
-
-        self.audio_responses = 0
+        self.audio_processed = 0
 
         self.errors = 0
 
-        # ----------------------------------------------------
-        # Creation time
-        # ----------------------------------------------------
+        self.total_response_time = 0.0
 
-        self.created_at = (
-            time.monotonic()
-        )
-
-        # ----------------------------------------------------
-        # Stop flag
-        # ----------------------------------------------------
-
-        self.stopping = False
+        self._play_lock = asyncio.Lock()
 
     # ========================================================
-    # START
+    # JOIN
     # ========================================================
 
     async def start(
         self,
+        channel: discord.VoiceChannel,
     ) -> None:
 
-        if self.stopping:
-            return
+        if self.voice_client is not None:
+            if self.voice_client.is_connected():
+                return
 
         logger.info(
-            "Starting VoiceSession for guild %s",
-            self.guild.id,
+            "Connecting to voice channel: %s",
+            channel.name,
         )
 
-        # ----------------------------------------------------
-        # إنشاء Sink
-        # ----------------------------------------------------
+        try:
+            vc = await channel.connect(
+                cls=voice_recv.VoiceRecvClient,
+                reconnect=True,
+            )
 
-        self.sink = VoiceAISink(
-            self
-        )
+            self.voice_client = vc
 
-        # ----------------------------------------------------
-        # بدء استقبال الصوت
-        # ----------------------------------------------------
+            self.sink = VoiceAISink(self)
 
-        self.voice_client.listen(
-            self.sink
-        )
+            vc.listen(self.sink)
 
-        self.listening = True
+            await self.sink.start_monitor()
+
+            logger.info(
+                "Connected to %s.",
+                channel.name,
+            )
+
+        except Exception:
+            self.voice_client = None
+            self.sink = None
+
+            logger.exception(
+                "Failed to connect to voice channel."
+            )
+
+            raise
+
+    # ========================================================
+    # LEAVE
+    # ========================================================
+
+    async def stop(self) -> None:
+
+        if self.sink is not None:
+            try:
+                self.sink.cleanup()
+            except Exception:
+                logger.exception(
+                    "Sink cleanup failed."
+                )
+
+            self.sink = None
+
+        if self.voice_client is not None:
+
+            try:
+                if self.voice_client.is_listening():
+                    self.voice_client.stop_listening()
+            except Exception:
+                pass
+
+            try:
+                if self.voice_client.is_connected():
+                    await self.voice_client.disconnect(
+                        force=True
+                    )
+            except Exception:
+                logger.exception(
+                    "Voice disconnect failed."
+                )
+
+            self.voice_client = None
 
         logger.info(
-            "Voice listening started for guild %s",
+            "Voice session stopped for guild %s.",
             self.guild.id,
         )
 
     # ========================================================
-    # PROCESS AUDIO
+    # PROCESS USER AUDIO
     # ========================================================
 
     async def process_user_audio(
@@ -708,197 +764,185 @@ class VoiceSession:
         pcm: bytes,
     ) -> None:
 
-        if self.stopping:
-            return
-
         if not pcm:
             return
 
-        self.audio_received += len(
-            pcm
-        )
-
-        # ----------------------------------------------------
-        # طلب AI واحد في نفس الوقت
-        # ----------------------------------------------------
-
-        async with self.processing_lock:
-
-            self.processing = True
-
-            try:
-
-                # --------------------------------------------
-                # تحويل Discord PCM
-                # إلى WAV 16kHz Mono
-                # --------------------------------------------
-
-                wav_data = (
-                    pcm_to_wav(
-                        pcm
-                    )
-                )
-
-                if not wav_data:
-                    return
-
-                # --------------------------------------------
-                # إحصائيات
-                # --------------------------------------------
-
-                if hasattr(
-                    self.bot,
-                    "stats",
-                ):
-
-                    self.bot.stats[
-                        "ai_requests"
-                    ] += 1
-
-                # --------------------------------------------
-                # Gemini
-                # --------------------------------------------
-
-                result = (
-                    await self.ai.process_voice(
-                        audio=wav_data,
-                        memory=self.memory,
-                        username=username,
-                        voice=self.voice_name,
-                    )
-                )
-
-                if not result:
-                    return
-
-                text = result.get(
-                    "text"
-                )
-
-                response = result.get(
-                    "response"
-                )
-
-                audio = result.get(
-                    "audio"
-                )
-
-                # --------------------------------------------
-                # لا يوجد نص
-                # --------------------------------------------
-
-                if not text:
-                    return
-
-                logger.info(
-                    "[%s] %s: %s",
-                    username,
-                    user_id,
-                    text,
-                )
-
-                # --------------------------------------------
-                # Memory
-                # --------------------------------------------
-
-                self.add_memory(
-                    role="user",
-                    content=text,
-                    username=username,
-                )
-
-                if response:
-
-                    self.add_memory(
-                        role="assistant",
-                        content=response,
-                    )
-
-                self.messages_processed += 1
-
-                if hasattr(
-                    self.bot,
-                    "stats",
-                ):
-
-                    self.bot.stats[
-                        "messages_processed"
-                    ] += 1
-
-                # --------------------------------------------
-                # إرسال النص للشات
-                # --------------------------------------------
-
-                await self.send_transcript(
-                    username=username,
-                    text=text,
-                    response=response,
-                )
-
-                # --------------------------------------------
-                # تشغيل TTS
-                # --------------------------------------------
-
-                if audio:
-
-                    await self.play_audio(
-                        audio
-                    )
-
-                    self.audio_responses += 1
-
-            except Exception:
-
-                self.errors += 1
-
-                if hasattr(
-                    self.bot,
-                    "stats",
-                ):
-
-                    self.bot.stats[
-                        "errors"
-                    ] += 1
-
-                logger.exception(
-                    "AI audio processing error"
-                )
-
-            finally:
-
-                self.processing = False
-
-    # ========================================================
-    # SEND TRANSCRIPT
-    # ========================================================
-
-    async def send_transcript(
-        self,
-        username: str,
-        text: str,
-        response: Optional[str],
-    ) -> None:
-
-        if not self.text_channel:
+        if user_id in self.processing_users:
             return
+
+        self.processing_users.add(user_id)
+
+        started = time.monotonic()
 
         try:
 
-            await self.text_channel.send(
-                f"🎤 **{username}:** {text}"
+            logger.info(
+                "Processing speech from %s.",
+                username,
             )
 
-            if response:
+            # ------------------------------------------------
+            # Convert Discord PCM -> Gemini WAV
+            # ------------------------------------------------
 
-                await self.text_channel.send(
-                    f"🤖 **AI:** {response}"
+            wav_audio = await asyncio.to_thread(
+                pcm_to_wav,
+                pcm,
+            )
+
+            # ------------------------------------------------
+            # Memory
+            # ------------------------------------------------
+
+            memory = list(
+                self.memory[user_id]
+            )
+
+            # ------------------------------------------------
+            # Gemini
+            # ------------------------------------------------
+
+            result = await self.ai.process_voice(
+                audio=wav_audio,
+                memory=memory,
+                username=username,
+                voice=self.voice_name,
+            )
+
+            if not result:
+                return
+
+            transcript = (
+                result.get("transcript")
+                or result.get("text")
+                or ""
+            )
+
+            response_text = (
+                result.get("response")
+                or result.get("reply")
+                or ""
+            )
+
+            audio_response = (
+                result.get("audio")
+                or result.get("tts")
+                or result.get("audio_data")
+            )
+
+            # ------------------------------------------------
+            # Update memory
+            # ------------------------------------------------
+
+            if transcript:
+                self.memory[user_id].append(
+                    {
+                        "role": "user",
+                        "content": transcript,
+                    }
                 )
 
-        except Exception as error:
+            if response_text:
+                self.memory[user_id].append(
+                    {
+                        "role": "assistant",
+                        "content": response_text,
+                    }
+                )
 
-            logger.warning(
-                "Could not send transcript: %s",
-                error,
+            self.messages_processed += 1
+            self.audio_processed += 1
+
+            # ------------------------------------------------
+            # Send text to Discord
+            # ------------------------------------------------
+
+            await self.send_text_response(
+                username=username,
+                transcript=transcript,
+                response=response_text,
+            )
+
+            # ------------------------------------------------
+            # Play TTS
+            # ------------------------------------------------
+
+            if audio_response:
+                await self.play_audio(
+                    audio_response
+                )
+
+            elapsed = (
+                time.monotonic()
+                - started
+            )
+
+            self.total_response_time += elapsed
+
+            logger.info(
+                "Processed %s in %.2fs.",
+                username,
+                elapsed,
+            )
+
+        except Exception:
+            self.errors += 1
+
+            logger.exception(
+                "Voice AI processing failed for %s.",
+                username,
+            )
+
+        finally:
+            self.processing_users.discard(
+                user_id
+            )
+
+    # ========================================================
+    # TEXT RESPONSE
+    # ========================================================
+
+    async def send_text_response(
+        self,
+        username: str,
+        transcript: str,
+        response: str,
+    ) -> None:
+
+        if not response:
+            return
+
+        # نبحث عن channel نصي مناسب.
+        channel = None
+
+        for candidate in self.guild.text_channels:
+
+            if candidate.permissions_for(
+                self.guild.me
+            ).send_messages:
+
+                channel = candidate
+                break
+
+        if channel is None:
+            return
+
+        # لا نرسل التسجيل كاملًا إذا كان طويلًا.
+        transcript_display = transcript[:500]
+
+        content = (
+            f"🎙️ **{discord.utils.escape_markdown(username)}**\n"
+            f"> {transcript_display}\n\n"
+            f"🤖 {response}"
+        )
+
+        try:
+            await channel.send(
+                content[:2000]
+            )
+        except Exception:
+            logger.exception(
+                "Failed sending text response."
             )
 
     # ========================================================
@@ -907,632 +951,225 @@ class VoiceSession:
 
     async def play_audio(
         self,
-        audio: bytes,
+        audio_data: bytes,
     ) -> None:
 
-        if self.stopping:
+        if not audio_data:
             return
 
-        if not audio:
+        if self.voice_client is None:
             return
 
-        if not self.voice_client:
+        if not self.voice_client.is_connected():
             return
 
-        # ----------------------------------------------------
-        # تحويل TTS من:
-        #
-        # 24kHz Mono
-        #
-        # إلى:
-        #
-        # 48kHz Stereo
-        # ----------------------------------------------------
-
-        discord_audio = (
-            tts_pcm_to_discord_pcm(
-                audio
-            )
-        )
-
-        if not discord_audio:
-            return
-
-        # ----------------------------------------------------
-        # الانتظار حتى ينتهي الصوت السابق
-        # ----------------------------------------------------
-
-        while (
-            self.voice_client.is_playing()
-            and not self.stopping
-        ):
-
-            await asyncio.sleep(
-                0.10
-            )
-
-        if self.stopping:
-            return
-
-        # ----------------------------------------------------
-        # Raw PCM
-        # ----------------------------------------------------
-
-        stream = io.BytesIO(
-            discord_audio
-        )
-
-        source = discord.PCMAudio(
-            stream,
-            sample_width=2,
-        )
-
-        finished = (
-            asyncio.Event()
-        )
-
-        loop = (
-            asyncio.get_running_loop()
-        )
-
-        def after_play(
-            error,
-        ):
-
-            if error:
-
-                logger.error(
-                    "Audio playback error: %s",
-                    error,
-                )
-
-            loop.call_soon_threadsafe(
-                finished.set
-            )
-
-        try:
-
-            self.voice_client.play(
-                source,
-                after=after_play,
-            )
-
-            await finished.wait()
-
-        except Exception:
-
-            logger.exception(
-                "Could not play AI audio"
-            )
+        async with self._play_lock:
 
             try:
 
-                source.cleanup()
+                # ------------------------------------------------
+                # Gemini TTS PCM -> Discord PCM
+                # ------------------------------------------------
+
+                discord_pcm = await asyncio.to_thread(
+                    tts_pcm_to_discord_pcm,
+                    audio_data,
+                )
+
+                if not discord_pcm:
+                    return
+
+                # ------------------------------------------------
+                # Stop previous playback
+                # ------------------------------------------------
+
+                if self.voice_client.is_playing():
+                    self.voice_client.stop()
+
+                source = discord.PCMAudio(
+                    io.BytesIO(
+                        discord_pcm
+                    ),
+                    sample_width=2,
+                )
+
+                finished = asyncio.Event()
+
+                def after_play(error):
+                    if error:
+                        logger.error(
+                            "Discord playback error: %s",
+                            error,
+                        )
+
+                    self.bot.loop.call_soon_threadsafe(
+                        finished.set
+                    )
+
+                self.voice_client.play(
+                    source,
+                    after=after_play,
+                )
+
+                try:
+                    await asyncio.wait_for(
+                        finished.wait(),
+                        timeout=60,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Audio playback timed out."
+                    )
+
+                    if self.voice_client.is_playing():
+                        self.voice_client.stop()
 
             except Exception:
-                pass
+                self.errors += 1
+
+                logger.exception(
+                    "Failed playing TTS audio."
+                )
 
     # ========================================================
-    # CHANGE VOICE
+    # VOICE SETTINGS
     # ========================================================
 
     def set_voice(
         self,
         voice_name: str,
-    ) -> bool:
-
-        voice_name = (
-            voice_name.strip()
-        )
-
-        if not voice_name:
-            return False
-
-        if (
-            voice_name
-            not in GEMINI_VOICES
-        ):
-
-            return False
-
-        self.voice_name = (
-            voice_name
-        )
-
-        logger.info(
-            "Guild %s changed AI voice to %s",
-            self.guild.id,
-            voice_name,
-        )
-
-        return True
-
-    # ========================================================
-    # GET VOICE
-    # ========================================================
-
-    def get_voice(
-        self,
     ) -> str:
 
+        normalized = normalize_voice_name(
+            voice_name
+        )
+
+        self.voice_name = normalized
+
+        return normalized
+
+    def get_voice(self) -> str:
         return self.voice_name
 
-    # ========================================================
-    # LIST VOICES
-    # ========================================================
-
-    def list_voices(
-        self,
-    ) -> list[str]:
-
-        return list(
-            GEMINI_VOICES
-        )
+    def list_voices(self) -> list[str]:
+        return list(GEMINI_VOICES)
 
     # ========================================================
-    # ADD MEMORY
-    # ========================================================
-
-    def add_memory(
-        self,
-        role: str,
-        content: str,
-        username: Optional[str] = None,
-    ) -> None:
-
-        if not content:
-            return
-
-        item = {
-            "role": role,
-            "content": content,
-        }
-
-        if username:
-
-            item[
-                "username"
-            ] = username
-
-        self.memory.append(
-            item
-        )
-
-        if (
-            len(self.memory)
-            > MAX_MEMORY_MESSAGES
-        ):
-
-            overflow = (
-                len(self.memory)
-                - MAX_MEMORY_MESSAGES
-            )
-
-            del self.memory[
-                0:overflow
-            ]
-
-    # ========================================================
-    # CLEAR MEMORY
+    # MEMORY
     # ========================================================
 
     def clear_memory(
         self,
+        user_id: Optional[int] = None,
     ) -> None:
 
-        self.memory.clear()
-
-        try:
-
-            self.ai.clear_memory()
-
-        except Exception:
-
-            pass
-
-    # ========================================================
-    # MEMORY SIZE
-    # ========================================================
-
-    def memory_size(
-        self,
-    ) -> int:
-
-        return len(
-            self.memory
-        )
-
-    # ========================================================
-    # RESET
-    # ========================================================
-
-    async def reset(
-        self,
-    ) -> None:
-
-        self.clear_memory()
-
-        try:
-
-            await self.ai.reset()
-
-        except Exception as error:
-
-            logger.warning(
-                "AI reset warning: %s",
-                error,
-            )
-
-    # ========================================================
-    # STOP
-    # ========================================================
-
-    async def stop(
-        self,
-    ) -> None:
-
-        if self.stopping:
-            return
-
-        self.stopping = True
-
-        self.listening = False
-
-        logger.info(
-            "Stopping VoiceSession for guild %s",
-            self.guild.id,
-        )
-
-        # ----------------------------------------------------
-        # إيقاف Sink
-        # ----------------------------------------------------
-
-        if self.sink:
+        if user_id is None:
+            self.memory.clear()
 
             try:
-
-                self.sink.cleanup()
-
+                self.ai.clear_memory()
             except Exception:
-
                 pass
 
-            self.sink = None
+            return
 
-        # ----------------------------------------------------
-        # إيقاف الاستماع
-        # ----------------------------------------------------
+        self.memory.pop(
+            user_id,
+            None,
+        )
+
+    def get_memory(
+        self,
+        user_id: int,
+    ) -> list:
+
+        return list(
+            self.memory.get(
+                user_id,
+                [],
+            )
+        )
+
+    # ========================================================
+    # STATS
+    # ========================================================
+
+    @property
+    def uptime(self) -> float:
+        return (
+            time.monotonic()
+            - self.started_at
+        )
+
+    @property
+    def average_response_time(
+        self,
+    ) -> float:
+
+        if self.messages_processed <= 0:
+            return 0.0
+
+        return (
+            self.total_response_time
+            / self.messages_processed
+        )
+
+    def get_stats(self) -> dict:
+
+        return {
+            "guild_id": self.guild.id,
+            "voice_connected": (
+                self.voice_client is not None
+                and self.voice_client.is_connected()
+            ),
+            "voice_channel": (
+                self.voice_client.channel.name
+                if (
+                    self.voice_client
+                    and self.voice_client.channel
+                )
+                else None
+            ),
+            "voice": self.voice_name,
+            "messages_processed": (
+                self.messages_processed
+            ),
+            "audio_processed": (
+                self.audio_processed
+            ),
+            "errors": self.errors,
+            "average_response_time": (
+                round(
+                    self.average_response_time,
+                    2,
+                )
+            ),
+            "uptime": round(
+                self.uptime,
+                1,
+            ),
+            "processing_users": len(
+                self.processing_users
+            ),
+        }
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
+    async def close(self) -> None:
+
+        await self.stop()
 
         try:
-
-            self.voice_client.stop_listening()
-
-        except Exception:
-
-            pass
-
-        # ----------------------------------------------------
-        # إيقاف Gemini
-        # ----------------------------------------------------
-
-        try:
-
             await self.ai.close()
-
-        except Exception as error:
-
-            logger.warning(
-                "Gemini close error: %s",
-                error,
+        except Exception:
+            logger.exception(
+                "Gemini engine close failed."
             )
 
-        # ----------------------------------------------------
-        # تنظيف الذاكرة
-        # ----------------------------------------------------
-
         self.memory.clear()
-
-        logger.info(
-            "VoiceSession stopped for guild %s",
-            self.guild.id,
-        )
-
-
-# ============================================================
-# PCM 48kHz Stereo
-# ->
-# PCM 16kHz Mono
-# ============================================================
-
-def downsample_pcm_48k_to_16k(
-    pcm: bytes,
-) -> bytes:
-
-    """
-    تحويل Discord PCM:
-
-        48000Hz
-        Stereo
-        16-bit
-
-    إلى:
-
-        16000Hz
-        Mono
-        16-bit
-
-    بدون NumPy أو audioop.
-    """
-
-    if not pcm:
-        return b""
-
-    frame_size = (
-        PCM_CHANNELS
-        * PCM_SAMPLE_WIDTH
-    )
-
-    if (
-        len(pcm)
-        < frame_size
-    ):
-
-        return b""
-
-    total_frames = (
-        len(pcm)
-        // frame_size
-    )
-
-    target_frames = (
-        total_frames // 3
-    )
-
-    output = bytearray(
-        target_frames
-        * GEMINI_SAMPLE_WIDTH
-    )
-
-    output_index = 0
-
-    for index in range(
-        target_frames
-    ):
-
-        source_frame = (
-            index * 3
-        )
-
-        offset = (
-            source_frame
-            * frame_size
-        )
-
-        # ----------------------------------------------------
-        # Left
-        # ----------------------------------------------------
-
-        left = int.from_bytes(
-            pcm[
-                offset:
-                offset + 2
-            ],
-            byteorder="little",
-            signed=True,
-        )
-
-        # ----------------------------------------------------
-        # Right
-        # ----------------------------------------------------
-
-        right = int.from_bytes(
-            pcm[
-                offset + 2:
-                offset + 4
-            ],
-            byteorder="little",
-            signed=True,
-        )
-
-        # ----------------------------------------------------
-        # Stereo -> Mono
-        # ----------------------------------------------------
-
-        mono = (
-            left + right
-        ) // 2
-
-        mono = max(
-            -32768,
-            min(
-                32767,
-                mono,
-            ),
-        )
-
-        output[
-            output_index:
-            output_index + 2
-        ] = int(
-            mono
-        ).to_bytes(
-            2,
-            byteorder="little",
-            signed=True,
-        )
-
-        output_index += 2
-
-    return bytes(
-        output
-    )
-
-
-# ============================================================
-# PCM -> WAV
-# ============================================================
-
-def pcm_to_wav(
-    pcm: bytes,
-) -> bytes:
-
-    """
-    يحول Discord PCM إلى WAV مناسب لـ Gemini.
-
-    Discord:
-        48kHz Stereo PCM
-
-    Gemini:
-        16kHz Mono WAV
-    """
-
-    if not pcm:
-        return b""
-
-    gemini_pcm = (
-        downsample_pcm_48k_to_16k(
-            pcm
-        )
-    )
-
-    if not gemini_pcm:
-        return b""
-
-    output = io.BytesIO()
-
-    with wave.open(
-        output,
-        "wb",
-    ) as wav:
-
-        wav.setnchannels(
-            GEMINI_CHANNELS
-        )
-
-        wav.setsampwidth(
-            GEMINI_SAMPLE_WIDTH
-        )
-
-        wav.setframerate(
-            GEMINI_SAMPLE_RATE
-        )
-
-        wav.writeframes(
-            gemini_pcm
-        )
-
-    return output.getvalue()
-
-
-# ============================================================
-# TTS 24kHz Mono
-# ->
-# Discord 48kHz Stereo
-# ============================================================
-
-def tts_pcm_to_discord_pcm(
-    pcm: bytes,
-) -> bytes:
-
-    """
-    Gemini TTS:
-
-        24000Hz
-        Mono
-        16-bit
-
-    Discord:
-
-        48000Hz
-        Stereo
-        16-bit
-
-    نرفع معدل العينات من 24k إلى 48k
-    بتكرار كل عينة مرتين،
-    ثم نحول Mono إلى Stereo.
-    """
-
-    if not pcm:
-        return b""
-
-    frame_size = (
-        TTS_CHANNELS
-        * TTS_SAMPLE_WIDTH
-    )
-
-    if (
-        len(pcm)
-        < frame_size
-    ):
-
-        return b""
-
-    sample_count = (
-        len(pcm)
-        // frame_size
-    )
-
-    output = bytearray(
-        sample_count
-        * 2
-        * PCM_CHANNELS
-        * PCM_SAMPLE_WIDTH
-    )
-
-    output_index = 0
-
-    for index in range(
-        sample_count
-    ):
-
-        offset = (
-            index
-            * frame_size
-        )
-
-        sample = int.from_bytes(
-            pcm[
-                offset:
-                offset + 2
-            ],
-            byteorder="little",
-            signed=True,
-        )
-
-        sample_bytes = int(
-            sample
-        ).to_bytes(
-            2,
-            byteorder="little",
-            signed=True,
-        )
-
-        # ----------------------------------------------------
-        # 24k -> 48k
-        # كل عينة تصبح عينتين
-        # ----------------------------------------------------
-
-        for _ in range(2):
-
-            # Left
-            output[
-                output_index:
-                output_index + 2
-            ] = sample_bytes
-
-            output_index += 2
-
-            # Right
-            output[
-                output_index:
-                output_index + 2
-            ] = sample_bytes
-
-            output_index += 2
-
-    return bytes(
-        output
-    )
+        self.processing_users.clear()
 
 
 # ============================================================
@@ -1540,54 +1177,160 @@ def tts_pcm_to_discord_pcm(
 # ============================================================
 
 async def send_voice_list(
-    ctx: commands.Context,
-    session: VoiceSession,
-):
-
-    voices = (
-        session.list_voices()
-    )
+    interaction: discord.Interaction,
+    voices: list[str],
+) -> None:
+    """
+    يرسل قائمة الأصوات في Discord.
+    """
 
     if not voices:
-
-        await ctx.send(
-            "❌ ما فيه أصوات متاحة."
+        await interaction.response.send_message(
+            "❌ ما فيه أصوات متاحة حاليًا.",
+            ephemeral=True,
         )
-
         return
 
-    lines = []
+    lines = [
+        "🎙️ **Gemini Voices**",
+        "",
+    ]
 
     for index, voice in enumerate(
         voices,
         start=1,
     ):
-
-        current = (
-            " ← الحالي"
-            if voice
-            == session.get_voice()
-            else ""
-        )
-
         lines.append(
-            f"`{index}.` **{voice}**{current}"
+            f"`{index:02d}` • **{voice}**"
         )
 
-    embed = discord.Embed(
-        title="🎙️ أصوات Gemini",
-        description="\n".join(
-            lines
-        ),
-        color=discord.Color.blurple(),
+    lines.extend(
+        [
+            "",
+            "💡 استخدم `/setvoice` لاختيار الصوت.",
+        ]
     )
 
-    embed.set_footer(
-        text=(
-            "استخدم أمر /setvoice لاختيار الصوت"
+    text = "\n".join(lines)
+
+    # Discord limit
+    if len(text) > 1900:
+        text = text[:1890] + "\n…"
+
+    await interaction.response.send_message(
+        text,
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# SESSION FACTORY
+# ============================================================
+
+class VoiceSessionManager:
+    """
+    يدير جلسات Voice AI لكل Guild.
+    """
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+    ):
+        self.bot = bot
+
+        self.sessions: dict[
+            int,
+            VoiceSession,
+        ] = {}
+
+    def get(
+        self,
+        guild_id: int,
+    ) -> Optional[VoiceSession]:
+
+        return self.sessions.get(
+            guild_id
         )
-    )
 
-    await ctx.send(
-        embed=embed
-    )
+    async def create(
+        self,
+        guild: discord.Guild,
+        channel: discord.VoiceChannel,
+    ) -> VoiceSession:
+
+        existing = self.sessions.get(
+            guild.id
+        )
+
+        if existing is not None:
+            if (
+                existing.voice_client
+                and existing.voice_client.is_connected()
+            ):
+                return existing
+
+            await existing.close()
+
+            self.sessions.pop(
+                guild.id,
+                None,
+            )
+
+        session = VoiceSession(
+            bot=self.bot,
+            guild=guild,
+        )
+
+        await session.start(
+            channel
+        )
+
+        self.sessions[guild.id] = session
+
+        return session
+
+    async def remove(
+        self,
+        guild_id: int,
+    ) -> None:
+
+        session = self.sessions.pop(
+            guild_id,
+            None,
+        )
+
+        if session is None:
+            return
+
+        await session.close()
+
+    async def close_all(self) -> None:
+
+        sessions = list(
+            self.sessions.values()
+        )
+
+        self.sessions.clear()
+
+        for session in sessions:
+            try:
+                await session.close()
+            except Exception:
+                logger.exception(
+                    "Failed closing voice session."
+                )
+
+
+# ============================================================
+# EXPORTS
+# ============================================================
+
+__all__ = [
+    "VoiceSession",
+    "VoiceAISink",
+    "VoiceSessionManager",
+    "send_voice_list",
+    "pcm_to_wav",
+    "tts_pcm_to_discord_pcm",
+    "normalize_voice_name",
+]
