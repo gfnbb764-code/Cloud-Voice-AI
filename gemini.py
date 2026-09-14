@@ -1,30 +1,36 @@
 # gemini.py
 # ============================================================
-# Cloud Voice AI — Gemini Flash-Lite + Local Piper
+# Cloud Voice AI — Groq + Local Piper
 #
 # Pipeline:
+#
 # Discord PCM
 #     ↓
-# Gemini 3.5 Flash-Lite (audio understanding / STT)
+# WAV 16kHz mono
 #     ↓
-# Gemini 3.5 Flash-Lite (AI)
+# Groq Whisper Large V3 Turbo
+#     ↓
+# Groq GPT-OSS 20B
 #     ↓
 # Local Piper TTS
 #     ↓
 # Discord PCM
+#
+# Gemini is no longer used by this file.
 # ============================================================
 
 from __future__ import annotations
 
 import asyncio
 import audioop
+import io
 import logging
+import wave
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
-from google import genai
-from google.genai import types
+from groq import Groq
 
 from piper import PiperVoice
 from piper.config import SynthesisConfig
@@ -36,9 +42,6 @@ from config import (
     API_RETRY_DELAY_SECONDS,
     API_TIMEOUT_SECONDS,
     DEFAULT_GEMINI_VOICE,
-    GEMINI_API_KEY,
-    GEMINI_MAX_OUTPUT_TOKENS,
-    GEMINI_TEMPERATURE,
     GEMINI_VOICES,
     MEMORY_ENABLED,
     MAX_MEMORY_MESSAGES,
@@ -46,29 +49,38 @@ from config import (
     normalize_voice_name,
 )
 
-
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+import os
+
+
+GROQ_API_KEY = (
+    os.getenv("GROQ_API_KEY", "")
+    or ""
+).strip()
 
 
 # ============================================================
 # MODELS
 # ============================================================
 
-# IMPORTANT:
-# Do NOT use gemini-3.5-transcribe.
-#
-# Gemini 3.5 Flash-Lite accepts audio input and is used for
-# both transcription and response generation.
-#
-# This prevents the bot from consuming the dedicated
-# gemini-3.5-transcribe daily quota.
-# ============================================================
+# Speech-to-text
+GROQ_STT_MODEL = "whisper-large-v3-turbo"
 
-LIGHT_MODEL = "gemini-3.5-flash-lite"
+# Chat / AI
+GROQ_CHAT_MODEL = "openai/gpt-oss-20b"
 
-# TTS is NOT Gemini.
-# It is 100% local Piper.
-LOCAL_TTS_NAME = "Piper/ar_JO-kareem-low"
+# Local TTS
+PIPER_VOICE_MODEL = "ar_JO-kareem-low"
+
+LOCAL_TTS_NAME = (
+    f"Piper/{PIPER_VOICE_MODEL}"
+)
 
 
 # ============================================================
@@ -77,8 +89,7 @@ LOCAL_TTS_NAME = "Piper/ar_JO-kareem-low"
 
 DEFAULT_AUDIO_MIME_TYPE = "audio/wav"
 
-# Piper output returned to voice.py:
-# 24kHz mono 16-bit PCM
+# Piper output exposed to voice.py
 PIPER_OUTPUT_SAMPLE_RATE = 24000
 PIPER_OUTPUT_CHANNELS = 1
 
@@ -94,17 +105,25 @@ DEFAULT_SPEECH_SPEED = 1.0
 
 
 # ============================================================
-# PIPER
+# PIPER STORAGE
 # ============================================================
 
-PIPER_VOICE_MODEL = "ar_JO-kareem-low"
-PIPER_MODEL_DIR = Path("piper_models")
+PIPER_MODEL_DIR = Path(
+    "piper_models"
+)
 
 _PIPER_VOICE: PiperVoice | None = None
 _PIPER_LOAD_LOCK: asyncio.Lock | None = None
 
 
-def _clean_text(value: Any) -> str:
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def _clean_text(
+    value: Any,
+) -> str:
+
     if value is None:
         return ""
 
@@ -120,7 +139,10 @@ def _limit_text(
     text: str,
     maximum: int,
 ) -> str:
-    text = _clean_text(text)
+
+    text = _clean_text(
+        text
+    )
 
     if len(text) <= maximum:
         return text
@@ -131,7 +153,10 @@ def _limit_text(
 def _safe_username(
     username: str,
 ) -> str:
-    username = _clean_text(username)
+
+    username = _clean_text(
+        username
+    )
 
     if not username:
         return "User"
@@ -262,172 +287,7 @@ def _build_character_prompt(
 
 
 # ============================================================
-# RESPONSE EXTRACTION
-# ============================================================
-
-def _extract_response_text(
-    response: Any,
-) -> str:
-
-    results: list[str] = []
-
-    try:
-
-        candidates = (
-            getattr(
-                response,
-                "candidates",
-                None,
-            )
-            or []
-        )
-
-        for candidate in candidates:
-
-            content = getattr(
-                candidate,
-                "content",
-                None,
-            )
-
-            if content is None:
-                continue
-
-            parts = (
-                getattr(
-                    content,
-                    "parts",
-                    None,
-                )
-                or []
-            )
-
-            for part in parts:
-
-                text = getattr(
-                    part,
-                    "text",
-                    None,
-                )
-
-                if text:
-
-                    cleaned = _clean_text(
-                        text
-                    )
-
-                    if (
-                        cleaned
-                        and cleaned not in results
-                    ):
-                        results.append(
-                            cleaned
-                        )
-
-    except Exception:
-        logger.exception(
-            "Failed to extract Gemini response"
-        )
-
-    if results:
-        return "\n".join(
-            results
-        ).strip()
-
-    try:
-
-        fallback = getattr(
-            response,
-            "text",
-            None,
-        )
-
-        if fallback:
-            return _clean_text(
-                fallback
-            )
-
-    except Exception:
-        pass
-
-    return ""
-
-
-# ============================================================
-# ERROR HELPERS
-# ============================================================
-
-def _error_text(
-    error: Exception,
-) -> str:
-
-    try:
-        return str(error).lower()
-    except Exception:
-        return ""
-
-
-def _is_quota_error(
-    error: Exception,
-) -> bool:
-
-    text = _error_text(
-        error
-    )
-
-    markers = (
-        "resource_exhausted",
-        "quota exceeded",
-        "free_tier",
-        "quota_value",
-        "generativelanguage.googleapis.com",
-    )
-
-    return (
-        "429" in text
-        and any(
-            marker in text
-            for marker in markers
-        )
-    )
-
-
-def _is_retryable_error(
-    error: Exception,
-) -> bool:
-
-    if _is_quota_error(
-        error
-    ):
-        return False
-
-    text = _error_text(
-        error
-    )
-
-    if "429" in text:
-        return False
-
-    retry_markers = (
-        "timeout",
-        "timed out",
-        "temporarily unavailable",
-        "service unavailable",
-        "internal server error",
-        "500",
-        "502",
-        "503",
-        "504",
-    )
-
-    return any(
-        marker in text
-        for marker in retry_markers
-    )
-
-
-# ============================================================
-# VOICE TEXT CLEANUP
+# MARKDOWN CLEANUP
 # ============================================================
 
 def _strip_markdown_for_voice(
@@ -485,7 +345,7 @@ def _strip_markdown_for_voice(
 
 
 # ============================================================
-# PIPER MODEL
+# PIPER
 # ============================================================
 
 def _piper_paths() -> tuple[Path, Path]:
@@ -611,7 +471,6 @@ def _synthesize_piper_sync(
     )
 
     chunks: list[bytes] = []
-
     first_chunk = True
 
     for chunk in voice.synthesize(
@@ -669,10 +528,14 @@ def _synthesize_piper_sync(
 
 
 # ============================================================
-# GEMINI ENGINE
+# GROQ ENGINE
 # ============================================================
 
 class GeminiEngine:
+    """
+    Kept under the old class name so the existing main.py and
+    voice.py do not need to be rewritten.
+    """
 
     def __init__(
         self,
@@ -685,30 +548,28 @@ class GeminiEngine:
 
         self.api_key = (
             api_key
-            or GEMINI_API_KEY
-        )
+            or GROQ_API_KEY
+        ).strip()
 
         if not self.api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY is missing."
+                "GROQ_API_KEY is missing."
             )
 
-        # FORCE Flash-Lite.
-        # Ignore old config.py model values.
         self.chat_model = (
             chat_model
-            or LIGHT_MODEL
+            or GROQ_CHAT_MODEL
         )
 
-        # FORCE Flash-Lite for audio understanding.
-        # This is intentional and prevents the bot from
-        # using gemini-3.5-transcribe.
-        self.transcribe_model = LIGHT_MODEL
+        self.transcribe_model = (
+            transcribe_model
+            or GROQ_STT_MODEL
+        )
 
-        # Backwards compatible attribute.
+        # Actual TTS remains local Piper.
         self.tts_model = LOCAL_TTS_NAME
 
-        self.client = genai.Client(
+        self.client = Groq(
             api_key=self.api_key
         )
 
@@ -753,8 +614,73 @@ class GeminiEngine:
         return normalized
 
     # ========================================================
-    # RETRY
+    # ERROR / RETRY
     # ========================================================
+
+    @staticmethod
+    def _error_text(
+        error: Exception,
+    ) -> str:
+
+        try:
+            return str(error).lower()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _is_quota_error(
+        cls,
+        error: Exception,
+    ) -> bool:
+
+        text = cls._error_text(
+            error
+        )
+
+        markers = (
+            "rate limit",
+            "rate_limit",
+            "quota",
+            "too many requests",
+            "429",
+        )
+
+        return any(
+            marker in text
+            for marker in markers
+        )
+
+    @classmethod
+    def _is_retryable_error(
+        cls,
+        error: Exception,
+    ) -> bool:
+
+        if cls._is_quota_error(
+            error
+        ):
+            return False
+
+        text = cls._error_text(
+            error
+        )
+
+        markers = (
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "service unavailable",
+            "internal server error",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+
+        return any(
+            marker in text
+            for marker in markers
+        )
 
     async def _with_retry(
         self,
@@ -777,7 +703,9 @@ class GeminiEngine:
             try:
 
                 return await asyncio.wait_for(
-                    operation(),
+                    asyncio.to_thread(
+                        operation
+                    ),
                     timeout=API_TIMEOUT_SECONDS,
                 )
 
@@ -785,15 +713,14 @@ class GeminiEngine:
 
                 last_error = error
 
-                if _is_quota_error(
+                if self._is_quota_error(
                     error
                 ):
 
                     self.quota_exhausted = True
 
                     logger.error(
-                        "%s stopped: Gemini quota exhausted. "
-                        "No retry will be performed.",
+                        "%s stopped: rate limit/quota.",
                         operation_name,
                     )
 
@@ -801,7 +728,7 @@ class GeminiEngine:
 
                 if (
                     attempt >= attempts
-                    or not _is_retryable_error(
+                    or not self._is_retryable_error(
                         error
                     )
                 ):
@@ -829,7 +756,7 @@ class GeminiEngine:
 
         self.failed_requests += 1
 
-        if last_error:
+        if last_error is not None:
             raise last_error
 
         raise RuntimeError(
@@ -837,8 +764,35 @@ class GeminiEngine:
         )
 
     # ========================================================
-    # AUDIO TRANSCRIPTION
+    # STT
     # ========================================================
+
+    def _transcribe_sync(
+        self,
+        audio: bytes,
+        language: str | None = None,
+    ):
+
+        filename = (
+            "discord_audio.wav"
+        )
+
+        kwargs: dict[str, Any] = {
+            "file": (
+                filename,
+                audio,
+            ),
+            "model": self.transcribe_model,
+            "response_format": "json",
+            "temperature": 0.0,
+        }
+
+        if language:
+            kwargs["language"] = language
+
+        return self.client.audio.transcriptions.create(
+            **kwargs
+        )
 
     async def transcribe(
         self,
@@ -850,43 +804,21 @@ class GeminiEngine:
         if not audio:
             return ""
 
-        async def operation():
-
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=LIGHT_MODEL,
-                contents=[
-                    types.Part.from_bytes(
-                        data=audio,
-                        mime_type=mime_type,
-                    ),
-                    (
-                        "Listen to this audio carefully.\n"
-                        "Transcribe exactly what the user said.\n"
-                        "The user may speak Arabic or English.\n"
-                        "Detect the spoken language automatically.\n"
-                        "Return ONLY the transcript.\n"
-                        "Do not translate.\n"
-                        "Do not summarize.\n"
-                        "Do not explain.\n"
-                        "Do not answer the user."
-                    ),
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=512,
-                ),
-            )
-
-            return response
-
+        # WAV is already what voice.py sends.
+        # Groq supports WAV input for transcription.
         response = await self._with_retry(
-            operation,
-            operation_name="Gemini STT",
+            lambda: self._transcribe_sync(
+                audio
+            ),
+            operation_name="Groq STT",
         )
 
-        transcript = _extract_response_text(
-            response
+        transcript = _clean_text(
+            getattr(
+                response,
+                "text",
+                "",
+            )
         )
 
         transcript = _limit_text(
@@ -897,7 +829,8 @@ class GeminiEngine:
         if transcript:
 
             logger.info(
-                "STT successful | transcript=%s",
+                "STT successful | model=%s | transcript=%s",
+                self.transcribe_model,
                 transcript,
             )
 
@@ -1003,20 +936,20 @@ class GeminiEngine:
         )
 
     # ========================================================
-    # CHAT CONTENT
+    # CHAT MESSAGES
     # ========================================================
 
-    def _build_chat_contents(
+    def _build_chat_messages(
         self,
         text: str,
         username: str,
         memory: Iterable[
             dict[str, str]
         ] | None = None,
-    ) -> list[types.Content]:
+    ) -> list[dict[str, str]]:
 
-        contents: list[
-            types.Content
+        messages: list[
+            dict[str, str]
         ] = []
 
         source_memory = (
@@ -1042,48 +975,79 @@ class GeminiEngine:
             if not content:
                 continue
 
-            sdk_role = (
-                "model"
-                if role in {
-                    "assistant",
-                    "model",
+            if role in {
+                "assistant",
+                "model",
+            }:
+
+                sdk_role = "assistant"
+
+            else:
+
+                sdk_role = "user"
+
+            messages.append(
+                {
+                    "role": sdk_role,
+                    "content": _limit_text(
+                        content,
+                        800,
+                    ),
                 }
-                else "user"
             )
 
-            contents.append(
-                types.Content(
-                    role=sdk_role,
-                    parts=[
-                        types.Part.from_text(
-                            text=_limit_text(
-                                content,
-                                800,
-                            )
-                        )
-                    ],
-                )
-            )
-
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(
-                        text=(
-                            f"{_safe_username(username)} said:\n"
-                            f"{_limit_text(text, MAX_TRANSCRIPT_LENGTH)}"
-                        )
-                    )
-                ],
-            )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"{_safe_username(username)} said:\n"
+                    f"{_limit_text(text, MAX_TRANSCRIPT_LENGTH)}"
+                ),
+            }
         )
 
-        return contents
+        return messages
 
     # ========================================================
-    # AI RESPONSE
+    # CHAT
     # ========================================================
+
+    def _generate_response_sync(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str,
+    ):
+
+        final_messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            *messages,
+        ]
+
+        return self.client.chat.completions.create(
+            model=self.chat_model,
+            messages=final_messages,
+            temperature=min(
+                float(
+                    os.getenv(
+                        "GEMINI_TEMPERATURE",
+                        "0.75",
+                    )
+                ),
+                0.8,
+            ),
+            max_tokens=min(
+                int(
+                    os.getenv(
+                        "GEMINI_MAX_OUTPUT_TOKENS",
+                        "700",
+                    )
+                ),
+                512,
+            ),
+        )
 
     async def generate_response(
         self,
@@ -1123,52 +1087,61 @@ class GeminiEngine:
             "You are speaking inside a Discord voice channel.\n"
             "Keep replies concise and natural.\n"
             "Usually answer in 1-3 short sentences.\n"
+            "Match the user's language.\n"
+            "If the user speaks Arabic, respond in Arabic.\n"
             "Do not use markdown.\n"
             "Do not use code blocks.\n"
             "Do not write long explanations unless explicitly asked."
         )
 
-        contents = (
-            self._build_chat_contents(
-                text,
-                username,
-                memory,
-            )
+        messages = self._build_chat_messages(
+            text,
+            username,
+            memory,
         )
-
-        async def operation():
-
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=LIGHT_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=final_system_prompt,
-                    temperature=min(
-                        float(
-                            GEMINI_TEMPERATURE
-                        ),
-                        0.8,
-                    ),
-                    max_output_tokens=min(
-                        int(
-                            GEMINI_MAX_OUTPUT_TOKENS
-                        ),
-                        512,
-                    ),
-                ),
-            )
-
-            return response
 
         response = await self._with_retry(
-            operation,
-            operation_name="Gemini AI",
+            lambda: self._generate_response_sync(
+                messages,
+                final_system_prompt,
+            ),
+            operation_name="Groq AI",
         )
 
-        answer = _extract_response_text(
-            response
-        )
+        answer = ""
+
+        try:
+
+            choices = (
+                getattr(
+                    response,
+                    "choices",
+                    None,
+                )
+                or []
+            )
+
+            if choices:
+
+                message = getattr(
+                    choices[0],
+                    "message",
+                    None,
+                )
+
+                answer = _clean_text(
+                    getattr(
+                        message,
+                        "content",
+                        "",
+                    )
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to extract Groq response"
+            )
 
         answer = _limit_text(
             answer,
@@ -1182,7 +1155,8 @@ class GeminiEngine:
         if answer:
 
             logger.info(
-                "AI response generated | response=%s",
+                "AI response generated | model=%s | response=%s",
+                self.chat_model,
                 answer,
             )
 
@@ -1215,8 +1189,10 @@ class GeminiEngine:
             else self.voice
         )
 
-        selected_speed = normalize_speech_speed(
-            speed
+        selected_speed = (
+            normalize_speech_speed(
+                speed
+            )
         )
 
         logger.info(
@@ -1226,7 +1202,9 @@ class GeminiEngine:
             selected_speed,
         )
 
-        voice_model = await _get_piper_voice()
+        voice_model = (
+            await _get_piper_voice()
+        )
 
         started = (
             asyncio.get_running_loop().time()
@@ -1273,7 +1251,7 @@ class GeminiEngine:
         return audio
 
     # ========================================================
-    # COMPLETE PIPELINE
+    # COMPLETE VOICE PIPELINE
     # ========================================================
 
     async def process_voice(
@@ -1347,7 +1325,7 @@ class GeminiEngine:
             )
 
             # ==================================================
-            # MEMORY
+            # MEMORY - USER
             # ==================================================
 
             self.add_user_message(
@@ -1381,12 +1359,16 @@ class GeminiEngine:
                 response
             )
 
+            # ==================================================
+            # MEMORY - ASSISTANT
+            # ==================================================
+
             self.add_assistant_message(
                 response
             )
 
             # ==================================================
-            # PIPER TTS
+            # LOCAL TTS
             # ==================================================
 
             selected_voice = (
@@ -1430,8 +1412,8 @@ class GeminiEngine:
                 "user=%s | stt=%s | chat=%s | "
                 "tts=%s | voice=%s | speed=%.2f",
                 username,
-                LIGHT_MODEL,
-                LIGHT_MODEL,
+                self.transcribe_model,
+                self.chat_model,
                 LOCAL_TTS_NAME,
                 selected_voice,
                 normalize_speech_speed(
@@ -1449,14 +1431,14 @@ class GeminiEngine:
                 str(error)
             )
 
-            if _is_quota_error(
+            if self._is_quota_error(
                 error
             ):
 
                 self.quota_exhausted = True
 
                 logger.error(
-                    "Gemini quota exhausted."
+                    "Groq rate limit/quota reached."
                 )
 
             else:
@@ -1489,8 +1471,10 @@ class GeminiEngine:
             "quota_exhausted": (
                 self.quota_exhausted
             ),
-            "chat_model": LIGHT_MODEL,
-            "transcribe_model": LIGHT_MODEL,
+            "chat_model": self.chat_model,
+            "transcribe_model": (
+                self.transcribe_model
+            ),
             "tts_model": LOCAL_TTS_NAME,
             "tts_local": True,
             "piper_voice": PIPER_VOICE_MODEL,
@@ -1504,28 +1488,10 @@ class GeminiEngine:
         self,
     ) -> None:
 
-        try:
+        # Groq client is synchronous and doesn't require
+        # an async close in the normal SDK usage.
 
-            close_method = getattr(
-                self.client,
-                "close",
-                None,
-            )
-
-            if close_method:
-
-                result = close_method()
-
-                if asyncio.iscoroutine(
-                    result
-                ):
-                    await result
-
-        except Exception:
-
-            logger.exception(
-                "Failed to close Gemini client"
-            )
+        self.client = None
 
 
 # ============================================================
@@ -1535,6 +1501,10 @@ class GeminiEngine:
 def create_gemini_engine() -> GeminiEngine:
     return GeminiEngine()
 
+
+# ============================================================
+# EXPORTS
+# ============================================================
 
 __all__ = [
     "GeminiEngine",
