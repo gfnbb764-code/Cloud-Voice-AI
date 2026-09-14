@@ -1,51 +1,43 @@
 # ============================================================
-# AI VOICE BOT
 # main.py
-# ============================================================
-#
-# Discord AI Voice Bot
-#
-# الوظائف الرئيسية:
-# - تشغيل البوت
-# - أوامر Discord
-# - الدخول والخروج من Voice
-# - إدارة جلسات السيرفر
-# - إدارة إعدادات السيرفر
-# - إدارة الذاكرة
-# - التحكم في حالة الصوت
-# - معالجة الأخطاء
-# - مراقبة Voice State
-# - Health / Ping
-#
-# يعتمد على:
-#   discord.py
-#   discord-ext-voice-recv
-#   Gemini API
-#
+# Gemini Discord AI Voice Bot
+# FINAL SLASH COMMAND VERSION
 # ============================================================
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import signal
-import sys
 import time
-
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
-from discord.ext import commands, voice_recv
+from discord import app_commands
+from discord.ext import commands
 
 from config import (
+    PROJECT_NAME,
+    PROJECT_VERSION,
+
     DISCORD_TOKEN,
-    BOT_PREFIX,
-    BOT_STATUS,
-    BOT_ACTIVITY,
-    MAX_MEMORY_MESSAGES,
+    DISCORD_STATUS,
+
+    DEFAULT_VOICE,
+    GEMINI_VOICES,
+
     MAX_GUILD_SESSIONS,
+    MAX_MEMORY_MESSAGES,
+
+    MEMORY_ENABLED,
+    ALLOW_VOICE_CHANGE,
+
+    DEBUG,
+    LOG_LEVEL,
+
+    validate_config,
+    normalize_voice_name,
 )
 
 from voice import VoiceSession
@@ -55,16 +47,11 @@ from voice import VoiceSession
 # LOGGING
 # ============================================================
 
-LOG_LEVEL = os.getenv(
-    "LOG_LEVEL",
-    "INFO"
-).upper()
-
 logging.basicConfig(
     level=getattr(
         logging,
         LOG_LEVEL,
-        logging.INFO
+        logging.INFO,
     ),
     format=(
         "%(asctime)s | "
@@ -74,9 +61,7 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(
-    "ai_voice_bot"
-)
+logger = logging.getLogger("GeminiBot")
 
 
 # ============================================================
@@ -88,1323 +73,1536 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
 intents.messages = True
-intents.message_content = True
+intents.message_content = False
 
 
 # ============================================================
-# BOT CLASS
+# BOT
 # ============================================================
 
-class AIVoiceBot(commands.Bot):
-    """
-    الكلاس الرئيسي للبوت.
-
-    يحتوي على:
-    - جلسات Voice
-    - إعدادات السيرفر
-    - ذاكرة المحادثة
-    - Locks لمنع العمليات المتزامنة
-    """
+class GeminiBot(commands.Bot):
 
     def __init__(self):
 
         super().__init__(
-            command_prefix=BOT_PREFIX,
+            command_prefix=commands.when_mentioned,
             intents=intents,
-            case_insensitive=True,
             help_command=None,
         )
 
         # ----------------------------------------------------
-        # جلسات Voice
-        # guild_id -> VoiceSession
+        # Voice sessions
         # ----------------------------------------------------
 
-        self.voice_sessions: dict[
-            int,
-            VoiceSession
-        ] = {}
+        self.voice_sessions: dict[int, VoiceSession] = {}
 
         # ----------------------------------------------------
-        # Locks
+        # Per-user cooldown
         # ----------------------------------------------------
 
-        self.guild_locks: dict[
-            int,
-            asyncio.Lock
-        ] = {}
-
-        # ----------------------------------------------------
-        # إعدادات السيرفر
-        # ----------------------------------------------------
-
-        self.guild_settings: dict[
-            int,
-            dict
-        ] = {}
-
-        # ----------------------------------------------------
-        # وقت التشغيل
-        # ----------------------------------------------------
-
-        self.started_at = time.monotonic()
-
-        # ----------------------------------------------------
-        # حالة الإغلاق
-        # ----------------------------------------------------
-
-        self.shutting_down = False
+        self.cooldowns: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=20)
+        )
 
         # ----------------------------------------------------
         # Statistics
         # ----------------------------------------------------
 
+        self.started_at = time.monotonic()
+
         self.stats = {
+            "commands": 0,
             "voice_joins": 0,
             "voice_leaves": 0,
-            "messages_processed": 0,
+            "voice_messages": 0,
             "ai_requests": 0,
             "errors": 0,
         }
 
-    # ========================================================
-    # LOCK
-    # ========================================================
+        # ----------------------------------------------------
+        # Lock
+        # ----------------------------------------------------
 
-    def get_guild_lock(
-        self,
-        guild_id: int
-    ) -> asyncio.Lock:
-
-        lock = self.guild_locks.get(
-            guild_id
-        )
-
-        if lock is None:
-
-            lock = asyncio.Lock()
-
-            self.guild_locks[
-                guild_id
-            ] = lock
-
-        return lock
+        self.session_lock = asyncio.Lock()
 
     # ========================================================
-    # READY
+    # SETUP HOOK
     # ========================================================
 
     async def setup_hook(self):
 
         logger.info(
-            "Running setup_hook..."
+            "Loading Gemini Discord AI Bot..."
         )
 
         # ----------------------------------------------------
-        # تحميل الإضافات
+        # Sync slash commands
         # ----------------------------------------------------
 
-        await self.load_commands()
+        try:
 
-        logger.info(
-            "setup_hook completed."
-        )
+            synced = await self.tree.sync()
 
-    # ========================================================
-    # COMMAND LOADER
-    # ========================================================
+            logger.info(
+                "Synced %s global slash commands.",
+                len(synced),
+            )
 
-    async def load_commands(self):
+        except Exception:
 
-        """
-        الأوامر موجودة في هذا الملف حاليًا.
+            logger.exception(
+                "Failed to sync slash commands."
+            )
 
-        هذا النظام موجود عشان نقدر نفصلها لاحقًا
-        إلى Cogs بدون تغيير البنية الأساسية.
-        """
-
-        logger.info(
-            "Command system initialized."
-        )
+            raise
 
     # ========================================================
-    # BOT READY
+    # READY
     # ========================================================
 
     async def on_ready(self):
 
         logger.info(
-            "======================================"
+            "=========================================="
         )
 
         logger.info(
-            "AI Voice Bot is ONLINE"
+            "%s v%s",
+            PROJECT_NAME,
+            PROJECT_VERSION,
         )
 
         logger.info(
-            "Bot: %s",
-            self.user
-        )
-
-        logger.info(
-            "Bot ID: %s",
-            self.user.id
+            "Logged in as %s (%s)",
+            self.user,
+            self.user.id if self.user else "unknown",
         )
 
         logger.info(
             "Guilds: %s",
-            len(self.guilds)
+            len(self.guilds),
         )
 
         logger.info(
-            "Latency: %.0fms",
-            self.latency * 1000
+            "=========================================="
         )
 
-        logger.info(
-            "======================================"
+        activity = discord.Activity(
+            type=discord.ActivityType.watching,
+            name=DISCORD_STATUS,
         )
 
-        # ----------------------------------------------------
-        # Presence
-        # ----------------------------------------------------
+        try:
 
-        activity = None
-
-        if BOT_ACTIVITY:
-
-            activity = discord.Game(
-                name=BOT_ACTIVITY
+            await self.change_presence(
+                status=discord.Status.online,
+                activity=activity,
             )
 
-        await self.change_presence(
-            status=discord.Status.online,
-            activity=activity
-        )
+        except Exception:
+
+            logger.exception(
+                "Failed to update presence."
+            )
 
     # ========================================================
-    # MESSAGE
+    # ERROR HANDLER
     # ========================================================
 
-    async def on_message(
+    async def on_error(
         self,
-        message: discord.Message
+        event_method: str,
+        *args,
+        **kwargs,
     ):
-
-        # ----------------------------------------------------
-        # تجاهل البوتات
-        # ----------------------------------------------------
-
-        if message.author.bot:
-            return
-
-        # ----------------------------------------------------
-        # معالجة الأوامر
-        # ----------------------------------------------------
-
-        await self.process_commands(
-            message
-        )
-
-    # ========================================================
-    # ERROR
-    # ========================================================
-
-    async def on_command_error(
-        self,
-        ctx: commands.Context,
-        error: Exception
-    ):
-
-        # ----------------------------------------------------
-        # تجاهل CommandNotFound
-        # ----------------------------------------------------
-
-        if isinstance(
-            error,
-            commands.CommandNotFound
-        ):
-            return
-
-        # ----------------------------------------------------
-        # Missing arguments
-        # ----------------------------------------------------
-
-        if isinstance(
-            error,
-            commands.MissingRequiredArgument
-        ):
-
-            await safe_send(
-                ctx,
-                "❌ ناقصك شيء في الأمر."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Missing permissions
-        # ----------------------------------------------------
-
-        if isinstance(
-            error,
-            commands.MissingPermissions
-        ):
-
-            await safe_send(
-                ctx,
-                "❌ ما عندك الصلاحية لهذا الأمر."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Bot permissions
-        # ----------------------------------------------------
-
-        if isinstance(
-            error,
-            commands.BotMissingPermissions
-        ):
-
-            await safe_send(
-                ctx,
-                "❌ البوت ما عنده الصلاحيات المطلوبة."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Cooldown
-        # ----------------------------------------------------
-
-        if isinstance(
-            error,
-            commands.CommandOnCooldown
-        ):
-
-            await safe_send(
-                ctx,
-                (
-                    "⏳ انتظر "
-                    f"{error.retry_after:.1f} ثانية."
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Unexpected error
-        # ----------------------------------------------------
 
         self.stats["errors"] += 1
 
         logger.exception(
-            "Command error:",
-            exc_info=error
+            "Unhandled Discord event error: %s",
+            event_method,
         )
 
-        await safe_send(
-            ctx,
-            "❌ صار خطأ غير متوقع."
-        )
+    # ========================================================
+    # SESSION
+    # ========================================================
 
+    async def get_or_create_session(
+        self,
+        guild: discord.Guild,
+    ) -> VoiceSession:
 
-# ============================================================
-# SAFE SEND
-# ============================================================
+        guild_id = guild.id
 
-async def safe_send(
-    ctx: commands.Context,
-    content: str
-):
+        async with self.session_lock:
 
-    try:
-
-        await ctx.send(
-            content
-        )
-
-    except Exception as error:
-
-        logger.warning(
-            "Could not send message: %s",
-            error
-        )
-
-
-# ============================================================
-# BOT INSTANCE
-# ============================================================
-
-bot = AIVoiceBot()
-
-
-# ============================================================
-# BASIC COMMANDS
-# ============================================================
-
-@bot.command(
-    name="ping"
-)
-async def ping_command(
-    ctx: commands.Context
-):
-
-    start = time.perf_counter()
-
-    message = await ctx.send(
-        "🏓 جاري القياس..."
-    )
-
-    elapsed = (
-        time.perf_counter()
-        - start
-    ) * 1000
-
-    websocket_latency = (
-        bot.latency * 1000
-    )
-
-    await message.edit(
-        content=(
-            "🏓 **Pong!**\n"
-            f"📡 Discord: `{websocket_latency:.0f}ms`\n"
-            f"⚡ Response: `{elapsed:.0f}ms`"
-        )
-    )
-
-
-# ============================================================
-# BOT INFO
-# ============================================================
-
-@bot.command(
-    name="botinfo"
-)
-async def botinfo_command(
-    ctx: commands.Context
-):
-
-    uptime = (
-        time.monotonic()
-        - bot.started_at
-    )
-
-    hours = int(
-        uptime // 3600
-    )
-
-    minutes = int(
-        (uptime % 3600)
-        // 60
-    )
-
-    seconds = int(
-        uptime % 60
-    )
-
-    embed = discord.Embed(
-        title="🤖 AI Voice Bot",
-        description=(
-            "بوت ذكاء اصطناعي صوتي "
-            "يعمل داخل Discord."
-        ),
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="📡 Latency",
-        value=(
-            f"`{bot.latency * 1000:.0f}ms`"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🏠 Servers",
-        value=str(
-            len(bot.guilds)
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="⏱️ Uptime",
-        value=(
-            f"`{hours:02d}:"
-            f"{minutes:02d}:"
-            f"{seconds:02d}`"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🎙️ Voice Sessions",
-        value=str(
-            len(
-                bot.voice_sessions
+            existing = self.voice_sessions.get(
+                guild_id
             )
-        ),
-        inline=True
-    )
 
-    embed.add_field(
-        name="🧠 AI Requests",
-        value=str(
-            bot.stats[
-                "ai_requests"
-            ]
-        ),
-        inline=True
-    )
+            if existing:
 
-    embed.add_field(
-        name="❌ Errors",
-        value=str(
-            bot.stats[
-                "errors"
-            ]
-        ),
-        inline=True
-    )
-
-    await ctx.send(
-        embed=embed
-    )
-
-
-# ============================================================
-# HELP
-# ============================================================
-
-@bot.command(
-    name="help_ai",
-    aliases=["commands", "cmds"]
-)
-async def help_command(
-    ctx: commands.Context
-):
-
-    embed = discord.Embed(
-        title="🤖 أوامر AI Voice Bot",
-        description=(
-            "هذه أوامر البوت الأساسية."
-        ),
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="🎙️ الصوت",
-        value=(
-            "`!join` — دخول الروم الصوتي\n"
-            "`!leave` — الخروج من الروم\n"
-            "`!voice` — حالة الاتصال"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🧠 الذكاء",
-        value=(
-            "`!clear` — مسح ذاكرة المحادثة\n"
-            "`!memory` — عرض حالة الذاكرة"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚙️ النظام",
-        value=(
-            "`!ping` — سرعة البوت\n"
-            "`!botinfo` — معلومات البوت\n"
-            "`!help_ai` — هذه القائمة"
-        ),
-        inline=False
-    )
-
-    await ctx.send(
-        embed=embed
-    )
-
-
-# ============================================================
-# JOIN
-# ============================================================
-
-@bot.command(
-    name="join"
-)
-@commands.guild_only()
-async def join_command(
-    ctx: commands.Context
-):
-
-    guild = ctx.guild
-
-    # --------------------------------------------------------
-    # لازم المستخدم يكون داخل Voice
-    # --------------------------------------------------------
-
-    if ctx.author.voice is None:
-
-        await safe_send(
-            ctx,
-            (
-                "🎙️ ادخل روم صوتي أول، "
-                "وبعدين استخدم `!join`."
-            )
-        )
-
-        return
-
-    channel = (
-        ctx.author.voice.channel
-    )
-
-    # --------------------------------------------------------
-    # تحقق من الحد
-    # --------------------------------------------------------
-
-    if (
-        guild.id
-        not in bot.voice_sessions
-        and len(bot.voice_sessions)
-        >= MAX_GUILD_SESSIONS
-    ):
-
-        await safe_send(
-            ctx,
-            (
-                "⚠️ البوت وصل للحد الأقصى "
-                "من جلسات Voice."
-            )
-        )
-
-        return
-
-    lock = bot.get_guild_lock(
-        guild.id
-    )
-
-    async with lock:
-
-        # ----------------------------------------------------
-        # إذا فيه اتصال سابق
-        # ----------------------------------------------------
-
-        existing = (
-            guild.voice_client
-        )
-
-        if existing:
+                return existing
 
             if (
-                existing.channel
-                == channel
+                len(self.voice_sessions)
+                >= MAX_GUILD_SESSIONS
             ):
 
-                await safe_send(
-                    ctx,
-                    (
-                        "🎙️ أنا أصلًا داخل "
-                        "هذا الروم."
-                    )
+                raise RuntimeError(
+                    "Maximum guild sessions reached."
                 )
-
-                return
-
-            try:
-
-                await existing.disconnect(
-                    force=True
-                )
-
-            except Exception as error:
-
-                logger.warning(
-                    "Failed to disconnect old VC: %s",
-                    error
-                )
-
-        # ----------------------------------------------------
-        # الاتصال
-        # ----------------------------------------------------
-
-        status_message = await ctx.send(
-            (
-                f"🔌 جاري الدخول إلى "
-                f"**{channel.name}**..."
-            )
-        )
-
-        try:
-
-            voice_client = (
-                await channel.connect(
-                    cls=voice_recv.VoiceRecvClient
-                )
-            )
-
-        except Exception as error:
-
-            logger.exception(
-                "Voice connection failed"
-            )
-
-            await status_message.edit(
-                content=(
-                    "❌ ما قدرت أدخل الروم.\n"
-                    f"```text\n{error}\n```"
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # إنشاء جلسة AI
-        # ----------------------------------------------------
-
-        try:
 
             session = VoiceSession(
-                bot=bot,
+                bot=self,
                 guild=guild,
-                voice_client=voice_client,
-                text_channel=ctx.channel,
+                default_voice=DEFAULT_VOICE,
             )
 
-            await session.start()
+            self.voice_sessions[guild_id] = session
 
-            bot.voice_sessions[
-                guild.id
-            ] = session
+            return session
 
-            bot.stats[
-                "voice_joins"
-            ] += 1
+    # ========================================================
+    # GET SESSION
+    # ========================================================
 
-        except Exception as error:
+    def get_session(
+        self,
+        guild_id: int,
+    ) -> Optional[VoiceSession]:
 
-            logger.exception(
-                "Failed to create voice session"
-            )
-
-            try:
-
-                await voice_client.disconnect(
-                    force=True
-                )
-
-            except Exception:
-                pass
-
-            await status_message.edit(
-                content=(
-                    "❌ فشل تشغيل نظام الصوت.\n"
-                    f"```text\n{error}\n```"
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # نجاح
-        # ----------------------------------------------------
-
-        await status_message.edit(
-            content=(
-                f"🎙️ **دخلت الروم!**\n"
-                f"📍 `{channel.name}`\n\n"
-                "🧠 نظام الذكاء جاهز.\n"
-                "🎤 تكلم بشكل طبيعي."
-            )
+        return self.voice_sessions.get(
+            guild_id
         )
 
+    # ========================================================
+    # REMOVE SESSION
+    # ========================================================
 
-# ============================================================
-# LEAVE
-# ============================================================
+    async def remove_session(
+        self,
+        guild_id: int,
+    ):
 
-@bot.command(
-    name="leave",
-    aliases=["disconnect", "dc"]
-)
-@commands.guild_only()
-async def leave_command(
-    ctx: commands.Context
-):
+        async with self.session_lock:
 
-    guild = ctx.guild
-
-    lock = bot.get_guild_lock(
-        guild.id
-    )
-
-    async with lock:
-
-        session = (
-            bot.voice_sessions.pop(
-                guild.id,
-                None
+            session = self.voice_sessions.pop(
+                guild_id,
+                None,
             )
-        )
-
-        voice_client = (
-            guild.voice_client
-        )
 
         if session:
 
             try:
 
-                await session.stop()
+                await session.close()
 
-            except Exception as error:
+            except Exception:
 
-                logger.warning(
-                    "Session stop error: %s",
-                    error
+                logger.exception(
+                    "Failed to close voice session."
                 )
 
-        if voice_client:
+    # ========================================================
+    # COOLDOWN
+    # ========================================================
 
-            try:
+    def check_cooldown(
+        self,
+        user_id: int,
+        cooldown: float = 1.0,
+    ) -> float:
 
-                await voice_client.disconnect(
-                    force=True
-                )
+        now = time.monotonic()
 
-            except Exception as error:
+        history = self.cooldowns[user_id]
 
-                logger.warning(
-                    "Disconnect error: %s",
-                    error
-                )
+        while history and (
+            now - history[0] > 60
+        ):
 
-            bot.stats[
-                "voice_leaves"
-            ] += 1
+            history.popleft()
 
-            await safe_send(
-                ctx,
-                "👋 طلعت من الروم."
+        if history:
+
+            remaining = cooldown - (
+                now - history[-1]
             )
 
-            return
+            if remaining > 0:
 
-        await safe_send(
-            ctx,
-            "ℹ️ أنا مو داخل أي روم صوتي."
+                return remaining
+
+        history.append(now)
+
+        return 0.0
+
+    # ========================================================
+    # UPTIME
+    # ========================================================
+
+    def uptime_seconds(self) -> int:
+
+        return int(
+            time.monotonic()
+            - self.started_at
         )
 
+    # ========================================================
+    # FORMAT UPTIME
+    # ========================================================
 
-# ============================================================
-# VOICE STATUS
-# ============================================================
+    @staticmethod
+    def format_uptime(
+        seconds: int,
+    ) -> str:
 
-@bot.command(
-    name="voice",
-    aliases=["vc", "voicestatus"]
-)
-@commands.guild_only()
-async def voice_status_command(
-    ctx: commands.Context
-):
-
-    session = (
-        bot.voice_sessions.get(
-            ctx.guild.id
-        )
-    )
-
-    voice_client = (
-        ctx.guild.voice_client
-    )
-
-    if not voice_client:
-
-        await safe_send(
-            ctx,
-            "🔴 مو متصل بـ Voice."
+        days, remainder = divmod(
+            seconds,
+            86400,
         )
 
-        return
-
-    channel = (
-        voice_client.channel
-    )
-
-    listening = False
-
-    if session:
-
-        listening = (
-            session.listening
+        hours, remainder = divmod(
+            remainder,
+            3600,
         )
 
-    embed = discord.Embed(
-        title="🎙️ Voice Status",
-        color=(
-            discord.Color.green()
-            if listening
-            else discord.Color.orange()
+        minutes, seconds = divmod(
+            remainder,
+            60,
         )
-    )
 
-    embed.add_field(
-        name="📍 Channel",
-        value=(
-            channel.mention
-            if channel
-            else "Unknown"
-        ),
-        inline=False
-    )
+        parts = []
 
-    embed.add_field(
-        name="👂 Listening",
-        value=(
-            "🟢 نعم"
-            if listening
-            else "🔴 لا"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🧠 Session",
-        value=(
-            "🟢 Active"
-            if session
-            else "🔴 None"
-        ),
-        inline=True
-    )
-
-    await ctx.send(
-        embed=embed
-    )
-
-
-# ============================================================
-# CLEAR MEMORY
-# ============================================================
-
-@bot.command(
-    name="clear",
-    aliases=[
-        "clearmemory",
-        "forget"
-    ]
-)
-@commands.guild_only()
-async def clear_memory_command(
-    ctx: commands.Context
-):
-
-    session = (
-        bot.voice_sessions.get(
-            ctx.guild.id
-        )
-    )
-
-    if not session:
-
-        await safe_send(
-            ctx,
-            (
-                "ℹ️ ما فيه جلسة AI "
-                "فعالة حاليًا."
+        if days:
+            parts.append(
+                f"{days}d"
             )
+
+        if hours:
+            parts.append(
+                f"{hours}h"
+            )
+
+        if minutes:
+            parts.append(
+                f"{minutes}m"
+            )
+
+        parts.append(
+            f"{seconds}s"
         )
 
-        return
+        return " ".join(parts)
 
-    try:
 
-        session.clear_memory()
+# ============================================================
+# CREATE BOT
+# ============================================================
 
-    except Exception as error:
+bot = GeminiBot()
 
-        logger.exception(
-            "Memory clear failed"
-        )
 
-        await safe_send(
-            ctx,
-            "❌ ما قدرت أمسح الذاكرة."
-        )
+# ============================================================
+# EMBED HELPERS
+# ============================================================
 
-        return
+def success_embed(
+    title: str,
+    description: str,
+) -> discord.Embed:
 
-    await safe_send(
-        ctx,
-        "🧠 تم مسح ذاكرة المحادثة."
+    return discord.Embed(
+        title=f"✅ {title}",
+        description=description,
+        color=discord.Color.green(),
+    )
+
+
+def error_embed(
+    title: str,
+    description: str,
+) -> discord.Embed:
+
+    return discord.Embed(
+        title=f"❌ {title}",
+        description=description,
+        color=discord.Color.red(),
+    )
+
+
+def info_embed(
+    title: str,
+    description: str,
+) -> discord.Embed:
+
+    return discord.Embed(
+        title=f"ℹ️ {title}",
+        description=description,
+        color=discord.Color.blurple(),
     )
 
 
 # ============================================================
-# MEMORY STATUS
+# /PING
 # ============================================================
 
-@bot.command(
-    name="memory"
+@bot.tree.command(
+    name="ping",
+    description="فحص سرعة واستجابة البوت",
 )
-@commands.guild_only()
-async def memory_command(
-    ctx: commands.Context
+async def ping(
+    interaction: discord.Interaction,
 ):
 
-    session = (
-        bot.voice_sessions.get(
-            ctx.guild.id
-        )
+    bot.stats["commands"] += 1
+
+    latency = round(
+        bot.latency * 1000
     )
 
-    if not session:
+    await interaction.response.send_message(
+        embed=info_embed(
+            "Pong!",
+            f"🏓 Discord Latency: **{latency}ms**",
+        ),
+        ephemeral=True,
+    )
 
-        await safe_send(
-            ctx,
-            "ℹ️ ما فيه جلسة Voice."
-        )
 
-        return
+# ============================================================
+# /BOTINFO
+# ============================================================
 
-    try:
+@bot.tree.command(
+    name="botinfo",
+    description="عرض معلومات البوت والنظام",
+)
+async def botinfo(
+    interaction: discord.Interaction,
+):
 
-        count = (
-            session.memory_size()
-        )
+    bot.stats["commands"] += 1
 
-    except Exception:
-
-        count = 0
+    uptime = bot.format_uptime(
+        bot.uptime_seconds()
+    )
 
     embed = discord.Embed(
-        title="🧠 Memory",
-        color=discord.Color.blurple()
+        title="🤖 Gemini AI Bot",
+        description=(
+            "بوت ذكاء اصطناعي صوتي يعمل داخل Discord."
+        ),
+        color=discord.Color.blurple(),
     )
 
     embed.add_field(
-        name="Messages",
-        value=(
-            f"`{count}/{MAX_MEMORY_MESSAGES}`"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="Limit",
-        value=(
-            f"`{MAX_MEMORY_MESSAGES}`"
-        ),
-        inline=True
-    )
-
-    await ctx.send(
-        embed=embed
-    )
-
-
-# ============================================================
-# RESET SESSION
-# ============================================================
-
-@bot.command(
-    name="reset"
-)
-@commands.guild_only()
-async def reset_command(
-    ctx: commands.Context
-):
-
-    session = (
-        bot.voice_sessions.get(
-            ctx.guild.id
-        )
-    )
-
-    if not session:
-
-        await safe_send(
-            ctx,
-            "ℹ️ ما فيه جلسة Voice."
-        )
-
-        return
-
-    try:
-
-        await session.reset()
-
-    except Exception as error:
-
-        logger.exception(
-            "Session reset failed"
-        )
-
-        await safe_send(
-            ctx,
-            "❌ فشل إعادة تشغيل الجلسة."
-        )
-
-        return
-
-    await safe_send(
-        ctx,
-        "🔄 تم إعادة تشغيل جلسة AI."
-    )
-
-
-# ============================================================
-# STATS
-# ============================================================
-
-@bot.command(
-    name="stats"
-)
-@commands.guild_only()
-async def stats_command(
-    ctx: commands.Context
-):
-
-    embed = discord.Embed(
-        title="📊 Bot Statistics",
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="🎙️ Voice Joins",
-        value=str(
-            bot.stats[
-                "voice_joins"
-            ]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🚪 Voice Leaves",
-        value=str(
-            bot.stats[
-                "voice_leaves"
-            ]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🧠 AI Requests",
-        value=str(
-            bot.stats[
-                "ai_requests"
-            ]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="💬 Processed",
-        value=str(
-            bot.stats[
-                "messages_processed"
-            ]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="❌ Errors",
-        value=str(
-            bot.stats[
-                "errors"
-            ]
-        ),
-        inline=True
+        name="📦 Version",
+        value=f"`{PROJECT_VERSION}`",
+        inline=True,
     )
 
     embed.add_field(
         name="🏠 Servers",
-        value=str(
-            len(bot.guilds)
+        value=f"`{len(bot.guilds)}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🎙️ Voice Sessions",
+        value=f"`{len(bot.voice_sessions)}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="⏱️ Uptime",
+        value=f"`{uptime}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🧠 Memory",
+        value=(
+            f"`{MAX_MEMORY_MESSAGES} messages`"
+            if MEMORY_ENABLED
+            else "`Disabled`"
         ),
-        inline=True
+        inline=True,
     )
 
-    await ctx.send(
-        embed=embed
+    embed.add_field(
+        name="🎤 Default Voice",
+        value=f"`{DEFAULT_VOICE}`",
+        inline=True,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
     )
 
 
 # ============================================================
-# SHUTDOWN
+# /HELP
 # ============================================================
 
-async def shutdown():
+@bot.tree.command(
+    name="help",
+    description="عرض جميع أوامر البوت",
+)
+async def help_command(
+    interaction: discord.Interaction,
+):
 
-    if bot.shutting_down:
+    bot.stats["commands"] += 1
+
+    embed = discord.Embed(
+        title="📚 أوامر Gemini AI",
+        description=(
+            "هذه جميع أوامر البوت المتاحة:"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="🎙️ الصوت",
+        value=(
+            "`/join` — دخول الروم الصوتي\n"
+            "`/leave` — الخروج من الروم\n"
+            "`/voices` — عرض الأصوات\n"
+            "`/setvoice` — تغيير الصوت\n"
+            "`/voice` — الصوت الحالي"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🧠 الذكاء الاصطناعي",
+        value=(
+            "`/memory` — حالة الذاكرة\n"
+            "`/clear` — مسح الذاكرة\n"
+            "`/reset` — إعادة ضبط الجلسة"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ النظام",
+        value=(
+            "`/ping` — فحص السرعة\n"
+            "`/botinfo` — معلومات البوت\n"
+            "`/stats` — الإحصائيات"
+        ),
+        inline=False,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# /JOIN
+# ============================================================
+
+@bot.tree.command(
+    name="join",
+    description="إدخال البوت إلى الروم الصوتي",
+)
+async def join(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    if not interaction.guild:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
+
         return
 
-    bot.shutting_down = True
+    member = interaction.user
 
-    logger.info(
-        "Starting graceful shutdown..."
+    if not isinstance(
+        member,
+        discord.Member,
+    ):
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "خطأ",
+                "تعذر تحديد عضويتك في السيرفر.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    voice_state = member.voice
+
+    if not voice_state or not voice_state.channel:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "أنت لست في روم صوتي",
+                "ادخل روم صوتي أولاً ثم استخدم `/join`.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    channel = voice_state.channel
+
+    await interaction.response.defer(
+        ephemeral=True
     )
 
-    # --------------------------------------------------------
-    # إيقاف كل جلسات Voice
-    # --------------------------------------------------------
+    try:
 
-    sessions = list(
-        bot.voice_sessions.values()
+        session = await bot.get_or_create_session(
+            interaction.guild
+        )
+
+        await session.join(
+            channel
+        )
+
+        bot.stats["voice_joins"] += 1
+
+        await interaction.followup.send(
+            embed=success_embed(
+                "تم الدخول 🎙️",
+                (
+                    f"دخلت إلى **{channel.name}**.\n\n"
+                    f"🎤 الصوت الحالي: **{session.get_voice()}**\n"
+                    "🧠 الذكاء الاصطناعي جاهز للاستماع والرد."
+                ),
+            ),
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Join failed."
+        )
+
+        bot.stats["errors"] += 1
+
+        await interaction.followup.send(
+            embed=error_embed(
+                "تعذر الدخول",
+                f"حدث خطأ أثناء دخول الروم الصوتي.\n`{type(exc).__name__}`",
+            ),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# /LEAVE
+# ============================================================
+
+@bot.tree.command(
+    name="leave",
+    description="إخراج البوت من الروم الصوتي",
+)
+async def leave(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    if not interaction.guild:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
     )
 
-    bot.voice_sessions.clear()
+    session = bot.get_session(
+        interaction.guild.id
+    )
 
-    for session in sessions:
+    if not session:
+
+        await interaction.followup.send(
+            embed=info_embed(
+                "البوت غير موجود",
+                "البوت ليس لديه جلسة صوتية في هذا السيرفر.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    try:
+
+        await bot.remove_session(
+            interaction.guild.id
+        )
+
+        bot.stats["voice_leaves"] += 1
+
+        await interaction.followup.send(
+            embed=success_embed(
+                "تم الخروج 👋",
+                "خرجت من الروم الصوتي.",
+            ),
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Leave failed."
+        )
+
+        bot.stats["errors"] += 1
+
+        await interaction.followup.send(
+            embed=error_embed(
+                "تعذر الخروج",
+                f"`{type(exc).__name__}`",
+            ),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# /VOICE
+# ============================================================
+
+@bot.tree.command(
+    name="voice",
+    description="عرض الصوت المستخدم حالياً",
+)
+async def voice(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    if not interaction.guild:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    session = bot.get_session(
+        interaction.guild.id
+    )
+
+    current_voice = DEFAULT_VOICE
+
+    if session:
+
+        try:
+            current_voice = session.get_voice()
+        except Exception:
+            pass
+
+    description = (
+        f"🎙️ الصوت الحالي: **{current_voice}**\n"
+        f"✨ الشخصية الصوتية: **{GEMINI_VOICES.get(current_voice, 'Unknown')}**"
+    )
+
+    await interaction.response.send_message(
+        embed=info_embed(
+            "الصوت الحالي",
+            description,
+        ),
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# VOICE AUTOCOMPLETE
+# ============================================================
+
+async def voice_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+
+    current = current.lower().strip()
+
+    choices = []
+
+    for name, style in GEMINI_VOICES.items():
+
+        if (
+            not current
+            or current in name.lower()
+            or current in style.lower()
+        ):
+
+            choices.append(
+                app_commands.Choice(
+                    name=f"{name} — {style}",
+                    value=name,
+                )
+            )
+
+    return choices[:25]
+
+
+# ============================================================
+# /SETVOICE
+# ============================================================
+
+@bot.tree.command(
+    name="setvoice",
+    description="تغيير صوت الذكاء الاصطناعي",
+)
+@app_commands.describe(
+    voice_name="اختر صوت Gemini الذي تريد استخدامه"
+)
+@app_commands.autocomplete(
+    voice_name=voice_autocomplete
+)
+async def setvoice(
+    interaction: discord.Interaction,
+    voice_name: str,
+):
+
+    bot.stats["commands"] += 1
+
+    if not ALLOW_VOICE_CHANGE:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "تغيير الصوت معطل",
+                "تم تعطيل تغيير الأصوات من إعدادات البوت.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    if not interaction.guild:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    normalized = normalize_voice_name(
+        voice_name
+    )
+
+    if not normalized:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "صوت غير موجود",
+                (
+                    "لم أجد هذا الصوت.\n"
+                    "استخدم `/voices` لرؤية الأصوات المتاحة."
+                ),
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    try:
+
+        session = await bot.get_or_create_session(
+            interaction.guild
+        )
+
+        result = session.set_voice(
+            normalized
+        )
+
+        # بعض النسخ قد ترجع True/False،
+        # وبعضها قد لا ترجع شيئاً.
+        if result is False:
+
+            raise RuntimeError(
+                "Voice session rejected the voice."
+            )
+
+        await interaction.followup.send(
+            embed=success_embed(
+                "تم تغيير الصوت 🎙️",
+                (
+                    f"الصوت الجديد: **{normalized}**\n"
+                    f"الطابع: **{GEMINI_VOICES[normalized]}**"
+                ),
+            ),
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Failed to set voice."
+        )
+
+        bot.stats["errors"] += 1
+
+        await interaction.followup.send(
+            embed=error_embed(
+                "تعذر تغيير الصوت",
+                f"`{type(exc).__name__}`",
+            ),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# /VOICES
+# ============================================================
+
+@bot.tree.command(
+    name="voices",
+    description="عرض جميع أصوات Gemini المتاحة",
+)
+async def voices(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    lines = []
+
+    for name, style in GEMINI_VOICES.items():
+
+        lines.append(
+            f"🎙️ **{name}** — {style}"
+        )
+
+    # Discord embed field/description limits
+    # لذلك نقسم القائمة إلى أكثر من جزء.
+
+    embed = discord.Embed(
+        title="🎙️ أصوات Gemini",
+        description=(
+            "يمكنك تغيير الصوت باستخدام `/setvoice`.\n\n"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    first_half = lines[:15]
+    second_half = lines[15:]
+
+    embed.add_field(
+        name="الأصوات 1–15",
+        value="\n".join(first_half),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="الأصوات 16–29",
+        value="\n".join(second_half),
+        inline=True,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# /VOICEINFO
+# ============================================================
+
+@bot.tree.command(
+    name="voiceinfo",
+    description="عرض معلومات صوت Gemini",
+)
+@app_commands.describe(
+    voice_name="اسم الصوت"
+)
+@app_commands.autocomplete(
+    voice_name=voice_autocomplete
+)
+async def voiceinfo(
+    interaction: discord.Interaction,
+    voice_name: str,
+):
+
+    bot.stats["commands"] += 1
+
+    normalized = normalize_voice_name(
+        voice_name
+    )
+
+    if not normalized:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "الصوت غير موجود",
+                "استخدم `/voices` لرؤية القائمة.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    style = GEMINI_VOICES[
+        normalized
+    ]
+
+    embed = discord.Embed(
+        title=f"🎙️ {normalized}",
+        description=(
+            f"الطابع الصوتي: **{style}**"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="Voice ID",
+        value=f"`{normalized}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Style",
+        value=f"`{style}`",
+        inline=True,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# /MEMORY
+# ============================================================
+
+@bot.tree.command(
+    name="memory",
+    description="عرض حالة ذاكرة المحادثة",
+)
+async def memory(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    if not interaction.guild:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    session = bot.get_session(
+        interaction.guild.id
+    )
+
+    if not MEMORY_ENABLED:
+
+        await interaction.response.send_message(
+            embed=info_embed(
+                "الذاكرة",
+                "🧠 ذاكرة المحادثة معطلة حالياً.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    message_count = 0
+
+    if session:
 
         try:
 
-            await session.stop()
+            if hasattr(
+                session,
+                "memory",
+            ):
 
-        except Exception as error:
+                memory_obj = session.memory
 
-            logger.warning(
-                "Session shutdown error: %s",
-                error
-            )
+                if hasattr(
+                    memory_obj,
+                    "__len__",
+                ):
 
-    # --------------------------------------------------------
-    # Disconnect all voice clients
-    # --------------------------------------------------------
+                    message_count = len(
+                        memory_obj
+                    )
 
-    for guild in bot.guilds:
+        except Exception:
 
-        voice_client = (
-            guild.voice_client
-        )
+            message_count = 0
 
-        if voice_client:
+    embed = discord.Embed(
+        title="🧠 ذاكرة المحادثة",
+        color=discord.Color.blurple(),
+    )
 
-            try:
+    embed.add_field(
+        name="الحالة",
+        value="🟢 مفعلة",
+        inline=True,
+    )
 
-                await voice_client.disconnect(
-                    force=True
-                )
+    embed.add_field(
+        name="الحد الأقصى",
+        value=f"`{MAX_MEMORY_MESSAGES}`",
+        inline=True,
+    )
 
-            except Exception as error:
+    embed.add_field(
+        name="الرسائل الحالية",
+        value=f"`{message_count}`",
+        inline=True,
+    )
 
-                logger.warning(
-                    "VC shutdown error: %s",
-                    error
-                )
-
-    # --------------------------------------------------------
-    # Close bot
-    # --------------------------------------------------------
-
-    try:
-
-        await bot.close()
-
-    except Exception as error:
-
-        logger.warning(
-            "Bot close error: %s",
-            error
-        )
-
-    logger.info(
-        "Shutdown complete."
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
     )
 
 
 # ============================================================
-# SIGNAL HANDLERS
+# /CLEAR
 # ============================================================
 
-def handle_shutdown_signal(
-    signum,
-    frame
+@bot.tree.command(
+    name="clear",
+    description="مسح ذاكرة المحادثة الحالية",
+)
+async def clear(
+    interaction: discord.Interaction,
 ):
 
-    logger.info(
-        "Received signal: %s",
-        signum
-    )
+    bot.stats["commands"] += 1
 
-    try:
+    if not interaction.guild:
 
-        loop = asyncio.get_running_loop()
-
-    except RuntimeError:
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
 
         return
 
-    loop.create_task(
-        shutdown()
+    session = bot.get_session(
+        interaction.guild.id
+    )
+
+    if not session:
+
+        await interaction.response.send_message(
+            embed=info_embed(
+                "لا توجد جلسة",
+                "لا توجد جلسة AI نشطة حالياً.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    try:
+
+        cleared = False
+
+        if hasattr(
+            session,
+            "clear_memory",
+        ):
+
+            result = session.clear_memory()
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            cleared = True
+
+        elif hasattr(
+            session,
+            "memory",
+        ):
+
+            memory_obj = session.memory
+
+            if hasattr(
+                memory_obj,
+                "clear",
+            ):
+
+                memory_obj.clear()
+
+                cleared = True
+
+        if cleared:
+
+            await interaction.response.send_message(
+                embed=success_embed(
+                    "تم مسح الذاكرة 🧹",
+                    "تم حذف سياق المحادثة الحالية.",
+                ),
+                ephemeral=True,
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                embed=error_embed(
+                    "غير مدعوم",
+                    "نسخة جلسة الصوت الحالية لا تدعم مسح الذاكرة.",
+                ),
+                ephemeral=True,
+            )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Clear memory failed."
+        )
+
+        bot.stats["errors"] += 1
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "تعذر المسح",
+                f"`{type(exc).__name__}`",
+            ),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# /RESET
+# ============================================================
+
+@bot.tree.command(
+    name="reset",
+    description="إعادة ضبط جلسة الذكاء الاصطناعي",
+)
+async def reset(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    if not interaction.guild:
+
+        await interaction.response.send_message(
+            embed=error_embed(
+                "غير متاح",
+                "هذا الأمر يعمل داخل السيرفرات فقط.",
+            ),
+            ephemeral=True,
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    try:
+
+        old_session = bot.get_session(
+            interaction.guild.id
+        )
+
+        current_channel = None
+
+        if old_session:
+
+            try:
+
+                if hasattr(
+                    old_session,
+                    "voice_client",
+                ):
+
+                    vc = old_session.voice_client
+
+                    if vc and vc.channel:
+                        current_channel = vc.channel
+
+            except Exception:
+                pass
+
+        await bot.remove_session(
+            interaction.guild.id
+        )
+
+        if current_channel:
+
+            new_session = (
+                await bot.get_or_create_session(
+                    interaction.guild
+                )
+            )
+
+            await new_session.join(
+                current_channel
+            )
+
+        await interaction.followup.send(
+            embed=success_embed(
+                "تمت إعادة الضبط 🔄",
+                (
+                    "تمت إعادة إنشاء جلسة الذكاء الاصطناعي."
+                ),
+            ),
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Reset failed."
+        )
+
+        bot.stats["errors"] += 1
+
+        await interaction.followup.send(
+            embed=error_embed(
+                "تعذر إعادة الضبط",
+                f"`{type(exc).__name__}`",
+            ),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# /STATS
+# ============================================================
+
+@bot.tree.command(
+    name="stats",
+    description="عرض إحصائيات البوت",
+)
+async def stats(
+    interaction: discord.Interaction,
+):
+
+    bot.stats["commands"] += 1
+
+    uptime = bot.format_uptime(
+        bot.uptime_seconds()
+    )
+
+    embed = discord.Embed(
+        title="📊 إحصائيات البوت",
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="⏱️ Uptime",
+        value=f"`{uptime}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🏠 Servers",
+        value=f"`{len(bot.guilds)}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🎙️ Sessions",
+        value=f"`{len(bot.voice_sessions)}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="⚡ Commands",
+        value=f"`{bot.stats['commands']}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🧠 AI Requests",
+        value=f"`{bot.stats['ai_requests']}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🎤 Voice Joins",
+        value=f"`{bot.stats['voice_joins']}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="👋 Voice Leaves",
+        value=f"`{bot.stats['voice_leaves']}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="❌ Errors",
+        value=f"`{bot.stats['errors']}`",
+        inline=True,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
     )
 
 
 # ============================================================
-# MAIN
+# APP COMMAND ERROR HANDLER
+# ============================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+
+    bot.stats["errors"] += 1
+
+    logger.error(
+        "Slash command error: %s",
+        error,
+        exc_info=True,
+    )
+
+    if isinstance(
+        error,
+        app_commands.CommandOnCooldown,
+    ):
+
+        message = (
+            "⏳ انتظر قليلاً ثم حاول مرة أخرى."
+        )
+
+    elif isinstance(
+        error,
+        app_commands.CheckFailure,
+    ):
+
+        message = (
+            "🚫 لا تملك صلاحية استخدام هذا الأمر."
+        )
+
+    else:
+
+        message = (
+            "حدث خطأ غير متوقع أثناء تنفيذ الأمر."
+        )
+
+    try:
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                embed=error_embed(
+                    "حدث خطأ",
+                    message,
+                ),
+                ephemeral=True,
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                embed=error_embed(
+                    "حدث خطأ",
+                    message,
+                ),
+                ephemeral=True,
+            )
+
+    except Exception:
+
+        logger.exception(
+            "Failed to send command error."
+        )
+
+
+# ============================================================
+# STARTUP
 # ============================================================
 
 def main():
 
+    ok, errors = validate_config()
+
+    if not ok:
+
+        print()
+        print("=" * 60)
+        print("CONFIGURATION ERROR")
+        print("=" * 60)
+
+        for error in errors:
+
+            print(
+                f"❌ {error}"
+            )
+
+        print("=" * 60)
+        print()
+
+        raise SystemExit(1)
+
     logger.info(
-        "======================================"
+        "Configuration validated successfully."
     )
 
     logger.info(
-        "Starting AI Voice Bot..."
+        "Starting Discord bot..."
     )
-
-    logger.info(
-        "======================================"
-    )
-
-    # --------------------------------------------------------
-    # Signals
-    # --------------------------------------------------------
-
-    if sys.platform != "win32":
-
-        try:
-
-            signal.signal(
-                signal.SIGTERM,
-                handle_shutdown_signal
-            )
-
-            signal.signal(
-                signal.SIGINT,
-                handle_shutdown_signal
-            )
-
-        except Exception as error:
-
-            logger.warning(
-                "Could not install signal handlers: %s",
-                error
-            )
-
-    # --------------------------------------------------------
-    # Start
-    # --------------------------------------------------------
 
     try:
 
         bot.run(
-            DISCORD_TOKEN,
-            log_handler=None
+            DISCORD_TOKEN
         )
 
     except KeyboardInterrupt:
 
         logger.info(
-            "Keyboard interrupt."
+            "Bot stopped by user."
         )
 
     except Exception:
