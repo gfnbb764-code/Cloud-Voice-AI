@@ -402,10 +402,7 @@ class CharacterManager:
                 "A character with this name already exists."
             )
 
-        if (
-            len(items)
-            >= MAX_CHARACTERS_PER_GUILD
-        ):
+        if len(items) >= MAX_CHARACTERS_PER_GUILD:
             raise ValueError(
                 "Maximum number of characters reached."
             )
@@ -604,13 +601,9 @@ class CharacterManager:
 
             if new_key != old_key:
 
-                items.pop(
-                    old_key
-                )
+                items.pop(old_key)
 
-                items[
-                    new_key
-                ] = character
+                items[new_key] = character
 
                 selected = self.selected.get(
                     str(guild_id)
@@ -677,9 +670,7 @@ class CharacterManager:
 # BOT
 # ============================================================
 
-class CloudVoiceBot(
-    commands.Bot
-):
+class CloudVoiceBot(commands.Bot):
 
     def __init__(self) -> None:
 
@@ -695,14 +686,14 @@ class CloudVoiceBot(
             intents=intents,
         )
 
-        self.voice_manager = (
-            VoiceSessionManager()
+        # IMPORTANT:
+        # VoiceSessionManager now requires the bot instance.
+        self.voice_manager = VoiceSessionManager(
+            self
         )
 
-        self.character_manager = (
-            CharacterManager(
-                CHARACTER_STORAGE_FILE
-            )
+        self.character_manager = CharacterManager(
+            CHARACTER_STORAGE_FILE
         )
 
         self.ready_once = False
@@ -818,7 +809,8 @@ class CloudVoiceBot(
             "Shutting down Cloud Voice AI..."
         )
 
-        await self.voice_manager.disconnect_all()
+        # voice.py exposes close_all(), not disconnect_all().
+        await self.voice_manager.close_all()
 
         await super().close()
 
@@ -1027,7 +1019,6 @@ async def join(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     member = interaction.user
@@ -1041,7 +1032,6 @@ async def join(
             "❌ تعذر معرفة الروم الصوتي.",
             ephemeral=True,
         )
-
         return
 
     if member.voice is None:
@@ -1050,7 +1040,6 @@ async def join(
             "❌ ادخل روم صوتي أولًا.",
             ephemeral=True,
         )
-
         return
 
     channel = member.voice.channel
@@ -1061,7 +1050,6 @@ async def join(
             "❌ ادخل روم صوتي أولًا.",
             ephemeral=True,
         )
-
         return
 
     await interaction.response.defer()
@@ -1077,7 +1065,6 @@ async def join(
     try:
 
         session = await bot.voice_manager.join(
-            guild=interaction.guild,
             channel=channel,
             voice=(
                 selected.voice
@@ -1130,7 +1117,6 @@ async def leave(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     success = await bot.voice_manager.leave(
@@ -1160,7 +1146,6 @@ async def voice(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1172,7 +1157,6 @@ async def voice(
         await interaction.response.send_message(
             "🔇 البوت غير موجود في روم صوتي."
         )
-
         return
 
     character = session.character
@@ -1208,7 +1192,6 @@ async def setvoice(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     if not ALLOW_VOICE_CHANGE:
@@ -1217,7 +1200,6 @@ async def setvoice(
             "❌ تغيير الأصوات معطل.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1230,7 +1212,6 @@ async def setvoice(
             "❌ استخدم `/join` أولًا.",
             ephemeral=True,
         )
-
         return
 
     try:
@@ -1239,9 +1220,7 @@ async def setvoice(
             voice
         )
 
-        selected_character = (
-            session.character
-        )
+        selected_character = session.character
 
         if selected_character:
 
@@ -1298,7 +1277,6 @@ async def speed(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1311,12 +1289,10 @@ async def speed(
             "❌ استخدم `/join` أولًا.",
             ephemeral=True,
         )
-
         return
 
     new_speed = session.set_speed(
-        float(speed),
-        update_character=True,
+        float(speed)
     )
 
     character = session.character
@@ -1327,6 +1303,14 @@ async def speed(
             interaction.guild.id,
             character.name,
             speed=new_speed,
+        )
+
+        # Keep the live character synchronized.
+        session.set_character(
+            bot.character_manager.get(
+                interaction.guild.id,
+                character.name,
+            )
         )
 
     await interaction.response.send_message(
@@ -1382,7 +1366,6 @@ async def character_create(
             "❌ نظام الشخصيات معطل.",
             ephemeral=True,
         )
-
         return
 
     if interaction.guild is None:
@@ -1391,7 +1374,6 @@ async def character_create(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     normalized_voice = normalize_voice_name(
@@ -1406,7 +1388,6 @@ async def character_create(
             "❌ الصوت غير صالح.",
             ephemeral=True,
         )
-
         return
 
     character = Character(
@@ -1480,7 +1461,6 @@ async def character_edit(
             "❌ نظام الشخصيات معطل.",
             ephemeral=True,
         )
-
         return
 
     if interaction.guild is None:
@@ -1489,7 +1469,6 @@ async def character_edit(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     if all(
@@ -1508,7 +1487,6 @@ async def character_edit(
             "❌ حدد شيئًا واحدًا على الأقل لتعديله.",
             ephemeral=True,
         )
-
         return
 
     try:
@@ -1532,16 +1510,30 @@ async def character_edit(
             interaction.guild.id
         )
 
-        if (
-            session
-            and session.character
-            and session.character.name.lower()
-            == character.lower()
-        ):
+        if session:
+
+            live_character = (
+                bot.character_manager.get(
+                    interaction.guild.id,
+                    updated.name,
+                )
+            )
 
             session.set_character(
-                updated
+                live_character
             )
+
+            # If the edited character is currently active,
+            # immediately apply voice/speed too.
+            if live_character:
+
+                session.voice_name = (
+                    live_character.voice
+                )
+
+                session.speech_speed = (
+                    live_character.speed
+                )
 
         await interaction.response.send_message(
             f"✅ تم تعديل الشخصية **{updated.name}**."
@@ -1573,7 +1565,6 @@ async def character_select(
             "❌ نظام الشخصيات معطل.",
             ephemeral=True,
         )
-
         return
 
     if interaction.guild is None:
@@ -1582,7 +1573,6 @@ async def character_select(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     try:
@@ -1601,6 +1591,9 @@ async def character_select(
             session.set_character(
                 selected
             )
+
+            session.voice_name = selected.voice
+            session.speech_speed = selected.speed
 
         await interaction.response.send_message(
             (
@@ -1632,7 +1625,6 @@ async def character_list(
             "❌ نظام الشخصيات معطل.",
             ephemeral=True,
         )
-
         return
 
     if interaction.guild is None:
@@ -1641,7 +1633,6 @@ async def character_list(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     characters = bot.character_manager.list(
@@ -1657,7 +1648,6 @@ async def character_list(
         await interaction.response.send_message(
             "📭 لا توجد شخصيات في هذا السيرفر."
         )
-
         return
 
     lines: list[str] = []
@@ -1709,7 +1699,6 @@ async def character_view(
             "❌ نظام الشخصيات معطل.",
             ephemeral=True,
         )
-
         return
 
     if interaction.guild is None:
@@ -1718,7 +1707,6 @@ async def character_view(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     selected = bot.character_manager.get(
@@ -1732,7 +1720,6 @@ async def character_view(
             "❌ الشخصية غير موجودة.",
             ephemeral=True,
         )
-
         return
 
     embed = discord.Embed(
@@ -1793,7 +1780,6 @@ async def character_delete(
             "❌ نظام الشخصيات معطل.",
             ephemeral=True,
         )
-
         return
 
     if interaction.guild is None:
@@ -1802,7 +1788,6 @@ async def character_delete(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     try:
@@ -1823,7 +1808,18 @@ async def character_delete(
             == deleted.name.lower()
         ):
 
-            session.clear_character()
+            session.set_character(
+                None
+            )
+
+            # Return live session to default settings.
+            session.voice_name = (
+                DEFAULT_GEMINI_VOICE
+            )
+
+            session.speech_speed = (
+                DEFAULT_SPEECH_SPEED
+            )
 
         await interaction.response.send_message(
             f"🗑️ تم حذف الشخصية **{deleted.name}**."
@@ -1860,7 +1856,6 @@ async def memory(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1872,7 +1867,6 @@ async def memory(
         await interaction.response.send_message(
             "🔇 لا توجد جلسة صوتية."
         )
-
         return
 
     stats = session.engine.get_stats()
@@ -1900,7 +1894,6 @@ async def clear(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1912,10 +1905,9 @@ async def clear(
         await interaction.response.send_message(
             "🔇 لا توجد جلسة صوتية."
         )
-
         return
 
-    session.clear_memory()
+    session.engine.clear_memory()
 
     await interaction.response.send_message(
         "🧹 تم مسح ذاكرة المحادثة."
@@ -1936,7 +1928,6 @@ async def reset(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1948,14 +1939,20 @@ async def reset(
         await interaction.response.send_message(
             "🔇 لا توجد جلسة صوتية."
         )
-
         return
 
-    session.reset()
+    session.engine.reset()
 
     await bot.character_manager.clear_selected(
         interaction.guild.id
     )
+
+    session.set_character(
+        None
+    )
+
+    session.voice_name = DEFAULT_GEMINI_VOICE
+    session.speech_speed = DEFAULT_SPEECH_SPEED
 
     await interaction.response.send_message(
         "♻️ تم إعادة ضبط جلسة الذكاء الاصطناعي."
@@ -1976,7 +1973,6 @@ async def stats(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     session = bot.voice_manager.get(
@@ -1988,7 +1984,6 @@ async def stats(
         await interaction.response.send_message(
             "🔇 لا توجد جلسة صوتية."
         )
-
         return
 
     data = session.engine.get_stats()
@@ -2095,7 +2090,6 @@ async def require_moderation_owner(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return False
 
     if not MODERATION_AI_ENABLED:
@@ -2104,7 +2098,6 @@ async def require_moderation_owner(
             "❌ نظام الإشراف معطل.",
             ephemeral=True,
         )
-
         return False
 
     if (
@@ -2116,7 +2109,6 @@ async def require_moderation_owner(
             "🛡️ هذا النظام متاح **لصاحب السيرفر فقط**.",
             ephemeral=True,
         )
-
         return False
 
     return True
@@ -2146,7 +2138,6 @@ async def mod_status(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
-
         return
 
     owner = is_server_owner(
@@ -2266,7 +2257,6 @@ async def mod_request(
             "❌ اكتب الطلب أولًا.",
             ephemeral=True,
         )
-
         return
 
     supported = (
@@ -2341,7 +2331,6 @@ async def clear_messages(
             "❌ هذا الأمر يعمل في القنوات النصية.",
             ephemeral=True,
         )
-
         return
 
     if not bot_has_permission(
@@ -2353,7 +2342,6 @@ async def clear_messages(
             "❌ البوت لا يملك Manage Messages.",
             ephemeral=True,
         )
-
         return
 
     await interaction.response.defer(
@@ -2411,7 +2399,6 @@ async def kick(
             "❌ البوت لا يملك Kick Members.",
             ephemeral=True,
         )
-
         return
 
     me = interaction.guild.me
@@ -2425,7 +2412,6 @@ async def kick(
             "❌ لا أستطيع طرد عضو رتبته أعلى من رتبتي أو مساوية لها.",
             ephemeral=True,
         )
-
         return
 
     reason = (
@@ -2480,7 +2466,6 @@ async def ban(
             "❌ البوت لا يملك Ban Members.",
             ephemeral=True,
         )
-
         return
 
     me = interaction.guild.me
@@ -2494,7 +2479,6 @@ async def ban(
             "❌ لا أستطيع حظر عضو رتبته أعلى من رتبتي أو مساوية لها.",
             ephemeral=True,
         )
-
         return
 
     reason = (
@@ -2614,9 +2598,14 @@ async def on_app_command_error(
     error: app_commands.AppCommandError,
 ) -> None:
 
-    logger.exception(
-        "Application command error",
-        exc_info=error,
+    logger.error(
+        "Application command error: %r",
+        error,
+        exc_info=(
+            type(error),
+            error,
+            error.__traceback__,
+        ),
     )
 
     message = (
