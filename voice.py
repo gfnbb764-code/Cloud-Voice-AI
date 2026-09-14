@@ -46,12 +46,8 @@ logger = logging.getLogger("voice")
 # AUDIO SETTINGS
 # ============================================================
 
-# Discord can continue sending PCM frames even when the user
-# is not actively speaking. Therefore silence detection must
-# be based on volume, not simply packet arrival time.
-#
-# 500 is intentionally low enough to detect normal speech while
-# filtering normal near-silent Discord PCM noise.
+# Discord continues sending PCM frames even while the user
+# is silent, so speech detection is based on RMS volume.
 SILENCE_RMS_THRESHOLD = 500
 
 
@@ -66,6 +62,9 @@ def pcm_to_wav(
     sample_width: int = DISCORD_SAMPLE_WIDTH,
 ) -> bytes:
     """Convert raw PCM to WAV."""
+
+    if not pcm:
+        return b""
 
     buffer = io.BytesIO()
 
@@ -86,15 +85,23 @@ def resample_pcm(
     target_channels: int,
     sample_width: int = 2,
 ) -> bytes:
-    """Convert PCM sample rate/channels."""
+    """Convert PCM sample rate and channel count."""
 
     if not pcm:
         return b""
 
     result = pcm
 
+    # --------------------------------------------------------
+    # Channels
+    # --------------------------------------------------------
+
     if source_channels != target_channels:
-        if source_channels == 2 and target_channels == 1:
+
+        if (
+            source_channels == 2
+            and target_channels == 1
+        ):
             result = audioop.tomono(
                 result,
                 sample_width,
@@ -102,7 +109,10 @@ def resample_pcm(
                 0.5,
             )
 
-        elif source_channels == 1 and target_channels == 2:
+        elif (
+            source_channels == 1
+            and target_channels == 2
+        ):
             result = audioop.tostereo(
                 result,
                 sample_width,
@@ -112,11 +122,16 @@ def resample_pcm(
 
         else:
             raise ValueError(
-                f"Unsupported channel conversion: "
+                "Unsupported channel conversion: "
                 f"{source_channels} -> {target_channels}"
             )
 
+    # --------------------------------------------------------
+    # Sample rate
+    # --------------------------------------------------------
+
     if source_rate != target_rate:
+
         result, _ = audioop.ratecv(
             result,
             sample_width,
@@ -175,7 +190,7 @@ def pcm_duration(
     channels: int,
     sample_width: int,
 ) -> float:
-    """Calculate PCM duration."""
+    """Calculate PCM duration in seconds."""
 
     bytes_per_second = (
         sample_rate
@@ -190,7 +205,7 @@ def pcm_duration(
 
 
 # ============================================================
-# PCM DISCORD AUDIO SOURCE
+# DISCORD PCM AUDIO SOURCE
 # ============================================================
 
 class PCMSource(discord.AudioSource):
@@ -203,13 +218,13 @@ class PCMSource(discord.AudioSource):
         16-bit
     """
 
-    FRAME_BYTES = 3840  # 20ms @ 48kHz stereo 16-bit
+    FRAME_DURATION = 0.02
 
     def __init__(
         self,
         pcm: bytes,
-        sample_rate: int = GEMINI_TTS_SAMPLE_RATE,
-        channels: int = GEMINI_TTS_CHANNELS,
+        sample_rate: int = DISCORD_SAMPLE_RATE,
+        channels: int = 2,
         sample_width: int = 2,
     ):
         self.pcm = pcm
@@ -223,7 +238,7 @@ class PCMSource(discord.AudioSource):
             self.sample_rate
             * self.channels
             * self.sample_width
-            * 0.02
+            * self.FRAME_DURATION
         )
 
         self.frame_size = max(
@@ -232,7 +247,7 @@ class PCMSource(discord.AudioSource):
         )
 
     def read(self) -> bytes:
-        """Return the next 20ms frame."""
+        """Return exactly one 20ms PCM frame."""
 
         if self.position >= len(self.pcm):
             return b""
@@ -244,7 +259,6 @@ class PCMSource(discord.AudioSource):
 
         self.position += len(frame)
 
-        # Discord expects exactly one 20ms frame.
         if len(frame) < self.frame_size:
             frame += b"\x00" * (
                 self.frame_size - len(frame)
@@ -268,11 +282,12 @@ class VoiceAISink(voice_recv.AudioSink):
     """
     Receives decoded PCM from Discord.
 
-    Important:
-    - wants_opus() returns False.
-    - The fork therefore provides decoded PCM.
-    - Audio is buffered per user.
-    - Speech is processed after actual silence.
+    Responsibilities:
+        - Receive Discord PCM
+        - Detect speech
+        - Buffer per-user audio
+        - Detect silence
+        - Send finished speech to VoiceSession
     """
 
     def __init__(
@@ -283,16 +298,19 @@ class VoiceAISink(voice_recv.AudioSink):
 
         self.session = session
 
-        # The sink callback can run outside the normal asyncio
-        # task context, so capture the loop here.
+        # Receive callbacks can happen outside normal asyncio
+        # task context, so capture the event loop now.
         self.loop = asyncio.get_running_loop()
 
         self.buffers: dict[int, bytearray] = {}
 
-        # Time of the last NON-SILENT audio frame.
+        # Last time the user produced actual speech.
         self.last_speech_time: dict[int, float] = {}
 
+        # Users currently being processed.
         self.processing: set[int] = set()
+
+        # Users whose processing task has already been scheduled.
         self.scheduled: set[int] = set()
 
         self.closed = False
@@ -311,9 +329,8 @@ class VoiceAISink(voice_recv.AudioSink):
 
     def wants_opus(self) -> bool:
         """
-        False = give us decoded PCM instead of Opus.
+        False means we receive decoded PCM.
         """
-
         return False
 
     # ========================================================
@@ -326,9 +343,9 @@ class VoiceAISink(voice_recv.AudioSink):
         data: Any,
     ) -> None:
         """
-        Called by discord-ext-voice-recv when audio arrives.
+        Receive a Discord audio packet.
 
-        This function must stay synchronous.
+        Must remain synchronous.
         """
 
         if self.closed:
@@ -348,7 +365,7 @@ class VoiceAISink(voice_recv.AudioSink):
                 return
 
             # ------------------------------------------------
-            # Get PCM
+            # Extract PCM
             # ------------------------------------------------
 
             pcm = getattr(
@@ -383,22 +400,23 @@ class VoiceAISink(voice_recv.AudioSink):
                 return
 
             # ------------------------------------------------
-            # Calculate volume BEFORE buffering.
+            # Volume detection
             # ------------------------------------------------
 
-            rms = calculate_rms(pcm)
-            peak = calculate_peak(pcm)
+            rms = calculate_rms(
+                pcm
+            )
+
+            peak = calculate_peak(
+                pcm
+            )
 
             is_speech = (
                 rms >= SILENCE_RMS_THRESHOLD
             )
 
             # ------------------------------------------------
-            # Buffer audio.
-            #
-            # We intentionally keep the silence after speech
-            # because Gemini can benefit from the natural end
-            # of the utterance.
+            # Buffer
             # ------------------------------------------------
 
             buffer = self.buffers.setdefault(
@@ -416,17 +434,17 @@ class VoiceAISink(voice_recv.AudioSink):
                     - len(buffer),
                 )
 
-                if remaining:
+                if remaining > 0:
                     buffer.extend(
                         pcm[:remaining]
                     )
             else:
-                buffer.extend(pcm)
+                buffer.extend(
+                    pcm
+                )
 
             # ------------------------------------------------
-            # ONLY speech updates the silence timer.
-            #
-            # This is the important fix.
+            # Only actual speech resets silence timer
             # ------------------------------------------------
 
             if is_speech:
@@ -455,10 +473,13 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
             # ------------------------------------------------
-            # Maximum recording duration fallback.
+            # Maximum duration safeguard
             # ------------------------------------------------
 
-            if duration >= MAX_RECORDING_SECONDS:
+            if (
+                duration
+                >= MAX_RECORDING_SECONDS
+            ):
                 logger.info(
                     "Maximum recording duration reached | "
                     "user=%s | duration=%.2fs",
@@ -476,7 +497,7 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
     # ========================================================
-    # THREAD-SAFE PROCESS SCHEDULER
+    # THREAD-SAFE SCHEDULER
     # ========================================================
 
     def _schedule_process(
@@ -484,10 +505,7 @@ class VoiceAISink(voice_recv.AudioSink):
         user_id: int,
     ) -> None:
         """
-        Safely schedule processing on the asyncio event loop.
-
-        The receive sink callback may execute outside the
-        normal asyncio task context.
+        Schedule processing safely on the asyncio loop.
         """
 
         if self.closed:
@@ -499,9 +517,12 @@ class VoiceAISink(voice_recv.AudioSink):
         if user_id in self.scheduled:
             return
 
-        self.scheduled.add(user_id)
+        self.scheduled.add(
+            user_id
+        )
 
         def schedule() -> None:
+
             if self.closed:
                 self.scheduled.discard(
                     user_id
@@ -538,14 +559,11 @@ class VoiceAISink(voice_recv.AudioSink):
         self,
     ) -> None:
         """
-        Detect when a user stops talking.
-
-        Only NON-SILENT audio updates last_speech_time.
-        Therefore Discord's continuing silent PCM packets
-        cannot keep the recording alive forever.
+        Detect when speech has ended.
         """
 
         try:
+
             while not self.closed:
 
                 await asyncio.sleep(
@@ -554,9 +572,13 @@ class VoiceAISink(voice_recv.AudioSink):
 
                 now = time.monotonic()
 
-                for user_id, last_time in list(
+                for (
+                    user_id,
+                    last_time,
+                ) in list(
                     self.last_speech_time.items()
                 ):
+
                     if user_id in self.processing:
                         continue
 
@@ -632,7 +654,7 @@ class VoiceAISink(voice_recv.AudioSink):
 
         try:
             # ------------------------------------------------
-            # Take current buffer.
+            # Take current buffer
             # ------------------------------------------------
 
             buffer = self.buffers.pop(
@@ -648,7 +670,9 @@ class VoiceAISink(voice_recv.AudioSink):
             if not buffer:
                 return
 
-            pcm = bytes(buffer)
+            pcm = bytes(
+                buffer
+            )
 
             duration = pcm_duration(
                 pcm,
@@ -678,11 +702,15 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
             # ------------------------------------------------
-            # Convert Discord audio:
+            # Discord PCM
             #
-            # 48kHz stereo
+            # 48kHz stereo 16-bit
+            #
             # ->
-            # 16kHz mono
+            #
+            # Gemini PCM
+            #
+            # 16kHz mono 16-bit
             # ------------------------------------------------
 
             gemini_pcm = resample_pcm(
@@ -694,6 +722,14 @@ class VoiceAISink(voice_recv.AudioSink):
                 sample_width=DISCORD_SAMPLE_WIDTH,
             )
 
+            if not gemini_pcm:
+                logger.warning(
+                    "Gemini PCM conversion produced no audio | "
+                    "user=%s",
+                    user_id,
+                )
+                return
+
             wav_data = pcm_to_wav(
                 gemini_pcm,
                 sample_rate=GEMINI_INPUT_SAMPLE_RATE,
@@ -701,16 +737,22 @@ class VoiceAISink(voice_recv.AudioSink):
                 sample_width=DISCORD_SAMPLE_WIDTH,
             )
 
+            if not wav_data:
+                logger.warning(
+                    "WAV conversion produced no audio | "
+                    "user=%s",
+                    user_id,
+                )
+                return
+
             # ------------------------------------------------
-            # User information.
+            # Resolve username
             # ------------------------------------------------
 
             username = f"User {user_id}"
 
             try:
-                guild = self.session.guild
-
-                member = guild.get_member(
+                member = self.session.guild.get_member(
                     user_id
                 )
 
@@ -721,22 +763,24 @@ class VoiceAISink(voice_recv.AudioSink):
                     )
 
             except Exception:
-                pass
+                logger.debug(
+                    "Could not resolve member name | user=%s",
+                    user_id,
+                    exc_info=True,
+                )
 
             # ------------------------------------------------
-            # Character.
+            # Character
             # ------------------------------------------------
 
-            character = None
-
-            try:
-                character = self.session.character
-
-            except Exception:
-                character = None
+            character = getattr(
+                self.session,
+                "character",
+                None,
+            )
 
             # ------------------------------------------------
-            # Voice + speed.
+            # Voice
             # ------------------------------------------------
 
             voice_name = normalize_voice_name(
@@ -747,6 +791,17 @@ class VoiceAISink(voice_recv.AudioSink):
                 )
             )
 
+            if not is_valid_voice(
+                voice_name
+            ):
+                voice_name = (
+                    DEFAULT_GEMINI_VOICE
+                )
+
+            # ------------------------------------------------
+            # Speech speed
+            # ------------------------------------------------
+
             speed = normalize_speech_speed(
                 getattr(
                     self.session,
@@ -756,11 +811,19 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
             # ------------------------------------------------
-            # AI processing.
+            # Gemini
+            #
+            # process_voice() is responsible for:
+            #
+            # 1. Audio -> transcript
+            # 2. Transcript -> AI response
+            # 3. AI response -> Gemini TTS
+            #
+            # The voice system only handles Discord audio.
             # ------------------------------------------------
 
-            result = (
-                await self.session.engine.process_voice(
+            result = await (
+                self.session.engine.process_voice(
                     audio=wav_data,
                     username=username,
                     voice=voice_name,
@@ -777,27 +840,37 @@ class VoiceAISink(voice_recv.AudioSink):
                 return
 
             if not result.get(
-                "success"
+                "success",
+                False,
             ):
                 logger.warning(
                     "Voice AI failed | user=%s | error=%s",
                     user_id,
-                    result.get("error"),
+                    result.get(
+                        "error",
+                        "unknown error",
+                    ),
                 )
                 return
 
-            transcript = result.get(
-                "transcript",
-                "",
-            )
+            transcript = str(
+                result.get(
+                    "transcript",
+                    "",
+                )
+                or ""
+            ).strip()
 
-            response_text = result.get(
-                "response",
-                "",
-            )
+            response_text = str(
+                result.get(
+                    "response",
+                    "",
+                )
+                or ""
+            ).strip()
 
             audio = result.get(
-                "audio",
+                "audio"
             )
 
             logger.info(
@@ -809,12 +882,17 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
             # ------------------------------------------------
-            # Play TTS.
+            # Play Gemini TTS
             # ------------------------------------------------
 
             if audio:
                 await self.session.play_tts(
                     audio
+                )
+            else:
+                logger.debug(
+                    "Gemini returned no TTS audio | user=%s",
+                    user_id,
                 )
 
         except asyncio.CancelledError:
@@ -832,8 +910,7 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
             # ------------------------------------------------
-            # If the user started talking again while AI was
-            # processing, keep the new buffer alive.
+            # Keep audio that arrived while AI was processing.
             # ------------------------------------------------
 
             if (
@@ -851,6 +928,7 @@ class VoiceAISink(voice_recv.AudioSink):
     # ========================================================
 
     def cleanup(self) -> None:
+
         self.closed = True
 
         if self._silence_task:
@@ -872,7 +950,7 @@ class VoiceAISink(voice_recv.AudioSink):
 # ============================================================
 
 class VoiceSession:
-    """One AI voice session."""
+    """One Cloud Voice AI session."""
 
     def __init__(
         self,
@@ -895,6 +973,13 @@ class VoiceSession:
         self.voice_name = normalize_voice_name(
             voice
         )
+
+        if not is_valid_voice(
+            self.voice_name
+        ):
+            self.voice_name = (
+                DEFAULT_GEMINI_VOICE
+            )
 
         self.speech_speed = normalize_speech_speed(
             speed
@@ -937,8 +1022,8 @@ class VoiceSession:
             voice_recv.VoiceRecvClient,
         ):
             raise RuntimeError(
-                "VoiceRecvClient is required for "
-                "voice receive."
+                "VoiceRecvClient is required "
+                "for voice receive."
             )
 
         if self.sink is not None:
@@ -1040,6 +1125,7 @@ class VoiceSession:
                 self.guild.id,
                 name,
             )
+
         else:
             logger.info(
                 "Character cleared | guild=%s",
@@ -1066,18 +1152,27 @@ class VoiceSession:
 
         async with self._play_lock:
 
-            # Wait for previous audio.
+            # ------------------------------------------------
+            # Wait for current playback
+            # ------------------------------------------------
+
             while self.voice_client.is_playing():
+
+                if self._closed:
+                    return
+
                 await asyncio.sleep(
                     0.05
                 )
 
             # ------------------------------------------------
-            # Gemini TTS:
+            # Gemini TTS output
             #
             # 24kHz mono 16-bit
             #
-            # Discord:
+            # ->
+            #
+            # Discord
             #
             # 48kHz stereo 16-bit
             # ------------------------------------------------
@@ -1113,6 +1208,7 @@ class VoiceSession:
             ) -> None:
 
                 def finish() -> None:
+
                     if finished.done():
                         return
 
@@ -1141,19 +1237,23 @@ class VoiceSession:
             )
 
             try:
+
                 self.voice_client.play(
                     source,
                     after=after_playback,
                 )
 
             except Exception:
+
                 source.cleanup()
                 raise
 
             try:
+
                 await finished
 
             except asyncio.CancelledError:
+
                 try:
                     if self.voice_client.is_playing():
                         self.voice_client.stop()
@@ -1163,9 +1263,14 @@ class VoiceSession:
                 raise
 
             except Exception:
+
                 logger.exception(
                     "TTS playback failed"
                 )
+
+            finally:
+
+                source.cleanup()
 
     # ========================================================
     # CLOSE
@@ -1179,10 +1284,12 @@ class VoiceSession:
         self._closed = True
 
         try:
+
             if self.sink:
                 self.sink.cleanup()
 
         except Exception:
+
             logger.exception(
                 "Failed to cleanup voice sink"
             )
@@ -1190,6 +1297,7 @@ class VoiceSession:
         self.sink = None
 
         try:
+
             if self.voice_client.is_playing():
                 self.voice_client.stop()
 
@@ -1250,17 +1358,18 @@ class VoiceSessionManager:
 
         guild = channel.guild
 
-        # ----------------------------------------------------
-        # Avoid nested self._lock -> leave() deadlock.
-        # ----------------------------------------------------
-
         async with self._lock:
+
+            # ------------------------------------------------
+            # Existing Cloud Voice AI session
+            # ------------------------------------------------
 
             existing = self.sessions.get(
                 guild.id
             )
 
             if existing:
+
                 if existing.channel.id == channel.id:
                     return existing
 
@@ -1271,23 +1380,28 @@ class VoiceSessionManager:
 
                 try:
                     await existing.close()
+
                 except Exception:
                     logger.exception(
-                        "Failed to close existing voice session"
+                        "Failed to close existing "
+                        "voice session"
                     )
 
                 try:
+
                     if existing.voice_client.is_connected():
                         await existing.voice_client.disconnect(
                             force=True
                         )
+
                 except Exception:
                     logger.exception(
-                        "Failed to disconnect existing voice client"
+                        "Failed to disconnect existing "
+                        "voice client"
                     )
 
             # ------------------------------------------------
-            # Existing Discord voice client.
+            # Existing Discord voice client
             # ------------------------------------------------
 
             existing_client = guild.voice_client
@@ -1302,18 +1416,20 @@ class VoiceSessionManager:
                         await existing_client.disconnect(
                             force=True
                         )
+
                     except Exception:
                         logger.exception(
-                            "Failed to disconnect "
-                            "old voice client"
+                            "Failed to disconnect old "
+                            "voice client"
                         )
 
             # ------------------------------------------------
-            # Connect using VoiceRecvClient.
+            # Connect VoiceRecvClient
             # ------------------------------------------------
 
             logger.info(
-                "Connecting VoiceRecvClient | guild=%s | channel=%s",
+                "Connecting VoiceRecvClient | "
+                "guild=%s | channel=%s",
                 guild.id,
                 channel.name,
             )
@@ -1328,6 +1444,7 @@ class VoiceSessionManager:
                 voice_client,
                 voice_recv.VoiceRecvClient,
             ):
+
                 try:
                     await voice_client.disconnect(
                         force=True
@@ -1341,7 +1458,7 @@ class VoiceSessionManager:
                 )
 
             # ------------------------------------------------
-            # Create session.
+            # Create session
             # ------------------------------------------------
 
             session = VoiceSession(
@@ -1359,9 +1476,11 @@ class VoiceSessionManager:
             ] = session
 
             try:
+
                 session.start_receive()
 
             except Exception:
+
                 self.sessions.pop(
                     guild.id,
                     None,
@@ -1377,8 +1496,9 @@ class VoiceSessionManager:
                 raise
 
             logger.info(
-                "Voice session created | guild=%s | "
-                "channel=%s | voice=%s | speed=%.2f",
+                "Voice session created | "
+                "guild=%s | channel=%s | "
+                "voice=%s | speed=%.2f",
                 guild.id,
                 channel.name,
                 session.voice,
@@ -1407,6 +1527,7 @@ class VoiceSessionManager:
                 return False
 
             try:
+
                 await session.close()
 
             except Exception:
@@ -1415,6 +1536,7 @@ class VoiceSessionManager:
                 )
 
             try:
+
                 if session.voice_client.is_connected():
                     await session.voice_client.disconnect(
                         force=True
@@ -1440,13 +1562,15 @@ class VoiceSessionManager:
         for guild_id in guild_ids:
 
             try:
+
                 await self.leave(
                     guild_id
                 )
 
             except Exception:
                 logger.exception(
-                    "Failed to close guild voice session | guild=%s",
+                    "Failed to close guild voice "
+                    "session | guild=%s",
                     guild_id,
                 )
 
@@ -1493,7 +1617,9 @@ def format_voice_list() -> str:
             f"`{index:02}` • **{voice}**"
         )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 async def send_voice_list(
@@ -1503,4 +1629,4 @@ async def send_voice_list(
     await interaction.response.send_message(
         format_voice_list(),
         ephemeral=True,
-            )
+    )
