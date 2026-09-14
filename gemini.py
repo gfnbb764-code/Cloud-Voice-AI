@@ -22,7 +22,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from google import genai
 from google.genai import types
@@ -92,6 +92,10 @@ class GeminiEngine:
         self,
     ):
 
+        # ----------------------------------------------------
+        # API KEY
+        # ----------------------------------------------------
+
         self.api_key = (
             GEMINI_API_KEY
             or os.getenv(
@@ -154,7 +158,7 @@ class GeminiEngine:
         self.last_request_at = 0.0
 
         # ----------------------------------------------------
-        # Closed
+        # State
         # ----------------------------------------------------
 
         self.closed = False
@@ -173,7 +177,9 @@ class GeminiEngine:
     async def process_voice(
         self,
         audio: bytes,
-        memory: Optional[list[dict[str, Any]]] = None,
+        memory: Optional[
+            list[dict[str, Any]]
+        ] = None,
         username: Optional[str] = None,
         voice: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
@@ -204,10 +210,13 @@ class GeminiEngine:
         if len(audio) > MAX_AUDIO_BYTES:
 
             logger.warning(
-                "Audio exceeds maximum size."
+                "Audio exceeds maximum size: %s bytes",
+                len(audio),
             )
 
             return None
+
+        started_at = time.monotonic()
 
         try:
 
@@ -220,6 +229,10 @@ class GeminiEngine:
             )
 
             if not text:
+
+                logger.debug(
+                    "No transcription returned."
+                )
 
                 return None
 
@@ -277,7 +290,7 @@ class GeminiEngine:
             ):
 
                 logger.warning(
-                    "Invalid voice %s, using %s",
+                    "Invalid voice '%s'; using '%s'.",
                     selected_voice,
                     DEFAULT_GEMINI_VOICE,
                 )
@@ -286,11 +299,25 @@ class GeminiEngine:
                     DEFAULT_GEMINI_VOICE
                 )
 
+            # ------------------------------------------------
+            # TTS
+            # ------------------------------------------------
+
             audio_response = (
                 await self.generate_speech(
                     text=response,
                     voice=selected_voice,
                 )
+            )
+
+            elapsed = (
+                time.monotonic()
+                - started_at
+            )
+
+            logger.info(
+                "Voice pipeline completed in %.2fs",
+                elapsed,
             )
 
             return {
@@ -325,6 +352,10 @@ class GeminiEngine:
         يحول WAV إلى نص باستخدام Gemini.
         """
 
+        if self.closed:
+
+            return None
+
         if not audio:
 
             return None
@@ -344,7 +375,7 @@ class GeminiEngine:
         )
 
         # ----------------------------------------------------
-        # Gemini API
+        # Gemini API Request
         # ----------------------------------------------------
 
         async def request():
@@ -360,6 +391,9 @@ class GeminiEngine:
                         (
                             "Transcribe exactly what the user says. "
                             "Return only the spoken text. "
+                            "Preserve the spoken language. "
+                            "Do not translate unless necessary "
+                            "to understand the speech. "
                             "Do not add explanations, labels, "
                             "descriptions, or commentary."
                         ),
@@ -387,7 +421,21 @@ class GeminiEngine:
 
             return None
 
-        return text.strip()
+        text = str(
+            text
+        ).strip()
+
+        if not text:
+
+            return None
+
+        if len(text) > MAX_TEXT_LENGTH:
+
+            text = text[
+                :MAX_TEXT_LENGTH
+            ].strip()
+
+        return text
 
     # ========================================================
     # GENERATE RESPONSE
@@ -396,12 +444,18 @@ class GeminiEngine:
     async def generate_response(
         self,
         text: str,
-        memory: Optional[list[dict[str, Any]]] = None,
+        memory: Optional[
+            list[dict[str, Any]]
+        ] = None,
         username: Optional[str] = None,
     ) -> Optional[str]:
         """
         يرسل النص إلى Gemini ويولد الرد.
         """
+
+        if self.closed:
+
+            return None
 
         if not text:
 
@@ -417,7 +471,7 @@ class GeminiEngine:
 
             text = text[
                 :MAX_TEXT_LENGTH
-            ]
+            ].strip()
 
         self.chat_requests += 1
 
@@ -448,31 +502,40 @@ class GeminiEngine:
         # ----------------------------------------------------
 
         user_label = (
-            username
+            str(username).strip()
             if username
             else "User"
         )
+
+        if not user_label:
+
+            user_label = "User"
 
         # ----------------------------------------------------
         # Prompt
         # ----------------------------------------------------
 
-        prompt_parts = []
+        prompt_parts: list[str] = []
 
         if AI_SYSTEM_PROMPT:
 
             prompt_parts.append(
-                AI_SYSTEM_PROMPT
+                AI_SYSTEM_PROMPT.strip()
             )
 
         prompt_parts.append(
-            "\nYou are currently talking "
+            "You are currently talking "
             "inside a Discord voice channel."
         )
 
         prompt_parts.append(
-            "Keep your answer natural and "
-            "comfortable for spoken conversation."
+            "Keep your answer natural, concise, "
+            "friendly, and comfortable for spoken conversation."
+        )
+
+        prompt_parts.append(
+            "Answer in the same language as the user "
+            "whenever practical."
         )
 
         prompt_parts.append(
@@ -510,14 +573,16 @@ class GeminiEngine:
         )
 
         # ----------------------------------------------------
-        # Request
+        # Gemini Request
         # ----------------------------------------------------
 
         async def request():
 
             config_kwargs = {
                 "temperature": GEMINI_TEMPERATURE,
-                "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
+                "max_output_tokens": (
+                    GEMINI_MAX_OUTPUT_TOKENS
+                ),
             }
 
             response = (
@@ -550,11 +615,19 @@ class GeminiEngine:
 
             return None
 
-        result = result.strip()
+        result = str(
+            result
+        ).strip()
 
         if not result:
 
             return None
+
+        if len(result) > MAX_TEXT_LENGTH:
+
+            result = result[
+                :MAX_TEXT_LENGTH
+            ].strip()
 
         # ----------------------------------------------------
         # تحديث Memory الداخلية
@@ -592,6 +665,10 @@ class GeminiEngine:
             16-bit PCM
         """
 
+        if self.closed:
+
+            return None
+
         if not text:
 
             return None
@@ -606,7 +683,7 @@ class GeminiEngine:
 
             text = text[
                 :MAX_TEXT_LENGTH
-            ]
+            ].strip()
 
         selected_voice = (
             voice
@@ -617,6 +694,12 @@ class GeminiEngine:
             selected_voice
             not in GEMINI_VOICES
         ):
+
+            logger.warning(
+                "Invalid TTS voice '%s'; using '%s'.",
+                selected_voice,
+                DEFAULT_GEMINI_VOICE,
+            )
 
             selected_voice = (
                 DEFAULT_GEMINI_VOICE
@@ -631,7 +714,7 @@ class GeminiEngine:
         )
 
         # ----------------------------------------------------
-        # TTS request
+        # TTS Request
         # ----------------------------------------------------
 
         async def request():
@@ -683,6 +766,11 @@ class GeminiEngine:
 
             return None
 
+        logger.debug(
+            "Gemini TTS returned %s bytes.",
+            len(audio),
+        )
+
         return audio
 
     # ========================================================
@@ -696,6 +784,10 @@ class GeminiEngine:
         """
         استخراج PCM من استجابة Gemini TTS.
         """
+
+        if response is None:
+
+            return None
 
         try:
 
@@ -765,6 +857,13 @@ class GeminiEngine:
                             data
                         )
 
+                    if isinstance(
+                        data,
+                        memoryview,
+                    ):
+
+                        return data.tobytes()
+
         except Exception:
 
             logger.exception(
@@ -797,7 +896,7 @@ class GeminiEngine:
             ]
         )
 
-        lines = []
+        lines: list[str] = []
 
         for item in recent:
 
@@ -808,23 +907,33 @@ class GeminiEngine:
 
                 continue
 
-            role = item.get(
-                "role",
-                "user",
-            )
+            role = str(
+                item.get(
+                    "role",
+                    "user",
+                )
+            ).strip()
 
-            content = item.get(
-                "content",
-                "",
-            )
+            content = str(
+                item.get(
+                    "content",
+                    "",
+                )
+            ).strip()
 
             username = item.get(
-                "username",
+                "username"
             )
 
             if not content:
 
                 continue
+
+            if username:
+
+                username = str(
+                    username
+                ).strip()
 
             if username:
 
@@ -852,21 +961,39 @@ class GeminiEngine:
         content: str,
         username: Optional[str] = None,
     ) -> None:
+        """
+        يضيف رسالة إلى الذاكرة الداخلية
+        مع الحفاظ على الحد الأقصى.
+        """
 
         if not content:
 
             return
 
-        item = {
+        content = str(
+            content
+        ).strip()
+
+        if not content:
+
+            return
+
+        item: dict[str, Any] = {
             "role": role,
             "content": content,
         }
 
         if username:
 
-            item[
-                "username"
-            ] = username
+            username = str(
+                username
+            ).strip()
+
+            if username:
+
+                item[
+                    "username"
+                ] = username
 
         self.memory.append(
             item
@@ -893,6 +1020,9 @@ class GeminiEngine:
     def clear_memory(
         self,
     ) -> None:
+        """
+        يمسح الذاكرة الداخلية بالكامل.
+        """
 
         self.memory.clear()
 
@@ -907,6 +1037,9 @@ class GeminiEngine:
     async def reset(
         self,
     ) -> None:
+        """
+        يعيد حالة الذاكرة الداخلية.
+        """
 
         self.clear_memory()
 
@@ -920,8 +1053,11 @@ class GeminiEngine:
 
     async def _with_retry(
         self,
-        operation,
-    ):
+        operation: Callable[
+            [],
+            Awaitable[Any]
+        ],
+    ) -> Any:
         """
         إعادة المحاولة تلقائيًا.
 
@@ -931,12 +1067,18 @@ class GeminiEngine:
             3
         """
 
-        last_error = None
+        last_error: Optional[
+            Exception
+        ] = None
 
         for attempt in range(
             1,
             MAX_RETRIES + 1,
         ):
+
+            if self.closed:
+
+                return None
 
             try:
 
@@ -965,10 +1107,15 @@ class GeminiEngine:
 
                 permanent_errors = (
                     "api key",
+                    "invalid api key",
                     "permission denied",
                     "unauthorized",
+                    "authentication",
                     "invalid argument",
-                    "invalid api key",
+                    "invalid model",
+                    "model not found",
+                    "not found",
+                    "permission",
                 )
 
                 if any(
@@ -1024,8 +1171,12 @@ class GeminiEngine:
     async def close(
         self,
     ) -> None:
+        """
+        يغلق محرك Gemini ويحرر حالته.
+        """
 
         if self.closed:
+
             return
 
         self.closed = True
@@ -1033,12 +1184,20 @@ class GeminiEngine:
         self.memory.clear()
 
         # ----------------------------------------------------
-        # google-genai client الحالي
-        # لا يحتاج إغلاقًا إجباريًا
+        # google-genai client
         # ----------------------------------------------------
+        #
+        # لا نعتمد على close إجباري هنا حتى تبقى
+        # متوافقة مع نسخة google-genai الموجودة على الهوست.
+        #
 
         self.client = None
 
         logger.info(
             "GeminiEngine closed."
         )
+
+
+# ============================================================
+# END OF gemini.py
+# ============================================================
