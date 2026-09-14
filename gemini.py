@@ -1,14 +1,26 @@
 # gemini.py
 # ============================================================
-# Cloud Voice AI — Gemini Engine
-# Supports:
-# - Gemini STT
-# - Gemini Chat
-# - Gemini TTS
-# - Character personality/style/instructions
-# - Per-character voice
-# - Speech speed post-processing
+# Cloud Voice AI — Lightweight Gemini Engine
+#
+# Pipeline:
+# Discord PCM
+#     ↓
+# Gemini 2.5 Flash-Lite STT
+#     ↓
+# Gemini 2.5 Flash-Lite AI
+#     ↓
+# Gemini 2.5 Flash TTS
+#     ↓
+# Discord PCM
+#
+# Designed for:
+# - Low API consumption
+# - Short voice responses
+# - Arabic + multilingual speech
+# - Gemini TTS voices
+# - Per-character personality/style/instructions
 # - Conversation memory
+# - No pointless 429 retries
 # ============================================================
 
 from __future__ import annotations
@@ -28,17 +40,14 @@ from config import (
     API_RETRIES,
     API_RETRY_DELAY_SECONDS,
     API_TIMEOUT_SECONDS,
-    CHAT_MODEL,
     DEFAULT_GEMINI_VOICE,
     GEMINI_API_KEY,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_TEMPERATURE,
     GEMINI_TTS_SAMPLE_RATE,
     GEMINI_VOICES,
-    MAX_MEMORY_MESSAGES,
     MEMORY_ENABLED,
-    TTS_MODEL,
-    TRANSCRIBE_MODEL,
+    MAX_MEMORY_MESSAGES,
     normalize_speech_speed,
     normalize_voice_name,
 )
@@ -47,14 +56,46 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CONSTANTS
+# MODELS
+# ============================================================
+#
+# Intentionally hardcoded here so an old config.py cannot
+# accidentally switch the voice system back to the exhausted
+# gemini-3.5-transcribe model.
+#
+# Google currently lists:
+#   gemini-2.5-flash-lite
+#   gemini-2.5-flash-preview-tts
+#
+# Flash-Lite is used for both:
+#   1. Speech understanding / transcription
+#   2. AI response
+#
+# TTS uses the dedicated Google Gemini TTS model.
+# ============================================================
+
+LIGHT_MODEL = "gemini-2.5-flash-lite"
+TTS_MODEL = "gemini-2.5-flash-preview-tts"
+
+
+# ============================================================
+# AUDIO
 # ============================================================
 
 DEFAULT_AUDIO_MIME_TYPE = "audio/wav"
 
-MIN_TEXT_LENGTH = 1
-MAX_TRANSCRIPT_LENGTH = 4000
-MAX_RESPONSE_LENGTH = 4000
+# Gemini TTS outputs PCM at 24kHz.
+TTS_SOURCE_SAMPLE_RATE = 24000
+
+# Discord voice responses should remain reasonably short.
+MAX_TRANSCRIPT_LENGTH = 2500
+MAX_RESPONSE_LENGTH = 1800
+
+# Keep voice memory deliberately small to reduce input tokens.
+VOICE_MEMORY_LIMIT = min(
+    max(int(MAX_MEMORY_MESSAGES), 0),
+    8,
+)
 
 DEFAULT_SPEECH_SPEED = 1.0
 
@@ -88,43 +129,46 @@ def _limit_text(
     return text[:maximum].rstrip()
 
 
-def _safe_username(username: str) -> str:
+def _safe_username(
+    username: str,
+) -> str:
 
     username = _clean_text(username)
 
     if not username:
         return "User"
 
-    return _limit_text(username, 100)
+    return _limit_text(
+        username,
+        80,
+    )
 
 
 # ============================================================
-# GEMINI RESPONSE EXTRACTION
+# RESPONSE TEXT EXTRACTION
 # ============================================================
 
 def _extract_response_text(
     response: Any,
 ) -> str:
     """
-    Extract normal text AND Gemini audio transcription text.
+    Extract normal Gemini text.
 
-    Gemini Transcribe can return:
-        part.audio_transcription.text
-
-    instead of:
-        part.text
-
-    This is important for STT.
+    Also supports audio transcription fields in case
+    the SDK returns transcription metadata.
     """
 
     results: list[str] = []
 
     try:
-        candidates = getattr(
-            response,
-            "candidates",
-            None,
-        ) or []
+        candidates = (
+            getattr(
+                response,
+                "candidates",
+                None,
+            )
+            or []
+        )
 
         for candidate in candidates:
 
@@ -137,14 +181,18 @@ def _extract_response_text(
             if content is None:
                 continue
 
-            parts = getattr(
-                content,
-                "parts",
-                None,
-            ) or []
+            parts = (
+                getattr(
+                    content,
+                    "parts",
+                    None,
+                )
+                or []
+            )
 
             for part in parts:
 
+                # Normal text.
                 text = getattr(
                     part,
                     "text",
@@ -152,11 +200,19 @@ def _extract_response_text(
                 )
 
                 if text:
-                    cleaned = _clean_text(text)
+                    cleaned = _clean_text(
+                        text
+                    )
 
-                    if cleaned and cleaned not in results:
-                        results.append(cleaned)
+                    if (
+                        cleaned
+                        and cleaned not in results
+                    ):
+                        results.append(
+                            cleaned
+                        )
 
+                # Possible audio transcription.
                 audio_transcription = getattr(
                     part,
                     "audio_transcription",
@@ -172,6 +228,7 @@ def _extract_response_text(
                     )
 
                     if transcription_text:
+
                         cleaned = _clean_text(
                             transcription_text
                         )
@@ -180,16 +237,21 @@ def _extract_response_text(
                             cleaned
                             and cleaned not in results
                         ):
-                            results.append(cleaned)
+                            results.append(
+                                cleaned
+                            )
 
     except Exception:
         logger.exception(
-            "Failed to extract structured Gemini response"
+            "Failed to extract Gemini response"
         )
 
     if results:
-        return "\n".join(results).strip()
+        return "\n".join(
+            results
+        ).strip()
 
+    # SDK convenience property.
     try:
         fallback = getattr(
             response,
@@ -198,7 +260,9 @@ def _extract_response_text(
         )
 
         if fallback:
-            return _clean_text(fallback)
+            return _clean_text(
+                fallback
+            )
 
     except Exception:
         pass
@@ -213,13 +277,19 @@ def _extract_response_text(
 def _extract_audio_bytes(
     response: Any,
 ) -> bytes | None:
+    """
+    Extract raw PCM returned by Gemini TTS.
+    """
 
     try:
-        candidates = getattr(
-            response,
-            "candidates",
-            None,
-        ) or []
+        candidates = (
+            getattr(
+                response,
+                "candidates",
+                None,
+            )
+            or []
+        )
 
         for candidate in candidates:
 
@@ -232,11 +302,14 @@ def _extract_audio_bytes(
             if content is None:
                 continue
 
-            parts = getattr(
-                content,
-                "parts",
-                None,
-            ) or []
+            parts = (
+                getattr(
+                    content,
+                    "parts",
+                    None,
+                )
+                or []
+            )
 
             for part in parts:
 
@@ -258,17 +331,28 @@ def _extract_audio_bytes(
                 if data is None:
                     continue
 
-                if isinstance(data, bytes):
+                if isinstance(
+                    data,
+                    bytes,
+                ):
                     return data
 
-                if isinstance(data, bytearray):
+                if isinstance(
+                    data,
+                    bytearray,
+                ):
                     return bytes(data)
 
-                if isinstance(data, memoryview):
+                if isinstance(
+                    data,
+                    memoryview,
+                ):
                     return data.tobytes()
 
-                if isinstance(data, str):
-
+                if isinstance(
+                    data,
+                    str,
+                ):
                     try:
                         return base64.b64decode(
                             data
@@ -278,7 +362,7 @@ def _extract_audio_bytes(
 
     except Exception:
         logger.exception(
-            "Failed to extract Gemini audio"
+            "Failed to extract Gemini TTS audio"
         )
 
     return None
@@ -288,28 +372,80 @@ def _extract_audio_bytes(
 # ERROR HELPERS
 # ============================================================
 
-def _is_retryable_error(
+def _error_text(
+    error: Exception,
+) -> str:
+
+    try:
+        return str(error).lower()
+    except Exception:
+        return ""
+
+
+def _is_quota_error(
     error: Exception,
 ) -> bool:
 
-    text = str(error).lower()
+    text = _error_text(
+        error
+    )
 
-    retry_words = (
-        "429",
-        "rate limit",
-        "resource exhausted",
-        "temporarily unavailable",
+    quota_markers = (
+        "resource_exhausted",
+        "quota exceeded",
+        "free_tier",
+        "generativelanguage.googleapis.com",
+        "generaterequestsperdayperprojectpermodel",
+        "quota_value",
+    )
+
+    return (
+        "429" in text
+        and any(
+            marker in text
+            for marker in quota_markers
+        )
+    )
+
+
+def _is_retryable_error(
+    error: Exception,
+) -> bool:
+    """
+    Only retry genuine temporary infrastructure errors.
+
+    429 is intentionally NOT retried.
+
+    This prevents the old behavior where a single exhausted
+    request caused several pointless requests.
+    """
+
+    if _is_quota_error(error):
+        return False
+
+    text = _error_text(
+        error
+    )
+
+    # Do not retry any 429 at all.
+    if "429" in text:
+        return False
+
+    retry_markers = (
         "timeout",
         "timed out",
-        "503",
-        "500",
-        "internal server error",
+        "temporarily unavailable",
         "service unavailable",
+        "internal server error",
+        "500",
+        "502",
+        "503",
+        "504",
     )
 
     return any(
-        word in text
-        for word in retry_words
+        marker in text
+        for marker in retry_markers
     )
 
 
@@ -321,7 +457,9 @@ def _strip_markdown_for_voice(
     text: str,
 ) -> str:
 
-    text = _clean_text(text)
+    text = _clean_text(
+        text
+    )
 
     if not text:
         return ""
@@ -337,7 +475,10 @@ def _strip_markdown_for_voice(
     )
 
     for old, new in replacements:
-        text = text.replace(old, new)
+        text = text.replace(
+            old,
+            new,
+        )
 
     lines: list[str] = []
 
@@ -348,12 +489,22 @@ def _strip_markdown_for_voice(
         if not line:
             continue
 
-        if line.startswith(("-", "*", "•")):
+        if line.startswith(
+            (
+                "-",
+                "*",
+                "•",
+            )
+        ):
             line = line[1:].strip()
 
-        lines.append(line)
+        lines.append(
+            line
+        )
 
-    return " ".join(lines).strip()
+    return " ".join(
+        lines
+    ).strip()
 
 
 # ============================================================
@@ -368,19 +519,35 @@ def _build_character_prompt(
         return ""
 
     name = _clean_text(
-        getattr(character, "name", "")
+        getattr(
+            character,
+            "name",
+            "",
+        )
     )
 
     personality = _clean_text(
-        getattr(character, "personality", "")
+        getattr(
+            character,
+            "personality",
+            "",
+        )
     )
 
     style = _clean_text(
-        getattr(character, "style", "")
+        getattr(
+            character,
+            "style",
+            "",
+        )
     )
 
     instructions = _clean_text(
-        getattr(character, "instructions", "")
+        getattr(
+            character,
+            "instructions",
+            "",
+        )
     )
 
     if not any(
@@ -396,9 +563,9 @@ def _build_character_prompt(
     sections: list[str] = []
 
     sections.append(
-        "\n\nCHARACTER PROFILE\n"
-        "The following is a user-created character profile. "
-        "Use it to control personality and speaking style only."
+        "CHARACTER PROFILE\n"
+        "Use this profile only to control personality "
+        "and speaking style."
     )
 
     if name:
@@ -427,7 +594,9 @@ def _build_character_prompt(
         "or authorization rules."
     )
 
-    return "\n".join(sections)
+    return "\n".join(
+        sections
+    )
 
 
 # ============================================================
@@ -455,14 +624,21 @@ class GeminiEngine:
                 "GEMINI_API_KEY is missing."
             )
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Force the lightweight models here.
+        # Old config.py model values cannot accidentally
+        # bring back gemini-3.5-transcribe.
+        # ----------------------------------------------------
+
         self.chat_model = (
             chat_model
-            or CHAT_MODEL
+            or LIGHT_MODEL
         )
 
         self.transcribe_model = (
             transcribe_model
-            or TRANSCRIBE_MODEL
+            or LIGHT_MODEL
         )
 
         self.tts_model = (
@@ -474,14 +650,22 @@ class GeminiEngine:
             api_key=self.api_key
         )
 
+        # ----------------------------------------------------
+        # Voice
+        # ----------------------------------------------------
+
         self.current_voice = normalize_voice_name(
             DEFAULT_GEMINI_VOICE
         )
 
+        # ----------------------------------------------------
+        # Small memory
+        # ----------------------------------------------------
+
         self._memory: deque[
             dict[str, str]
         ] = deque(
-            maxlen=MAX_MEMORY_MESSAGES
+            maxlen=VOICE_MEMORY_LIMIT
         )
 
         self._lock = asyncio.Lock()
@@ -489,13 +673,20 @@ class GeminiEngine:
         self.processed_requests = 0
         self.failed_requests = 0
 
+        self.quota_exhausted = False
+
+
     # ========================================================
     # VOICE
     # ========================================================
 
     @property
-    def voice(self) -> str:
+    def voice(
+        self,
+    ) -> str:
+
         return self.current_voice
+
 
     def set_voice(
         self,
@@ -515,6 +706,7 @@ class GeminiEngine:
 
         return normalized
 
+
     # ========================================================
     # RETRY
     # ========================================================
@@ -525,33 +717,81 @@ class GeminiEngine:
         *,
         operation_name: str = "Gemini request",
     ):
+        """
+        Execute a Gemini request.
+
+        IMPORTANT:
+        429 quota errors are never retried.
+
+        This fixes the old log spam:
+            retrying in 1.5s
+            retrying in 3.0s
+            retrying in 4.5s
+
+        when the daily quota is already exhausted.
+        """
 
         last_error: Exception | None = None
 
+        attempts = max(
+            0,
+            int(API_RETRIES),
+        )
+
         for attempt in range(
-            API_RETRIES + 1
+            attempts + 1
         ):
 
             try:
 
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     operation(),
                     timeout=API_TIMEOUT_SECONDS,
                 )
+
+                return result
 
             except Exception as error:
 
                 last_error = error
 
+                # ------------------------------------------------
+                # QUOTA EXHAUSTED
+                # ------------------------------------------------
+
+                if _is_quota_error(
+                    error
+                ):
+
+                    self.quota_exhausted = True
+
+                    logger.error(
+                        "%s stopped: Gemini quota exhausted. "
+                        "No retry will be performed.",
+                        operation_name,
+                    )
+
+                    raise
+
+                # ------------------------------------------------
+                # Non-retryable error
+                # ------------------------------------------------
+
                 if (
-                    attempt >= API_RETRIES
-                    or not _is_retryable_error(error)
+                    attempt >= attempts
+                    or not _is_retryable_error(
+                        error
+                    )
                 ):
                     break
 
                 delay = (
-                    API_RETRY_DELAY_SECONDS
-                    * (attempt + 1)
+                    float(
+                        API_RETRY_DELAY_SECONDS
+                    )
+                    * float(
+                        attempt + 1
+                    )
                 )
 
                 logger.warning(
@@ -574,6 +814,7 @@ class GeminiEngine:
             f"{operation_name} failed."
         )
 
+
     # ========================================================
     # SPEECH TO TEXT
     # ========================================================
@@ -588,6 +829,15 @@ class GeminiEngine:
         if not audio:
             return ""
 
+        # ----------------------------------------------------
+        # Use the lightweight multimodal Flash-Lite model.
+        #
+        # We are NOT using gemini-3.5-transcribe anymore.
+        #
+        # The model receives the actual audio and is explicitly
+        # instructed to return only the spoken transcript.
+        # ----------------------------------------------------
+
         async def operation():
 
             response = await asyncio.to_thread(
@@ -599,12 +849,20 @@ class GeminiEngine:
                         mime_type=mime_type,
                     ),
                     (
-                        "Transcribe exactly what the user said. "
-                        "Detect the spoken language automatically. "
-                        "Return only the transcript. "
-                        "Do not summarize, explain, or translate."
+                        "Transcribe the user's speech exactly.\n"
+                        "Detect the spoken language automatically.\n"
+                        "The user may speak Arabic or English.\n"
+                        "Return ONLY the transcript.\n"
+                        "Do not summarize.\n"
+                        "Do not explain.\n"
+                        "Do not translate.\n"
+                        "Do not answer the user."
                     ),
                 ],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=512,
+                ),
             )
 
             return response
@@ -624,17 +882,20 @@ class GeminiEngine:
         )
 
         if transcript:
+
             logger.info(
                 "STT successful | transcript=%s",
                 transcript,
             )
 
         else:
+
             logger.warning(
                 "STT returned no transcript"
             )
 
         return transcript
+
 
     # ========================================================
     # MEMORY
@@ -649,7 +910,12 @@ class GeminiEngine:
         if not MEMORY_ENABLED:
             return
 
-        content = _clean_text(content)
+        if VOICE_MEMORY_LIMIT <= 0:
+            return
+
+        content = _clean_text(
+            content
+        )
 
         if not content:
             return
@@ -668,6 +934,7 @@ class GeminiEngine:
             }
         )
 
+
     def add_user_message(
         self,
         content: str,
@@ -677,6 +944,7 @@ class GeminiEngine:
             "user",
             content,
         )
+
 
     def add_assistant_message(
         self,
@@ -688,11 +956,20 @@ class GeminiEngine:
             content,
         )
 
-    def clear_memory(self) -> None:
+
+    def clear_memory(
+        self,
+    ) -> None:
+
         self._memory.clear()
 
-    def reset_memory(self) -> None:
+
+    def reset_memory(
+        self,
+    ) -> None:
+
         self.clear_memory()
+
 
     def get_memory(
         self,
@@ -703,6 +980,7 @@ class GeminiEngine:
             for item in self._memory
         ]
 
+
     @property
     def memory(
         self,
@@ -710,8 +988,15 @@ class GeminiEngine:
 
         return self.get_memory()
 
-    def memory_size(self) -> int:
-        return len(self._memory)
+
+    def memory_size(
+        self,
+    ) -> int:
+
+        return len(
+            self._memory
+        )
+
 
     # ========================================================
     # CHAT CONTENT
@@ -726,13 +1011,19 @@ class GeminiEngine:
         ] | None = None,
     ) -> list[types.Content]:
 
-        contents: list[types.Content] = []
+        contents: list[
+            types.Content
+        ] = []
 
         source_memory = (
             list(memory)
             if memory is not None
             else self.get_memory()
         )
+
+        # ----------------------------------------------------
+        # Memory
+        # ----------------------------------------------------
 
         for item in source_memory:
 
@@ -765,11 +1056,18 @@ class GeminiEngine:
                     role=sdk_role,
                     parts=[
                         types.Part.from_text(
-                            text=content
+                            text=_limit_text(
+                                content,
+                                800,
+                            )
                         )
                     ],
                 )
             )
+
+        # ----------------------------------------------------
+        # Current user message
+        # ----------------------------------------------------
 
         current_text = (
             f"{_safe_username(username)} said:\n"
@@ -789,6 +1087,7 @@ class GeminiEngine:
 
         return contents
 
+
     # ========================================================
     # AI RESPONSE
     # ========================================================
@@ -805,9 +1104,11 @@ class GeminiEngine:
         system_prompt: str | None = None,
     ) -> str:
 
-        text = _clean_text(text)
+        text = _clean_text(
+            text
+        )
 
-        if len(text) < MIN_TEXT_LENGTH:
+        if not text:
             return ""
 
         base_prompt = (
@@ -816,13 +1117,22 @@ class GeminiEngine:
             else AI_SYSTEM_PROMPT
         )
 
-        character_prompt = _build_character_prompt(
-            character
+        character_prompt = (
+            _build_character_prompt(
+                character
+            )
         )
 
         final_system_prompt = (
-            f"{base_prompt}"
-            f"{character_prompt}"
+            f"{base_prompt}\n\n"
+            f"{character_prompt}\n\n"
+            "VOICE MODE:\n"
+            "You are speaking inside a Discord voice channel.\n"
+            "Keep replies concise and natural.\n"
+            "Usually answer in 1-3 short sentences.\n"
+            "Do not use markdown.\n"
+            "Do not use code blocks.\n"
+            "Do not write long explanations unless explicitly asked."
         )
 
         contents = self._build_chat_contents(
@@ -839,8 +1149,18 @@ class GeminiEngine:
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=final_system_prompt,
-                    temperature=GEMINI_TEMPERATURE,
-                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                    temperature=min(
+                        float(
+                            GEMINI_TEMPERATURE
+                        ),
+                        0.8,
+                    ),
+                    max_output_tokens=min(
+                        int(
+                            GEMINI_MAX_OUTPUT_TOKENS
+                        ),
+                        512,
+                    ),
                 ),
             )
 
@@ -865,12 +1185,14 @@ class GeminiEngine:
         )
 
         if answer:
+
             logger.info(
                 "AI response generated | response=%s",
                 answer,
             )
 
         return answer
+
 
     # ========================================================
     # SPEED PROCESSING
@@ -889,10 +1211,14 @@ class GeminiEngine:
         if not pcm:
             return pcm
 
-        if abs(speed - 1.0) < 0.01:
+        if abs(
+            speed - 1.0
+        ) < 0.01:
             return pcm
 
-        source_rate = GEMINI_TTS_SAMPLE_RATE
+        source_rate = (
+            TTS_SOURCE_SAMPLE_RATE
+        )
 
         effective_rate = int(
             source_rate * speed
@@ -915,11 +1241,13 @@ class GeminiEngine:
             return adjusted
 
         except Exception:
+
             logger.exception(
                 "Failed to adjust TTS speed"
             )
 
             return pcm
+
 
     # ========================================================
     # TEXT TO SPEECH
@@ -933,33 +1261,50 @@ class GeminiEngine:
         speed: float = DEFAULT_SPEECH_SPEED,
     ) -> bytes:
 
-        text = _clean_text(text)
+        text = _clean_text(
+            text
+        )
 
         if not text:
             return b""
 
-        selected_voice = self.set_voice(
-            voice
-        ) if voice else self.voice
-
-        selected_speed = normalize_speech_speed(
-            speed
+        selected_voice = (
+            self.set_voice(
+                voice
+            )
+            if voice
+            else self.voice
         )
+
+        selected_speed = (
+            normalize_speech_speed(
+                speed
+            )
+        )
+
+        # ----------------------------------------------------
+        # Gemini TTS is text-only input → audio-only output.
+        # ----------------------------------------------------
 
         async def operation():
 
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.tts_model,
-                contents=text,
+                contents=(
+                    "Speak naturally and clearly.\n"
+                    f"{text}"
+                ),
                 config=types.GenerateContentConfig(
                     response_modalities=[
                         "AUDIO"
                     ],
                     speech_config=types.SpeechConfig(
                         voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=selected_voice
+                            prebuilt_voice_config=(
+                                types.PrebuiltVoiceConfig(
+                                    voice_name=selected_voice
+                                )
                             )
                         )
                     ),
@@ -982,24 +1327,27 @@ class GeminiEngine:
                 "Gemini TTS returned no audio."
             )
 
-        # Gemini returns 24 kHz PCM for this
-        # configuration. Speed is adjusted after
-        # generation because the current TTS API
-        # does not expose a guaranteed numeric
-        # speech-speed parameter.
+        # Gemini TTS returns 24kHz PCM.
+        # Apply requested speed locally.
         audio = self._adjust_pcm_speed(
             audio,
             selected_speed,
         )
 
         logger.info(
-            "TTS generated | voice=%s | speed=%.2f | bytes=%s",
+            "TTS generated | "
+            "model=%s | "
+            "voice=%s | "
+            "speed=%.2f | "
+            "bytes=%s",
+            self.tts_model,
             selected_voice,
             selected_speed,
             len(audio),
         )
 
         return audio
+
 
     # ========================================================
     # COMPLETE VOICE PIPELINE
@@ -1026,7 +1374,9 @@ class GeminiEngine:
             "response": "",
             "audio": b"",
             "voice": (
-                normalize_voice_name(voice)
+                normalize_voice_name(
+                    voice
+                )
                 if voice
                 else self.voice
             ),
@@ -1042,6 +1392,7 @@ class GeminiEngine:
         }
 
         if not audio:
+
             result["error"] = (
                 "No audio received."
             )
@@ -1052,9 +1403,9 @@ class GeminiEngine:
 
             try:
 
-                # ------------------------------
+                # ============================================
                 # STT
-                # ------------------------------
+                # ============================================
 
                 transcript = await self.transcribe(
                     audio,
@@ -1069,27 +1420,31 @@ class GeminiEngine:
 
                     return result
 
-                result["transcript"] = transcript
+                result["transcript"] = (
+                    transcript
+                )
 
-                # ------------------------------
-                # Memory: user
-                # ------------------------------
+                # ============================================
+                # MEMORY — USER
+                # ============================================
 
                 self.add_user_message(
                     f"{_safe_username(username)}: "
                     f"{transcript}"
                 )
 
-                # ------------------------------
+                # ============================================
                 # AI
-                # ------------------------------
+                # ============================================
 
-                response = await self.generate_response(
-                    transcript,
-                    username=username,
-                    memory=memory,
-                    character=character,
-                    system_prompt=system_prompt,
+                response = (
+                    await self.generate_response(
+                        transcript,
+                        username=username,
+                        memory=memory,
+                        character=character,
+                        system_prompt=system_prompt,
+                    )
                 )
 
                 if not response:
@@ -1100,22 +1455,26 @@ class GeminiEngine:
 
                     return result
 
-                result["response"] = response
+                result["response"] = (
+                    response
+                )
 
-                # ------------------------------
-                # Memory: assistant
-                # ------------------------------
+                # ============================================
+                # MEMORY — ASSISTANT
+                # ============================================
 
                 self.add_assistant_message(
                     response
                 )
 
-                # ------------------------------
+                # ============================================
                 # TTS
-                # ------------------------------
+                # ============================================
 
                 selected_voice = (
-                    self.set_voice(voice)
+                    self.set_voice(
+                        voice
+                    )
                     if voice
                     else self.voice
                 )
@@ -1124,21 +1483,34 @@ class GeminiEngine:
                     selected_voice
                 )
 
-                speech = await self.generate_speech(
-                    response,
-                    voice=selected_voice,
-                    speed=speed,
+                speech = (
+                    await self.generate_speech(
+                        response,
+                        voice=selected_voice,
+                        speed=speed,
+                    )
                 )
 
-                result["audio"] = speech
+                result["audio"] = (
+                    speech
+                )
+
                 result["success"] = True
 
                 self.processed_requests += 1
 
                 logger.info(
                     "Voice pipeline completed | "
-                    "user=%s | voice=%s | speed=%.2f",
+                    "user=%s | "
+                    "stt=%s | "
+                    "chat=%s | "
+                    "tts=%s | "
+                    "voice=%s | "
+                    "speed=%.2f",
                     username,
+                    self.transcribe_model,
+                    self.chat_model,
+                    self.tts_model,
                     selected_voice,
                     normalize_speech_speed(
                         speed
@@ -1151,15 +1523,31 @@ class GeminiEngine:
 
                 self.failed_requests += 1
 
-                result["error"] = str(
-                    error
+                result["error"] = (
+                    str(error)
                 )
 
-                logger.exception(
-                    "Voice pipeline failed"
-                )
+                # ------------------------------------------------
+                # Friendly quota logging.
+                # ------------------------------------------------
+
+                if _is_quota_error(
+                    error
+                ):
+
+                    logger.error(
+                        "Voice AI stopped because "
+                        "Gemini quota is exhausted."
+                    )
+
+                else:
+
+                    logger.exception(
+                        "Voice pipeline failed"
+                    )
 
                 return result
+
 
     # ========================================================
     # STATS
@@ -1172,6 +1560,7 @@ class GeminiEngine:
         return {
             "voice": self.voice,
             "memory_size": self.memory_size(),
+            "memory_limit": VOICE_MEMORY_LIMIT,
             "memory_enabled": MEMORY_ENABLED,
             "processed_requests": (
                 self.processed_requests
@@ -1179,20 +1568,29 @@ class GeminiEngine:
             "failed_requests": (
                 self.failed_requests
             ),
+            "quota_exhausted": (
+                self.quota_exhausted
+            ),
             "chat_model": self.chat_model,
             "transcribe_model": (
                 self.transcribe_model
             ),
-            "tts_model": self.tts_model,
+            "tts_model": (
+                self.tts_model
+            ),
         }
+
 
     # ========================================================
     # CLOSE
     # ========================================================
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
 
         try:
+
             close_method = getattr(
                 self.client,
                 "close",
@@ -1203,10 +1601,13 @@ class GeminiEngine:
 
                 result = close_method()
 
-                if asyncio.iscoroutine(result):
+                if asyncio.iscoroutine(
+                    result
+                ):
                     await result
 
         except Exception:
+
             logger.exception(
                 "Failed to close Gemini client"
             )
@@ -1227,4 +1628,4 @@ def create_gemini_engine() -> GeminiEngine:
 __all__ = [
     "GeminiEngine",
     "create_gemini_engine",
-        ]
+]
