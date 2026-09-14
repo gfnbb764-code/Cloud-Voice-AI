@@ -1,3 +1,4 @@
+```python
 # main.py
 # ============================================================
 # Cloud Voice AI — Main Discord Bot
@@ -10,7 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import discord
 from discord import app_commands
@@ -72,6 +73,69 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("CloudVoiceAI")
+
+
+# ============================================================
+# CHARACTER HELPERS
+# ============================================================
+
+def _character_value(
+    character: Any,
+    key: str,
+    default: Any = None,
+) -> Any:
+    """
+    Safely read a field from either:
+        Character object
+        dict / Mapping
+        None
+    """
+
+    if character is None:
+        return default
+
+    if isinstance(character, Mapping):
+        try:
+            return character.get(
+                key,
+                default,
+            )
+        except Exception:
+            return default
+
+    try:
+        value = getattr(
+            character,
+            key,
+            default,
+        )
+    except Exception:
+        return default
+
+    return (
+        default
+        if value is None
+        else value
+    )
+
+
+def _character_name(
+    character: Any,
+) -> str:
+    """Return a safe character name."""
+
+    value = _character_value(
+        character,
+        "name",
+        None,
+    )
+
+    if value is None:
+        return "None"
+
+    name = str(value).strip()
+
+    return name or "None"
 
 
 # ============================================================
@@ -235,15 +299,24 @@ class CharacterManager:
                 {},
             )
 
-            if not isinstance(raw_characters, dict):
+            if not isinstance(
+                raw_characters,
+                dict,
+            ):
                 raw_characters = {}
 
-            if not isinstance(raw_selected, dict):
+            if not isinstance(
+                raw_selected,
+                dict,
+            ):
                 raw_selected = {}
 
             for guild_id, items in raw_characters.items():
 
-                if not isinstance(items, dict):
+                if not isinstance(
+                    items,
+                    dict,
+                ):
                     continue
 
                 guild_characters: dict[
@@ -310,9 +383,11 @@ class CharacterManager:
                 "characters": {
                     guild_id: {
                         key: character.to_dict()
-                        for key, character in items.items()
+                        for key, character
+                        in items.items()
                     }
-                    for guild_id, items in self.characters.items()
+                    for guild_id, items
+                    in self.characters.items()
                 },
                 "selected": self.selected,
             }
@@ -599,7 +674,9 @@ class CharacterManager:
 
             if new_key != old_key:
 
-                items.pop(old_key)
+                items.pop(
+                    old_key
+                )
 
                 items[new_key] = character
 
@@ -634,8 +711,10 @@ class CharacterManager:
 
         if speed is not None:
 
-            character.speed = normalize_speech_speed(
-                speed
+            character.speed = (
+                normalize_speech_speed(
+                    speed
+                )
             )
 
         if personality is not None:
@@ -864,7 +943,9 @@ async def character_autocomplete(
         interaction.guild.id
     )
 
-    matches: list[app_commands.Choice[str]] = []
+    matches: list[
+        app_commands.Choice[str]
+    ] = []
 
     for character in characters:
 
@@ -934,25 +1015,33 @@ async def botinfo(
 
     embed.add_field(
         name="Version",
-        value=str(config["version"]),
+        value=str(
+            config["version"]
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="Chat",
-        value=str(config["chat_model"]),
+        value=str(
+            config["chat_model"]
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="TTS",
-        value=str(config["tts_model"]),
+        value=str(
+            config["tts_model"]
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="Voices",
-        value=str(config["voice_count"]),
+        value=str(
+            config["voice_count"]
+        ),
         inline=True,
     )
 
@@ -1215,7 +1304,7 @@ async def voice(
             f"🎙️ الصوت: **{session.voice}**\n"
             f"⚡ السرعة: **{session.speed:.2f}x**\n"
             f"📡 الروم: **{session.channel.name}**\n"
-            f"🤖 الشخصية: **{character.name if character else 'بدون شخصية'}**"
+            f"🤖 الشخصية: **{_character_name(character)}**"
         )
     )
 
@@ -1271,7 +1360,10 @@ async def setvoice(
 
         selected_character = session.character
 
-        if selected_character:
+        if isinstance(
+            selected_character,
+            Character,
+        ):
 
             await bot.character_manager.update(
                 interaction.guild.id,
@@ -1345,28 +1437,43 @@ async def speed(
     )
 
     character = session.character
+    character_name = _character_name(
+        character
+    )
 
-    if character:
+    if isinstance(
+        character,
+        Character,
+    ):
 
-        await bot.character_manager.update(
-            interaction.guild.id,
-            character.name,
-            speed=new_speed,
-        )
-
-        session.set_character(
-            bot.character_manager.get(
+        updated_character = (
+            await bot.character_manager.update(
                 interaction.guild.id,
                 character.name,
+                speed=new_speed,
             )
         )
+
+        # Re-load the persisted Character object so
+        # session and storage reference the same current data.
+        live_character = (
+            bot.character_manager.get(
+                interaction.guild.id,
+                updated_character.name,
+            )
+        )
+
+        if live_character is not None:
+            session.set_character(
+                live_character
+            )
 
     await interaction.response.send_message(
         (
             f"⚡ سرعة الكلام الآن **{new_speed:.2f}x**."
             + (
-                f"\n🤖 تم حفظها للشخصية **{character.name}**."
-                if character
+                f"\n🤖 تم حفظها للشخصية **{character_name}**."
+                if character_name != "None"
                 else ""
             )
         )
@@ -1582,6 +1689,16 @@ async def character_edit(
                     live_character.speed
                 )
 
+                try:
+                    session.engine.set_voice(
+                        live_character.voice
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not sync edited character voice",
+                        exc_info=True,
+                    )
+
         await interaction.response.send_message(
             f"✅ تم تعديل الشخصية **{updated.name}**."
         )
@@ -1625,10 +1742,6 @@ async def character_select(
         )
         return
 
-    # ========================================================
-    # Verify the character belongs to this guild.
-    # ========================================================
-
     selected_character = bot.character_manager.get(
         interaction.guild.id,
         character,
@@ -1666,6 +1779,16 @@ async def character_select(
             session.speech_speed = (
                 selected.speed
             )
+
+            try:
+                session.engine.set_voice(
+                    selected.voice
+                )
+            except Exception:
+                logger.debug(
+                    "Could not sync selected character voice",
+                    exc_info=True,
+                )
 
         await interaction.response.send_message(
             (
@@ -1849,7 +1972,7 @@ async def character_view(
     character="اسم الشخصية",
 )
 @app_commands.autocomplete(
-    character=character_autocomplete,
+    character=character_autocomplete
 )
 async def character_delete(
     interaction: discord.Interaction,
@@ -1885,8 +2008,9 @@ async def character_delete(
 
         if (
             session
-            and session.character
-            and session.character.name.lower()
+            and _character_name(
+                session.character
+            ).lower()
             == deleted.name.lower()
         ):
 
@@ -1901,6 +2025,16 @@ async def character_delete(
             session.speech_speed = (
                 DEFAULT_SPEECH_SPEED
             )
+
+            try:
+                session.engine.set_voice(
+                    DEFAULT_GEMINI_VOICE
+                )
+            except Exception:
+                logger.debug(
+                    "Could not reset Gemini voice",
+                    exc_info=True,
+                )
 
         await interaction.response.send_message(
             f"🗑️ تم حذف الشخصية **{deleted.name}**."
@@ -2022,7 +2156,9 @@ async def reset(
         )
         return
 
-    session.engine.reset()
+    # FIX:
+    # GeminiEngine exposes reset_memory(), not reset().
+    session.engine.reset_memory()
 
     await bot.character_manager.clear_selected(
         interaction.guild.id
@@ -2032,8 +2168,23 @@ async def reset(
         None
     )
 
-    session.voice_name = DEFAULT_GEMINI_VOICE
-    session.speech_speed = DEFAULT_SPEECH_SPEED
+    session.voice_name = (
+        DEFAULT_GEMINI_VOICE
+    )
+
+    session.speech_speed = (
+        DEFAULT_SPEECH_SPEED
+    )
+
+    try:
+        session.engine.set_voice(
+            DEFAULT_GEMINI_VOICE
+        )
+    except Exception:
+        logger.debug(
+            "Could not reset Gemini engine voice",
+            exc_info=True,
+        )
 
     await interaction.response.send_message(
         "♻️ تم إعادة ضبط جلسة الذكاء الاصطناعي."
@@ -2094,29 +2245,33 @@ async def stats(
 
     embed.add_field(
         name="🤖 Character",
-        value=(
-            session.character.name
-            if session.character
-            else "None"
+        value=_character_name(
+            session.character
         ),
         inline=True,
     )
 
     embed.add_field(
         name="🧠 Memory",
-        value=str(data["memory_size"]),
+        value=str(
+            data["memory_size"]
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="✅ Processed",
-        value=str(data["processed_requests"]),
+        value=str(
+            data["processed_requests"]
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="❌ Failed",
-        value=str(data["failed_requests"]),
+        value=str(
+            data["failed_requests"]
+        ),
         inline=True,
     )
 
@@ -2655,11 +2810,9 @@ async def on_voice_state_update(
                 )
 
         except asyncio.CancelledError:
-
             return
 
         except Exception:
-
             logger.exception(
                 "Auto leave failed"
             )
@@ -2762,3 +2915,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+```
