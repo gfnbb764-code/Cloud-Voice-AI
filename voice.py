@@ -1,12 +1,14 @@
 # voice.py
 # ============================================================
 # Cloud Voice AI — Discord Voice Engine
-# Robust audio capture / buffering / voice AI / TTS
+# Final robust audio capture / STT / AI / TTS pipeline
+# Python 3.11
 # ============================================================
 
 from __future__ import annotations
 
 import asyncio
+import audioop
 import io
 import logging
 import math
@@ -33,11 +35,11 @@ from config import (
     MAX_CONCURRENT_AI_REQUESTS,
     MAX_MEMORY_MESSAGES,
     MAX_RECORDING_SECONDS,
-    MIN_AUDIO_SECONDS,
     MEMORY_ENABLED,
+    MIN_AUDIO_SECONDS,
     VOICE_SILENCE_TIMEOUT,
-    normalize_voice_name,
     is_valid_voice,
+    normalize_voice_name,
 )
 
 from gemini import GeminiEngine
@@ -54,17 +56,17 @@ logger = logging.getLogger("cloud_voice_ai.voice")
 # AUDIO SETTINGS
 # ============================================================
 
-DISCORD_RATE = DISCORD_SAMPLE_RATE
-DISCORD_CHANNEL_COUNT = DISCORD_CHANNELS
-DISCORD_WIDTH = DISCORD_SAMPLE_WIDTH
+DISCORD_RATE = int(DISCORD_SAMPLE_RATE)
+DISCORD_CHANNEL_COUNT = int(DISCORD_CHANNELS)
+DISCORD_WIDTH = int(DISCORD_SAMPLE_WIDTH)
 
-INPUT_RATE = GEMINI_INPUT_SAMPLE_RATE
-INPUT_CHANNELS = GEMINI_INPUT_CHANNELS
-INPUT_WIDTH = GEMINI_INPUT_SAMPLE_WIDTH
+INPUT_RATE = int(GEMINI_INPUT_SAMPLE_RATE)
+INPUT_CHANNELS = int(GEMINI_INPUT_CHANNELS)
+INPUT_WIDTH = int(GEMINI_INPUT_SAMPLE_WIDTH)
 
-TTS_RATE = GEMINI_TTS_SAMPLE_RATE
-TTS_CHANNELS = GEMINI_TTS_CHANNELS
-TTS_WIDTH = GEMINI_TTS_SAMPLE_WIDTH
+TTS_RATE = int(GEMINI_TTS_SAMPLE_RATE)
+TTS_CHANNELS = int(GEMINI_TTS_CHANNELS)
+TTS_WIDTH = int(GEMINI_TTS_SAMPLE_WIDTH)
 
 
 # ============================================================
@@ -105,19 +107,11 @@ AI_SEMAPHORE_LIMIT = max(
 
 
 # ============================================================
-# AUDIO QUALITY SETTINGS
+# AUDIO QUALITY
 # ============================================================
 
-# Diagnostic only. Never reject audio based on RMS.
-QUIET_RMS = 120.0
-
-# Maximum amplification allowed.
-MAX_GAIN = 5.0
-
-# Target RMS after optional normalization.
 TARGET_RMS = 5000.0
-
-# Headroom to reduce clipping.
+MAX_GAIN = 5.0
 CLIP_LIMIT = 30000
 
 
@@ -154,17 +148,12 @@ def _write_int16(
 def pcm_rms(
     pcm: bytes,
 ) -> float:
-    """
-    Calculate RMS level of signed 16-bit PCM.
-    Diagnostic only.
-    """
+    """Return RMS of signed 16-bit PCM."""
 
     if not pcm:
         return 0.0
 
-    usable = len(pcm) - (
-        len(pcm) % 2
-    )
+    usable = len(pcm) - (len(pcm) % 2)
 
     if usable <= 0:
         return 0.0
@@ -172,24 +161,16 @@ def pcm_rms(
     total = 0.0
     count = 0
 
-    for offset in range(
-        0,
-        usable,
-        2,
-    ):
+    for offset in range(0, usable, 2):
         sample = _read_int16(
             pcm,
             offset,
         )
 
-        total += (
-            float(sample)
-            * float(sample)
-        )
-
+        total += float(sample * sample)
         count += 1
 
-    if count <= 0:
+    if count == 0:
         return 0.0
 
     return math.sqrt(
@@ -200,24 +181,19 @@ def pcm_rms(
 def pcm_peak(
     pcm: bytes,
 ) -> int:
-    """
-    Calculate absolute PCM peak.
-    """
+    """Return absolute 16-bit PCM peak."""
 
     if not pcm:
         return 0
 
-    usable = len(pcm) - (
-        len(pcm) % 2
-    )
+    usable = len(pcm) - (len(pcm) % 2)
+
+    if usable <= 0:
+        return 0
 
     peak = 0
 
-    for offset in range(
-        0,
-        usable,
-        2,
-    ):
+    for offset in range(0, usable, 2):
         value = abs(
             _read_int16(
                 pcm,
@@ -235,25 +211,20 @@ def normalize_pcm_volume(
     pcm: bytes,
 ) -> bytes:
     """
-    Raise quiet PCM conservatively without
-    aggressively modifying already-loud audio.
+    Conservative automatic gain.
+
+    Does not reject quiet audio.
+    Does not amplify beyond MAX_GAIN.
+    Attempts to keep peak below CLIP_LIMIT.
     """
 
     if not pcm:
         return b""
 
-    rms = pcm_rms(
-        pcm
-    )
+    rms = pcm_rms(pcm)
+    peak = pcm_peak(pcm)
 
-    if rms <= 0:
-        return pcm
-
-    peak = pcm_peak(
-        pcm
-    )
-
-    if peak <= 0:
+    if rms <= 0 or peak <= 0:
         return pcm
 
     if rms >= TARGET_RMS:
@@ -269,9 +240,7 @@ def normalize_pcm_volume(
     )
 
     if peak * gain > CLIP_LIMIT:
-        gain = (
-            CLIP_LIMIT / peak
-        )
+        gain = CLIP_LIMIT / peak
 
     if gain <= 1.01:
         return pcm
@@ -294,32 +263,27 @@ def normalize_pcm_volume(
             offset,
         )
 
-        amplified = int(
+        output[
+            offset:offset + 2
+        ] = _write_int16(
             sample * gain
         )
 
-        output[
-            offset:
-            offset + 2
-        ] = _write_int16(
-            amplified
-        )
-
     if usable < len(pcm):
-        output[
-            usable:
-        ] = pcm[
-            usable:
-        ]
+        output[usable:] = pcm[usable:]
 
     return bytes(output)
 
+
+# ============================================================
+# DISCORD PCM -> GEMINI PCM
+# ============================================================
 
 def pcm_stereo_48k_to_mono_16k(
     pcm: bytes,
 ) -> bytes:
     """
-    Convert Discord PCM:
+    Convert:
 
         48000 Hz
         stereo
@@ -331,8 +295,8 @@ def pcm_stereo_48k_to_mono_16k(
         mono
         signed 16-bit
 
-    Uses averaging over each group of 3 frames
-    instead of simply discarding 2 out of 3 frames.
+    Uses Python's audioop for real sample-rate conversion
+    instead of simply dropping every third frame.
     """
 
     if not pcm:
@@ -346,82 +310,80 @@ def pcm_stereo_48k_to_mono_16k(
     if frame_width <= 0:
         return b""
 
-    usable_length = len(pcm) - (
+    usable = len(pcm) - (
         len(pcm) % frame_width
     )
 
-    if usable_length <= 0:
+    if usable <= 0:
         return b""
 
-    pcm = pcm[:usable_length]
+    pcm = pcm[:usable]
 
-    frame_count = (
-        len(pcm)
-        // frame_width
-    )
+    try:
+        # ----------------------------------------------------
+        # Stereo -> mono
+        # ----------------------------------------------------
 
-    output = bytearray()
+        if DISCORD_CHANNEL_COUNT == 2:
 
-    # 48000 -> 16000 = exactly 3:1
-    output_frame_count = frame_count // 3
-
-    for output_index in range(
-        output_frame_count
-    ):
-        base_frame = (
-            output_index * 3
-        )
-
-        total = 0
-
-        for offset_frame in range(3):
-            frame_index = (
-                base_frame
-                + offset_frame
+            mono = audioop.tomono(
+                pcm,
+                DISCORD_WIDTH,
+                0.5,
+                0.5,
             )
 
-            offset = (
-                frame_index
-                * frame_width
+        elif DISCORD_CHANNEL_COUNT == 1:
+
+            mono = pcm
+
+        else:
+
+            logger.warning(
+                "Unsupported Discord channel count: %s",
+                DISCORD_CHANNEL_COUNT,
             )
 
-            if DISCORD_CHANNEL_COUNT >= 2:
+            return b""
 
-                left = _read_int16(
-                    pcm,
-                    offset,
-                )
+        # ----------------------------------------------------
+        # 48 kHz -> 16 kHz
+        # ----------------------------------------------------
 
-                right = _read_int16(
-                    pcm,
-                    offset + 2,
-                )
+        if DISCORD_RATE != INPUT_RATE:
 
-                mono = (
-                    left + right
-                ) // 2
-
-            else:
-
-                mono = _read_int16(
-                    pcm,
-                    offset,
-                )
-
-            total += mono
-
-        averaged = (
-            total // 3
-        )
-
-        output.extend(
-            _write_int16(
-                averaged
+            converted, _state = audioop.ratecv(
+                mono,
+                DISCORD_WIDTH,
+                1,
+                DISCORD_RATE,
+                INPUT_RATE,
+                None,
             )
+
+        else:
+
+            converted = mono
+
+        return bytes(converted)
+
+    except Exception:
+
+        logger.exception(
+            "Failed to resample Discord PCM "
+            "(%sHz/%sch -> %sHz/%sch).",
+            DISCORD_RATE,
+            DISCORD_CHANNEL_COUNT,
+            INPUT_RATE,
+            INPUT_CHANNELS,
         )
 
-    return bytes(output)
+        return b""
 
+
+# ============================================================
+# PCM -> WAV
+# ============================================================
 
 def pcm_to_wav(
     pcm: bytes,
@@ -429,9 +391,7 @@ def pcm_to_wav(
     channels: int,
     sample_width: int,
 ) -> bytes:
-    """
-    Wrap raw PCM in a WAV container.
-    """
+    """Wrap raw PCM in a WAV container."""
 
     buffer = io.BytesIO()
 
@@ -459,17 +419,21 @@ def pcm_to_wav(
     return buffer.getvalue()
 
 
+# ============================================================
+# GEMINI TTS -> DISCORD PCM
+# ============================================================
+
 def tts_pcm_to_discord_pcm(
     pcm: bytes,
 ) -> bytes:
     """
-    Gemini TTS:
+    Convert Gemini TTS:
 
         24000 Hz
         mono
         16-bit
 
-    Discord:
+    into Discord:
 
         48000 Hz
         stereo
@@ -488,30 +452,67 @@ def tts_pcm_to_discord_pcm(
 
     pcm = pcm[:usable]
 
-    output = bytearray()
+    try:
 
-    for offset in range(
-        0,
-        len(pcm),
-        2,
-    ):
-        sample = pcm[
-            offset:
-            offset + 2
-        ]
+        # ----------------------------------------------------
+        # 24k mono -> 48k mono
+        # ----------------------------------------------------
 
-        # 24k -> 48k:
-        # duplicate each sample twice.
-        #
-        # Mono -> stereo:
-        # duplicate each frame L/R.
-        output.extend(sample)
-        output.extend(sample)
-        output.extend(sample)
-        output.extend(sample)
+        if TTS_RATE != DISCORD_RATE:
 
-    return bytes(output)
+            resampled, _state = audioop.ratecv(
+                pcm,
+                TTS_WIDTH,
+                1,
+                TTS_RATE,
+                DISCORD_RATE,
+                None,
+            )
 
+        else:
+
+            resampled = pcm
+
+        # ----------------------------------------------------
+        # Mono -> stereo
+        # ----------------------------------------------------
+
+        if TTS_CHANNELS == 1:
+
+            stereo = audioop.tostereo(
+                resampled,
+                TTS_WIDTH,
+                1.0,
+                1.0,
+            )
+
+        elif TTS_CHANNELS == 2:
+
+            stereo = resampled
+
+        else:
+
+            logger.warning(
+                "Unsupported TTS channel count: %s",
+                TTS_CHANNELS,
+            )
+
+            return b""
+
+        return bytes(stereo)
+
+    except Exception:
+
+        logger.exception(
+            "Failed to convert Gemini TTS PCM."
+        )
+
+        return b""
+
+
+# ============================================================
+# DURATION
+# ============================================================
 
 def pcm_duration_seconds(
     pcm: bytes,
@@ -541,6 +542,7 @@ def pcm_duration_seconds(
 
 @dataclass
 class UserAudioState:
+
     user_id: int
     username: str
     buffer: bytearray
@@ -582,9 +584,7 @@ class UserAudioState:
             time.monotonic()
         )
 
-    def elapsed(
-        self,
-    ) -> float:
+    def elapsed(self) -> float:
 
         if self.started_at <= 0:
             return 0.0
@@ -594,9 +594,7 @@ class UserAudioState:
             - self.started_at
         )
 
-    def silence_elapsed(
-        self,
-    ) -> float:
+    def silence_elapsed(self) -> float:
 
         if self.last_packet_at <= 0:
             return 0.0
@@ -606,9 +604,7 @@ class UserAudioState:
             - self.last_packet_at
         )
 
-    def take_buffer(
-        self,
-    ) -> bytes:
+    def take_buffer(self) -> bytes:
 
         data = bytes(
             self.buffer
@@ -621,15 +617,12 @@ class UserAudioState:
 
         return data
 
-    def clear(
-        self,
-    ) -> None:
+    def clear(self) -> None:
 
         self.buffer.clear()
 
         self.started_at = 0.0
         self.last_packet_at = 0.0
-
         self.processing = False
 
 
@@ -664,17 +657,20 @@ class VoiceAISink(
         ] = None
 
     # ========================================================
-    # VOICE RECV
+    # RECEIVE MODE
     # ========================================================
 
-    def wants_opus(
-        self,
-    ) -> bool:
+    def wants_opus(self) -> bool:
         """
-        Ask discord-ext-voice-recv for decoded PCM.
+        False = request decoded PCM from
+        discord-ext-voice-recv-dave.
         """
 
         return False
+
+    # ========================================================
+    # RECEIVE PACKET
+    # ========================================================
 
     def write(
         self,
@@ -748,9 +744,7 @@ class VoiceAISink(
 
         try:
 
-            loop = self.session.loop
-
-            loop.call_soon_threadsafe(
+            self.session.loop.call_soon_threadsafe(
                 self._handle_pcm_threadsafe,
                 user_id,
                 username,
@@ -803,7 +797,7 @@ class VoiceAISink(
             )
 
     # ========================================================
-    # AUDIO COLLECTION
+    # BUFFER AUDIO
     # ========================================================
 
     async def _handle_pcm(
@@ -843,16 +837,12 @@ class VoiceAISink(
                 pcm
             )
 
-            elapsed = (
-                state.elapsed()
-            )
+            elapsed = state.elapsed()
 
             silence = (
                 state.silence_elapsed()
             )
 
-            # Only time-based buffering.
-            # Do not reject quiet or distorted speech.
             should_process = (
                 elapsed >= MAX_BUFFER_SECONDS
                 or silence >= SILENCE_TIMEOUT
@@ -913,15 +903,19 @@ class VoiceAISink(
         )
 
         if duration < MIN_AUDIO_LENGTH:
+            logger.debug(
+                "Ignoring very short audio from %s: %.3fs",
+                username,
+                duration,
+            )
             return
 
-        raw_rms = pcm_rms(
-            pcm
-        )
+        # ----------------------------------------------------
+        # RAW DISCORD AUDIO DIAGNOSTICS
+        # ----------------------------------------------------
 
-        raw_peak = pcm_peak(
-            pcm
-        )
+        raw_rms = pcm_rms(pcm)
+        raw_peak = pcm_peak(pcm)
 
         logger.info(
             "Voice audio from %s | "
@@ -939,7 +933,8 @@ class VoiceAISink(
         try:
 
             # ------------------------------------------------
-            # 1. Discord 48k stereo -> Gemini 16k mono
+            # 1. Real resampling:
+            #    48k stereo -> 16k mono
             # ------------------------------------------------
 
             gemini_pcm = (
@@ -949,39 +944,31 @@ class VoiceAISink(
             )
 
             if not gemini_pcm:
+
+                logger.warning(
+                    "PCM conversion produced empty audio "
+                    "for %s.",
+                    username,
+                )
+
                 return
 
-            # ------------------------------------------------
-            # 2. Normalize quiet audio
-            # ------------------------------------------------
+            gemini_duration = (
+                pcm_duration_seconds(
+                    gemini_pcm,
+                    INPUT_RATE,
+                    INPUT_CHANNELS,
+                    INPUT_WIDTH,
+                )
+            )
 
-            before_rms = pcm_rms(
+            gemini_rms = pcm_rms(
                 gemini_pcm
             )
 
-            boosted_pcm = (
-                normalize_pcm_volume(
-                    gemini_pcm
-                )
+            gemini_peak = pcm_peak(
+                gemini_pcm
             )
-
-            after_rms = pcm_rms(
-                boosted_pcm
-            )
-
-            if before_rms != after_rms:
-
-                logger.info(
-                    "Voice normalization for %s | "
-                    "rms %.1f -> %.1f",
-                    username,
-                    before_rms,
-                    after_rms,
-                )
-
-            # ------------------------------------------------
-            # 3. Gemini audio diagnostics
-            # ------------------------------------------------
 
             logger.info(
                 "Gemini audio for %s | "
@@ -990,19 +977,40 @@ class VoiceAISink(
                 "rms=%.1f | "
                 "peak=%d",
                 username,
-                pcm_duration_seconds(
-                    boosted_pcm,
-                    INPUT_RATE,
-                    INPUT_CHANNELS,
-                    INPUT_WIDTH,
-                ),
-                len(boosted_pcm),
-                pcm_rms(boosted_pcm),
-                pcm_peak(boosted_pcm),
+                gemini_duration,
+                len(gemini_pcm),
+                gemini_rms,
+                gemini_peak,
             )
 
             # ------------------------------------------------
-            # 4. WAV for Gemini STT
+            # 2. Normalize volume
+            # ------------------------------------------------
+
+            boosted_pcm = (
+                normalize_pcm_volume(
+                    gemini_pcm
+                )
+            )
+
+            boosted_rms = pcm_rms(
+                boosted_pcm
+            )
+
+            if abs(
+                boosted_rms - gemini_rms
+            ) > 0.1:
+
+                logger.info(
+                    "Voice normalization for %s | "
+                    "rms %.1f -> %.1f",
+                    username,
+                    gemini_rms,
+                    boosted_rms,
+                )
+
+            # ------------------------------------------------
+            # 3. Create valid WAV
             # ------------------------------------------------
 
             wav_audio = pcm_to_wav(
@@ -1013,13 +1021,21 @@ class VoiceAISink(
             )
 
             logger.info(
-                "Gemini WAV ready for %s | bytes=%d",
+                "Gemini WAV ready for %s | "
+                "bytes=%d | "
+                "duration=%.2fs",
                 username,
                 len(wav_audio),
+                pcm_duration_seconds(
+                    boosted_pcm,
+                    INPUT_RATE,
+                    INPUT_CHANNELS,
+                    INPUT_WIDTH,
+                ),
             )
 
             # ------------------------------------------------
-            # 5. Send audio to Gemini
+            # 4. Send to Gemini
             # ------------------------------------------------
 
             await self.session.process_voice(
@@ -1046,22 +1062,16 @@ class VoiceAISink(
     # WATCHDOG
     # ========================================================
 
-    def start_watchdog(
-        self,
-    ) -> None:
+    def start_watchdog(self) -> None:
 
         if self._watchdog_task is not None:
             return
 
-        self._watchdog_task = (
-            asyncio.create_task(
-                self._watchdog()
-            )
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog()
         )
 
-    async def _watchdog(
-        self,
-    ) -> None:
+    async def _watchdog(self) -> None:
 
         try:
 
@@ -1102,9 +1112,7 @@ class VoiceAISink(
                 if not state.buffer:
                     continue
 
-                elapsed = (
-                    state.elapsed()
-                )
+                elapsed = state.elapsed()
 
                 silence = (
                     state.silence_elapsed()
@@ -1157,16 +1165,13 @@ class VoiceAISink(
     # CLEANUP
     # ========================================================
 
-    def cleanup(
-        self,
-    ) -> None:
+    def cleanup(self) -> None:
 
         self._closed = True
 
-        if self._watchdog_task:
+        if self._watchdog_task is not None:
 
             self._watchdog_task.cancel()
-
             self._watchdog_task = None
 
         for state in self.users.values():
@@ -1193,21 +1198,15 @@ class VoiceSession:
 
         if is_valid_voice(voice):
 
-            self.voice = (
-                normalize_voice_name(
-                    voice
-                )
+            self.voice = normalize_voice_name(
+                voice
             )
 
         else:
 
-            self.voice = (
-                DEFAULT_GEMINI_VOICE
-            )
+            self.voice = DEFAULT_GEMINI_VOICE
 
-        self.loop = (
-            asyncio.get_running_loop()
-        )
+        self.loop = asyncio.get_running_loop()
 
         self.voice_client: Optional[
             voice_recv.VoiceRecvClient
@@ -1225,39 +1224,29 @@ class VoiceSession:
 
         self._closed = False
 
-        self._playback_lock = (
-            asyncio.Lock()
-        )
+        self._playback_lock = asyncio.Lock()
 
-        self._ai_semaphore = (
-            asyncio.Semaphore(
-                AI_SEMAPHORE_LIMIT
-            )
+        self._ai_semaphore = asyncio.Semaphore(
+            AI_SEMAPHORE_LIMIT
         )
 
         self.processed_requests = 0
         self.failed_requests = 0
 
         self.created_at = time.time()
-
-        self.last_activity_at = (
-            time.time()
-        )
+        self.last_activity_at = time.time()
 
     # ========================================================
     # MEMORY
     # ========================================================
 
     @property
-    def memory_count(
-        self,
-    ) -> int:
+    def memory_count(self) -> int:
 
         if not MEMORY_ENABLED:
             return 0
 
         try:
-
             return self.engine.memory_size()
 
         except Exception:
@@ -1266,6 +1255,7 @@ class VoiceSession:
                 return len(
                     self.engine.memory
                 )
+
             except Exception:
                 return 0
 
@@ -1273,9 +1263,7 @@ class VoiceSession:
     # CONNECT
     # ========================================================
 
-    async def connect(
-        self,
-    ) -> None:
+    async def connect(self) -> None:
 
         if self._closed:
 
@@ -1311,9 +1299,7 @@ class VoiceSession:
 
         self.sink.start_watchdog()
 
-        self.last_activity_at = (
-            time.time()
-        )
+        self.last_activity_at = time.time()
 
         logger.info(
             "Voice receive sink started for guild %s.",
@@ -1331,7 +1317,7 @@ class VoiceSession:
         )
 
     # ========================================================
-    # GEMINI VOICE PIPELINE
+    # GEMINI PIPELINE
     # ========================================================
 
     async def process_voice(
@@ -1347,9 +1333,7 @@ class VoiceSession:
         if not audio:
             return
 
-        self.last_activity_at = (
-            time.time()
-        )
+        self.last_activity_at = time.time()
 
         async with self._ai_semaphore:
 
@@ -1409,6 +1393,10 @@ class VoiceSession:
                         error,
                     )
 
+                # ------------------------------------------------
+                # No TTS = no response to play.
+                # ------------------------------------------------
+
                 if not audio_bytes:
 
                     if error:
@@ -1464,7 +1452,23 @@ class VoiceSession:
         )
 
         if not discord_pcm:
+            logger.warning(
+                "TTS conversion produced empty PCM."
+            )
             return
+
+        logger.info(
+            "Starting TTS playback | "
+            "bytes=%d | "
+            "duration=%.2fs",
+            len(discord_pcm),
+            pcm_duration_seconds(
+                discord_pcm,
+                DISCORD_RATE,
+                DISCORD_CHANNEL_COUNT,
+                DISCORD_WIDTH,
+            ),
+        )
 
         source = discord.PCMAudio(
             io.BytesIO(
@@ -1557,10 +1561,8 @@ class VoiceSession:
                 f"Invalid Gemini voice: {voice}"
             )
 
-        selected = (
-            normalize_voice_name(
-                voice
-            )
+        selected = normalize_voice_name(
+            voice
         )
 
         self.voice = selected
@@ -1579,9 +1581,7 @@ class VoiceSession:
     # MEMORY
     # ========================================================
 
-    def clear_memory(
-        self,
-    ) -> None:
+    def clear_memory(self) -> None:
 
         try:
 
@@ -1593,18 +1593,14 @@ class VoiceSession:
                 "Failed to clear Gemini memory."
             )
 
-    def reset(
-        self,
-    ) -> None:
+    def reset(self) -> None:
 
         self.clear_memory()
 
         self.processed_requests = 0
         self.failed_requests = 0
 
-        self.last_activity_at = (
-            time.time()
-        )
+        self.last_activity_at = time.time()
 
         logger.info(
             "Voice session reset in guild %s.",
@@ -1615,9 +1611,7 @@ class VoiceSession:
     # DISCONNECT
     # ========================================================
 
-    async def disconnect(
-        self,
-    ) -> None:
+    async def disconnect(self) -> None:
 
         if self._closed:
             return
@@ -1678,9 +1672,7 @@ class VoiceSession:
 
                 result = close_method()
 
-                if asyncio.iscoroutine(
-                    result
-                ):
+                if asyncio.iscoroutine(result):
                     await result
 
             except Exception:
@@ -1702,9 +1694,7 @@ class VoiceSession:
 
 class VoiceSessionManager:
 
-    def __init__(
-        self,
-    ) -> None:
+    def __init__(self) -> None:
 
         self.sessions: dict[
             int,
@@ -1714,13 +1704,8 @@ class VoiceSessionManager:
         self._lock = asyncio.Lock()
 
     @property
-    def count(
-        self,
-    ) -> int:
-
-        return len(
-            self.sessions
-        )
+    def count(self) -> int:
+        return len(self.sessions)
 
     def get(
         self,
@@ -1751,16 +1736,11 @@ class VoiceSessionManager:
                     == channel.id
                 ):
 
-                    selected = (
-                        normalize_voice_name(
-                            voice
-                        )
+                    selected = normalize_voice_name(
+                        voice
                     )
 
-                    if (
-                        existing.voice
-                        != selected
-                    ):
+                    if existing.voice != selected:
 
                         existing.set_voice(
                             selected
@@ -1788,7 +1768,6 @@ class VoiceSessionManager:
             except Exception:
 
                 await session.disconnect()
-
                 raise
 
             self.sessions[
@@ -1994,4 +1973,4 @@ __all__ = [
     "VoiceAISink",
     "send_voice_list",
     "send_voice_channel_message",
-    ]
+]
