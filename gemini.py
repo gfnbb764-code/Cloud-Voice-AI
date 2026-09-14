@@ -8,11 +8,11 @@
 #     ↓
 # WAV 16kHz mono
 #     ↓
-# Groq Whisper Large V3 Turbo
+# Groq Whisper Large V3 Turbo (Arabic forced)
 #     ↓
 # Groq GPT-OSS 20B
 #     ↓
-# Local Piper TTS
+# Piper TTS in a separate worker process
 #     ↓
 # Discord PCM
 #
@@ -23,12 +23,17 @@ from __future__ import annotations
 
 import asyncio
 import audioop
-import io
 import logging
-import wave
+import os
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
+
+# Limit CPU threading used by ONNX/Piper.
+# These are defaults and can still be overridden by environment variables.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("ORT_NUM_THREADS", "1")
 
 from groq import Groq
 
@@ -49,15 +54,13 @@ from config import (
     normalize_voice_name,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # ENVIRONMENT
 # ============================================================
-
-import os
-
 
 GROQ_API_KEY = (
     os.getenv("GROQ_API_KEY", "")
@@ -70,13 +73,22 @@ GROQ_API_KEY = (
 # ============================================================
 
 # Speech-to-text
-GROQ_STT_MODEL = "whisper-large-v3-turbo"
+GROQ_STT_MODEL = os.getenv(
+    "GROQ_STT_MODEL",
+    "whisper-large-v3-turbo",
+).strip() or "whisper-large-v3-turbo"
 
 # Chat / AI
-GROQ_CHAT_MODEL = "openai/gpt-oss-20b"
+GROQ_CHAT_MODEL = os.getenv(
+    "GROQ_CHAT_MODEL",
+    "openai/gpt-oss-20b",
+).strip() or "openai/gpt-oss-20b"
 
 # Local TTS
-PIPER_VOICE_MODEL = "ar_JO-kareem-low"
+PIPER_VOICE_MODEL = os.getenv(
+    "PIPER_MODEL",
+    "ar_JO-kareem-low",
+).strip() or "ar_JO-kareem-low"
 
 LOCAL_TTS_NAME = (
     f"Piper/{PIPER_VOICE_MODEL}"
@@ -112,8 +124,19 @@ PIPER_MODEL_DIR = Path(
     "piper_models"
 )
 
-_PIPER_VOICE: PiperVoice | None = None
-_PIPER_LOAD_LOCK: asyncio.Lock | None = None
+
+# ============================================================
+# MAIN-PROCESS PIPER STATE
+# ============================================================
+
+_PIPER_EXECUTOR: ProcessPoolExecutor | None = None
+
+
+# ============================================================
+# PIPER WORKER PROCESS STATE
+# ============================================================
+
+_WORKER_PIPER_VOICE: PiperVoice | None = None
 
 
 # ============================================================
@@ -345,7 +368,7 @@ def _strip_markdown_for_voice(
 
 
 # ============================================================
-# PIPER
+# PIPER MODEL PATHS
 # ============================================================
 
 def _piper_paths() -> tuple[Path, Path]:
@@ -429,34 +452,87 @@ def _load_piper_sync() -> PiperVoice:
     return voice
 
 
-async def _get_piper_voice() -> PiperVoice:
+# ============================================================
+# PIPER WORKER PROCESS
+# ============================================================
 
-    global _PIPER_VOICE
-    global _PIPER_LOAD_LOCK
+def _piper_worker_init(
+    model_dir: str,
+    model_name: str,
+) -> None:
+    """
+    Runs once when the dedicated Piper worker process starts.
+    """
 
-    if _PIPER_VOICE is not None:
-        return _PIPER_VOICE
+    global _WORKER_PIPER_VOICE
 
-    if _PIPER_LOAD_LOCK is None:
-        _PIPER_LOAD_LOCK = asyncio.Lock()
+    # Re-apply CPU limits inside the child process.
+    os.environ.setdefault(
+        "OMP_NUM_THREADS",
+        "1",
+    )
 
-    async with _PIPER_LOAD_LOCK:
+    os.environ.setdefault(
+        "ORT_NUM_THREADS",
+        "1",
+    )
 
-        if _PIPER_VOICE is not None:
-            return _PIPER_VOICE
+    worker_model_dir = Path(
+        model_dir
+    )
 
-        _PIPER_VOICE = await asyncio.to_thread(
-            _load_piper_sync
+    worker_model_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model_path = (
+        worker_model_dir
+        / f"{model_name}.onnx"
+    )
+
+    config_path = (
+        worker_model_dir
+        / f"{model_name}.onnx.json"
+    )
+
+    if (
+        not model_path.exists()
+        or not config_path.exists()
+    ):
+        download_voice(
+            model_name,
+            worker_model_dir,
         )
 
-        return _PIPER_VOICE
+    if not model_path.exists():
+        raise RuntimeError(
+            f"Piper model missing in worker: {model_path}"
+        )
+
+    _WORKER_PIPER_VOICE = PiperVoice.load(
+        str(model_path)
+    )
 
 
-def _synthesize_piper_sync(
-    voice: PiperVoice,
+def _piper_worker_synthesize(
     text: str,
     speed: float,
 ) -> bytes:
+
+    global _WORKER_PIPER_VOICE
+
+    if _WORKER_PIPER_VOICE is None:
+        raise RuntimeError(
+            "Piper worker voice is not initialized."
+        )
+
+    text = _clean_text(
+        text
+    )
+
+    if not text:
+        return b""
 
     speed = normalize_speech_speed(
         speed
@@ -471,20 +547,20 @@ def _synthesize_piper_sync(
     )
 
     chunks: list[bytes] = []
-    first_chunk = True
+    first_chunk_logged = True
 
-    for chunk in voice.synthesize(
+    for chunk in _WORKER_PIPER_VOICE.synthesize(
         text,
         synthesis_config,
     ):
 
-        if first_chunk:
+        if first_chunk_logged:
 
             logger.info(
                 "Piper first audio chunk ready"
             )
 
-            first_chunk = False
+            first_chunk_logged = False
 
         audio_bytes = getattr(
             chunk,
@@ -507,7 +583,7 @@ def _synthesize_piper_sync(
         )
 
     source_rate = int(
-        voice.config.sample_rate
+        _WORKER_PIPER_VOICE.config.sample_rate
     )
 
     if (
@@ -528,6 +604,80 @@ def _synthesize_piper_sync(
 
 
 # ============================================================
+# PIPER EXECUTOR
+# ============================================================
+
+def _get_piper_executor() -> ProcessPoolExecutor:
+
+    global _PIPER_EXECUTOR
+
+    if _PIPER_EXECUTOR is None:
+
+        _PIPER_EXECUTOR = ProcessPoolExecutor(
+            max_workers=1,
+            initializer=_piper_worker_init,
+            initargs=(
+                str(PIPER_MODEL_DIR),
+                PIPER_VOICE_MODEL,
+            ),
+        )
+
+        logger.info(
+            "Piper worker process created | model=%s",
+            PIPER_VOICE_MODEL,
+        )
+
+    return _PIPER_EXECUTOR
+
+
+async def _synthesize_piper_process(
+    text: str,
+    speed: float,
+) -> bytes:
+
+    loop = asyncio.get_running_loop()
+
+    executor = _get_piper_executor()
+
+    future = loop.run_in_executor(
+        executor,
+        _piper_worker_synthesize,
+        text,
+        speed,
+    )
+
+    try:
+
+        audio = await asyncio.wait_for(
+            future,
+            timeout=max(
+                60.0,
+                float(
+                    API_TIMEOUT_SECONDS
+                ),
+            ),
+        )
+
+    except asyncio.TimeoutError as error:
+
+        logger.error(
+            "Piper TTS timed out after %.1fs",
+            max(
+                60.0,
+                float(
+                    API_TIMEOUT_SECONDS
+                ),
+            ),
+        )
+
+        raise RuntimeError(
+            "Piper TTS timed out."
+        ) from error
+
+    return audio
+
+
+# ============================================================
 # GROQ ENGINE
 # ============================================================
 
@@ -535,6 +685,10 @@ class GeminiEngine:
     """
     Kept under the old class name so the existing main.py and
     voice.py do not need to be rewritten.
+
+    STT  -> Groq Whisper Large V3 Turbo
+    Chat -> Groq GPT-OSS 20B
+    TTS  -> Local Piper in a separate worker process
     """
 
     def __init__(
@@ -770,7 +924,6 @@ class GeminiEngine:
     def _transcribe_sync(
         self,
         audio: bytes,
-        language: str | None = None,
     ):
 
         filename = (
@@ -785,10 +938,12 @@ class GeminiEngine:
             "model": self.transcribe_model,
             "response_format": "json",
             "temperature": 0.0,
-        }
 
-        if language:
-            kwargs["language"] = language
+            # ==================================================
+            # FORCE ARABIC
+            # ==================================================
+            "language": "ar",
+        }
 
         return self.client.audio.transcriptions.create(
             **kwargs
@@ -804,8 +959,6 @@ class GeminiEngine:
         if not audio:
             return ""
 
-        # WAV is already what voice.py sends.
-        # Groq supports WAV input for transcription.
         response = await self._with_retry(
             lambda: self._transcribe_sync(
                 audio
@@ -829,7 +982,8 @@ class GeminiEngine:
         if transcript:
 
             logger.info(
-                "STT successful | model=%s | transcript=%s",
+                "STT successful | model=%s | "
+                "language=ar | transcript=%s",
                 self.transcribe_model,
                 transcript,
             )
@@ -1196,14 +1350,11 @@ class GeminiEngine:
         )
 
         logger.info(
-            "Local Piper TTS | model=%s | mapped_voice=%s | speed=%.2f",
+            "Local Piper TTS | model=%s | "
+            "mapped_voice=%s | speed=%.2f | process=separate",
             PIPER_VOICE_MODEL,
             selected_voice,
             selected_speed,
-        )
-
-        voice_model = (
-            await _get_piper_voice()
         )
 
         started = (
@@ -1212,26 +1363,18 @@ class GeminiEngine:
 
         try:
 
-            audio = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _synthesize_piper_sync,
-                    voice_model,
-                    text,
-                    selected_speed,
-                ),
-                timeout=max(
-                    20.0,
-                    float(
-                        API_TIMEOUT_SECONDS
-                    ),
-                ),
+            audio = await _synthesize_piper_process(
+                text,
+                selected_speed,
             )
 
-        except asyncio.TimeoutError:
+        except Exception:
 
-            raise RuntimeError(
-                "Piper TTS timed out."
+            logger.exception(
+                "Piper TTS failed"
             )
+
+            raise
 
         elapsed = (
             asyncio.get_running_loop().time()
@@ -1475,9 +1618,11 @@ class GeminiEngine:
             "transcribe_model": (
                 self.transcribe_model
             ),
+            "stt_language": "ar",
             "tts_model": LOCAL_TTS_NAME,
             "tts_local": True,
             "piper_voice": PIPER_VOICE_MODEL,
+            "piper_worker": True,
         }
 
     # ========================================================
@@ -1488,10 +1633,28 @@ class GeminiEngine:
         self,
     ) -> None:
 
-        # Groq client is synchronous and doesn't require
-        # an async close in the normal SDK usage.
+        global _PIPER_EXECUTOR
 
         self.client = None
+
+        if _PIPER_EXECUTOR is not None:
+
+            try:
+
+                _PIPER_EXECUTOR.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Failed to shutdown Piper worker"
+                )
+
+            finally:
+
+                _PIPER_EXECUTOR = None
 
 
 # ============================================================
