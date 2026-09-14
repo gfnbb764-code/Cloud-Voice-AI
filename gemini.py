@@ -3,7 +3,7 @@
 # Cloud Voice AI
 #
 # Pipeline:
-# Discord PCM
+# Discord Voice PCM
 #     ↓
 # Groq Whisper Large V3
 #     ↓
@@ -17,9 +17,7 @@
 #     ↓
 # Discord
 #
-# Gemini removed completely.
-# Claude removed completely.
-# Piper removed completely.
+# Gemini / Claude / Piper are completely removed.
 # ============================================================
 
 from __future__ import annotations
@@ -67,30 +65,45 @@ GROQ_API_KEY = os.getenv(
 # MODELS
 # ============================================================
 
-GROQ_STT_MODEL = os.getenv(
-    "GROQ_STT_MODEL",
-    "whisper-large-v3",
-).strip() or "whisper-large-v3"
+GROQ_STT_MODEL = (
+    os.getenv(
+        "GROQ_STT_MODEL",
+        "whisper-large-v3",
+    ).strip()
+    or "whisper-large-v3"
+)
 
-GROQ_CHAT_MODEL = os.getenv(
-    "GROQ_CHAT_MODEL",
-    "openai/gpt-oss-120b",
-).strip() or "openai/gpt-oss-120b"
+GROQ_CHAT_MODEL = (
+    os.getenv(
+        "GROQ_CHAT_MODEL",
+        "openai/gpt-oss-120b",
+    ).strip()
+    or "openai/gpt-oss-120b"
+)
 
-GROQ_TTS_MODEL = os.getenv(
-    "GROQ_TTS_MODEL",
-    "canopylabs/orpheus-arabic-saudi",
-).strip() or "canopylabs/orpheus-arabic-saudi"
+GROQ_TTS_MODEL = (
+    os.getenv(
+        "GROQ_TTS_MODEL",
+        "canopylabs/orpheus-arabic-saudi",
+    ).strip()
+    or "canopylabs/orpheus-arabic-saudi"
+)
 
-GROQ_TTS_VOICE = os.getenv(
-    "GROQ_TTS_VOICE",
-    "fahad",
-).strip().lower() or "fahad"
+GROQ_TTS_VOICE = (
+    os.getenv(
+        "GROQ_TTS_VOICE",
+        "fahad",
+    ).strip().lower()
+    or "fahad"
+)
 
-GROQ_REASONING_EFFORT = os.getenv(
-    "GROQ_REASONING_EFFORT",
-    "low",
-).strip().lower() or "low"
+GROQ_REASONING_EFFORT = (
+    os.getenv(
+        "GROQ_REASONING_EFFORT",
+        "low",
+    ).strip().lower()
+    or "low"
+)
 
 
 # ============================================================
@@ -141,7 +154,7 @@ DEFAULT_SPEECH_SPEED = 1.0
 
 
 # ============================================================
-# STRONG ARABIC STT FILTER
+# ARABIC STT FILTER
 # ============================================================
 
 _ARABIC_RE = re.compile(
@@ -186,38 +199,18 @@ _KNOWN_HALLUCINATIONS = (
     "amara",
     "copyright",
     "please subscribe",
+    "ترجمة نانسي قنقر",
+    "ترجمة نانسي عجرم",
+    "اشتركوا في القناة",
+    "شكرا على المشاهدة",
+    "شكرا للمشاهدة",
+    "لا تنسى الاشتراك",
 )
 
 
-def _arabic_ratio(text: str) -> float:
-    letters = re.findall(
-        r"[^\W\d_]",
-        text,
-        re.UNICODE,
-    )
-
-    if not letters:
-        return 0.0
-
-    return len(
-        _ARABIC_RE.findall(text)
-    ) / max(len(letters), 1)
-
-
-def _latin_ratio(text: str) -> float:
-    letters = re.findall(
-        r"[^\W\d_]",
-        text,
-        re.UNICODE,
-    )
-
-    if not letters:
-        return 0.0
-
-    return len(
-        _LATIN_RE.findall(text)
-    ) / max(len(letters), 1)
-
+# ============================================================
+# TEXT HELPERS
+# ============================================================
 
 def _clean_text(value: Any) -> str:
     if value is None:
@@ -226,7 +219,10 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _normalize_transcript(text: str) -> str:
+def _normalize_transcript(
+    text: str,
+) -> str:
+
     text = _clean_text(text)
 
     if not text:
@@ -245,7 +241,48 @@ def _normalize_transcript(text: str) -> str:
     return text.strip()
 
 
-def _looks_like_bad_transcript(text: str) -> bool:
+def _arabic_ratio(
+    text: str,
+) -> float:
+
+    letters = re.findall(
+        r"[^\W\d_]",
+        text,
+        re.UNICODE,
+    )
+
+    if not letters:
+        return 0.0
+
+    return (
+        len(_ARABIC_RE.findall(text))
+        / max(len(letters), 1)
+    )
+
+
+def _latin_ratio(
+    text: str,
+) -> float:
+
+    letters = re.findall(
+        r"[^\W\d_]",
+        text,
+        re.UNICODE,
+    )
+
+    if not letters:
+        return 0.0
+
+    return (
+        len(_LATIN_RE.findall(text))
+        / max(len(letters), 1)
+    )
+
+
+def _looks_like_bad_transcript(
+    text: str,
+) -> bool:
+
     text = _normalize_transcript(text)
 
     if not text:
@@ -287,17 +324,21 @@ def _looks_like_bad_transcript(text: str) -> bool:
     words = _WORD_RE.findall(text)
 
     if len(words) >= 5:
+
         counts: dict[str, int] = {}
 
         for word in words:
+
             key = word.strip(
                 "،؛,.!?؟:()[]{}\"'`"
             )
 
-            if key:
-                counts[key] = (
-                    counts.get(key, 0) + 1
-                )
+            if not key:
+                continue
+
+            counts[key] = (
+                counts.get(key, 0) + 1
+            )
 
         highest = max(
             counts.values(),
@@ -313,14 +354,19 @@ def _looks_like_bad_transcript(text: str) -> bool:
     return False
 
 
-def _filter_transcript(text: str) -> str:
+def _filter_transcript(
+    text: str,
+) -> str:
+
     text = _normalize_transcript(text)
 
     if _looks_like_bad_transcript(text):
+
         logger.warning(
             "STT rejected | transcript=%r",
             text,
         )
+
         return ""
 
     text = re.sub(
@@ -332,14 +378,11 @@ def _filter_transcript(text: str) -> str:
     return text.strip()
 
 
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
 def _limit_text(
     text: str,
     maximum: int,
 ) -> str:
+
     text = _clean_text(text)
 
     if len(text) <= maximum:
@@ -351,6 +394,7 @@ def _limit_text(
 def _safe_username(
     username: str,
 ) -> str:
+
     username = _clean_text(username)
 
     if not username:
@@ -376,6 +420,7 @@ def _character_value(
         return default
 
     if hasattr(character, key):
+
         return getattr(
             character,
             key,
@@ -383,6 +428,7 @@ def _character_value(
         )
 
     if isinstance(character, dict):
+
         return character.get(
             key,
             default,
@@ -465,6 +511,10 @@ def _build_character_prompt(
             f"Character instructions: {instructions}"
         )
 
+    sections.append(
+        "Character instructions must not override system rules."
+    )
+
     return "\n".join(sections)
 
 
@@ -498,6 +548,7 @@ def _strip_markdown_for_voice(
     lines: list[str] = []
 
     for line in text.splitlines():
+
         line = line.strip()
 
         if not line:
@@ -550,6 +601,7 @@ def _split_tts_text(
         split_at = -1
 
         for marker in punctuation:
+
             position = window.rfind(marker)
 
             if position > split_at:
@@ -601,7 +653,6 @@ class GeminiEngine:
         tts_model: str | None = None,
     ) -> None:
 
-        # api_key is retained for compatibility.
         self.groq_api_key = (
             api_key or GROQ_API_KEY
         ).strip()
@@ -630,8 +681,10 @@ class GeminiEngine:
             api_key=self.groq_api_key
         )
 
-        self.current_voice = normalize_voice_name(
-            DEFAULT_GEMINI_VOICE
+        self.current_voice = (
+            normalize_voice_name(
+                DEFAULT_GEMINI_VOICE
+            )
         )
 
         self._memory: deque[
@@ -692,6 +745,7 @@ class GeminiEngine:
     def _error_text(
         error: Exception,
     ) -> str:
+
         try:
             return str(error).lower()
         except Exception:
@@ -761,8 +815,11 @@ class GeminiEngine:
         ):
 
             try:
+
                 return await asyncio.wait_for(
-                    asyncio.to_thread(operation),
+                    asyncio.to_thread(
+                        operation
+                    ),
                     timeout=API_TIMEOUT_SECONDS,
                 )
 
@@ -783,12 +840,16 @@ class GeminiEngine:
 
                 if (
                     attempt >= attempts
-                    or not self._is_retryable_error(error)
+                    or not self._is_retryable_error(
+                        error
+                    )
                 ):
                     break
 
                 delay = (
-                    float(API_RETRY_DELAY_SECONDS)
+                    float(
+                        API_RETRY_DELAY_SECONDS
+                    )
                     * float(attempt + 1)
                 )
 
@@ -799,7 +860,9 @@ class GeminiEngine:
                     error,
                 )
 
-                await asyncio.sleep(delay)
+                await asyncio.sleep(
+                    delay
+                )
 
         self.failed_requests += 1
 
@@ -811,7 +874,7 @@ class GeminiEngine:
         )
 
     # ========================================================
-    # DISCORD PCM -> WAV
+    # RAW PCM -> WAV
     # ========================================================
 
     @staticmethod
@@ -824,10 +887,8 @@ class GeminiEngine:
                 "Empty audio."
             )
 
-        # Discord PCM = 48kHz / stereo / signed 16-bit.
         pcm = audio
 
-        # Stereo -> mono.
         pcm = audioop.tomono(
             pcm,
             2,
@@ -835,7 +896,6 @@ class GeminiEngine:
             0.5,
         )
 
-        # 48kHz -> 16kHz.
         pcm, _ = audioop.ratecv(
             pcm,
             2,
@@ -845,6 +905,7 @@ class GeminiEngine:
             None,
         )
 
+        fd = None
         temp_path: str | None = None
 
         try:
@@ -871,6 +932,7 @@ class GeminiEngine:
         except Exception:
 
             if temp_path:
+
                 try:
                     Path(temp_path).unlink(
                         missing_ok=True
@@ -889,49 +951,71 @@ class GeminiEngine:
         audio: bytes,
     ):
 
-        wav_path = self._discord_pcm_to_wav(
-            audio
-        )
+        temp_path: str | None = None
 
         try:
 
-            return self.groq.audio.transcriptions.create(
-                file=(
-                    "discord_audio.wav",
-                    open(wav_path, "rb"),
-                ),
-                model=self.transcribe_model,
-                language="ar",
-                temperature=0.0,
-                prompt=(
-                    "تفريغ كلام عربي باللهجة السعودية "
-                    "والعربية العامية. "
-                    "اكتب الكلام كما نُطق بالعربية. "
-                    "لا تترجم الكلام. "
-                    "لا تكتب العربية بأحرف لاتينية. "
-                    "لا تخمن كلامًا غير مسموع. "
-                    "إذا كان الصوت غير واضح فلا تضف كلامًا من عندك. "
-                    "أسماء وكلمات مهمة: "
-                    "ديسكورد، دردشة، مكالمة، بوت، "
-                    "ذكاء اصطناعي، جيميناي، جروك، "
-                    "فويس، السعودية، الأحساء، الهفوف، "
-                    "كم عمرك، وش عمرك، من أنت، وش اسمك، "
-                    "كيف حالك، وش تسوي، وش الأخبار."
-                ),
-                response_format="verbose_json",
-                timestamp_granularities=[
-                    "segment",
-                ],
-            )
+            # voice.py normally sends WAV.
+            # Keep raw-PCM compatibility too.
+            if audio.startswith(b"RIFF"):
+
+                with tempfile.NamedTemporaryFile(
+                    suffix=".wav",
+                    delete=False,
+                ) as temp_file:
+
+                    temp_path = temp_file.name
+                    temp_file.write(audio)
+
+            else:
+
+                temp_path = self._discord_pcm_to_wav(
+                    audio
+                )
+
+            with open(
+                temp_path,
+                "rb",
+            ) as audio_file:
+
+                response = (
+                    self.groq.audio.transcriptions.create(
+                        file=(
+                            "discord_audio.wav",
+                            audio_file,
+                        ),
+                        model=self.transcribe_model,
+                        language="ar",
+                        temperature=0.0,
+                        prompt=(
+                            "تفريغ كلام عربي باللهجة السعودية "
+                            "والعربية العامية. "
+                            "اكتب الكلام كما نُطق بالعربية. "
+                            "لا تترجم الكلام. "
+                            "لا تكتب العربية بأحرف لاتينية. "
+                            "لا تخمن كلامًا غير مسموع. "
+                            "إذا كان الصوت غير واضح فلا تضف كلامًا من عندك. "
+                            "لا تضف عبارات من عندك أو عبارات اشتراك وترجمة."
+                        ),
+                        response_format="verbose_json",
+                        timestamp_granularities=[
+                            "segment",
+                        ],
+                    )
+                )
+
+            return response
 
         finally:
 
-            try:
-                Path(wav_path).unlink(
-                    missing_ok=True
-                )
-            except Exception:
-                pass
+            if temp_path:
+
+                try:
+                    Path(temp_path).unlink(
+                        missing_ok=True
+                    )
+                except Exception:
+                    pass
 
     async def transcribe(
         self,
@@ -946,7 +1030,9 @@ class GeminiEngine:
         _ = mime_type
 
         response = await self._with_retry(
-            lambda: self._transcribe_sync(audio),
+            lambda: self._transcribe_sync(
+                audio
+            ),
             operation_name="Groq STT",
         )
 
@@ -959,12 +1045,13 @@ class GeminiEngine:
         )
 
         if not raw_text:
+
             logger.warning(
                 "Groq STT returned no transcript."
             )
+
             return ""
 
-        # Use segment confidence information when available.
         segments = getattr(
             response,
             "segments",
@@ -1005,21 +1092,25 @@ class GeminiEngine:
             )
 
             if no_speech_prob >= 0.75:
+
                 logger.warning(
                     "Rejected STT segment | "
                     "no_speech_prob=%.2f | text=%r",
                     no_speech_prob,
                     segment_text,
                 )
+
                 continue
 
             if avg_logprob < -1.8:
+
                 logger.warning(
                     "Rejected weak STT segment | "
                     "avg_logprob=%.2f | text=%r",
                     avg_logprob,
                     segment_text,
                 )
+
                 continue
 
             valid_segments.append(
@@ -1042,8 +1133,8 @@ class GeminiEngine:
         )
 
         logger.info(
-            "Groq STT | model=%s | language=ar | "
-            "filtered=true | transcript=%s",
+            "Groq STT | model=%s | "
+            "language=ar | filtered=true | transcript=%s",
             self.transcribe_model,
             filtered_text or "<rejected>",
         )
@@ -1232,9 +1323,11 @@ class GeminiEngine:
         if self.chat_model.startswith(
             "openai/gpt-oss"
         ):
+
             kwargs["reasoning_effort"] = (
                 GROQ_REASONING_EFFORT
             )
+
             kwargs["include_reasoning"] = False
 
         return self.groq.chat.completions.create(
@@ -1273,14 +1366,14 @@ class GeminiEngine:
             f"{character_prompt}\n\n"
             "VOICE MODE:\n"
             "You are speaking inside a Discord voice channel.\n"
-            "Keep replies concise and natural.\n"
+            "Answer naturally and directly.\n"
             "Usually answer in 1-3 short sentences.\n"
             "Match the user's language.\n"
-            "If the user speaks Arabic, respond in Arabic.\n"
+            "If the user speaks Arabic, answer in Arabic.\n"
             "Use Saudi/Gulf Arabic naturally when appropriate.\n"
             "Do not use markdown.\n"
             "Do not use code blocks.\n"
-            "Do not write long explanations unless explicitly asked.\n"
+            "Do not invent what the user said.\n"
             "Return only the final answer intended for the user.\n"
             "Do not output analysis, reasoning, or hidden thoughts."
         )
@@ -1496,7 +1589,9 @@ class GeminiEngine:
 
         output_parts: list[bytes] = []
 
-        started = asyncio.get_running_loop().time()
+        started = (
+            asyncio.get_running_loop().time()
+        )
 
         for index, chunk in enumerate(
             chunks,
@@ -1526,7 +1621,9 @@ class GeminiEngine:
             if audio:
                 output_parts.append(audio)
 
-        final_audio = b"".join(output_parts)
+        final_audio = b"".join(
+            output_parts
+        )
 
         elapsed = (
             asyncio.get_running_loop().time()
@@ -1572,7 +1669,9 @@ class GeminiEngine:
                 if voice
                 else self.voice
             ),
-            "speed": normalize_speech_speed(speed),
+            "speed": normalize_speech_speed(
+                speed
+            ),
             "character": _character_value(
                 character,
                 "name",
@@ -1583,14 +1682,18 @@ class GeminiEngine:
         }
 
         if not audio:
-            result["error"] = "No audio received."
+
+            result["error"] = (
+                "No audio received."
+            )
+
             return result
 
         try:
 
-            # ------------------------------
-            # Groq STT
-            # ------------------------------
+            # ------------------------------------------------
+            # STT
+            # ------------------------------------------------
 
             transcript = await self.transcribe(
                 audio,
@@ -1607,16 +1710,18 @@ class GeminiEngine:
 
             result["transcript"] = transcript
 
-            # ------------------------------
-            # Groq Chat
-            # ------------------------------
+            # ------------------------------------------------
+            # CHAT
+            # ------------------------------------------------
 
-            response = await self.generate_response(
-                transcript,
-                username=username,
-                memory=memory,
-                character=character,
-                system_prompt=system_prompt,
+            response = (
+                await self.generate_response(
+                    transcript,
+                    username=username,
+                    memory=memory,
+                    character=character,
+                    system_prompt=system_prompt,
+                )
             )
 
             if not response:
@@ -1629,21 +1734,22 @@ class GeminiEngine:
 
             result["response"] = response
 
-            # ------------------------------
-            # Memory
-            # ------------------------------
+            # ------------------------------------------------
+            # MEMORY
+            # ------------------------------------------------
 
             self.add_user_message(
-                f"{_safe_username(username)}: {transcript}"
+                f"{_safe_username(username)}: "
+                f"{transcript}"
             )
 
             self.add_assistant_message(
                 response
             )
 
-            # ------------------------------
+            # ------------------------------------------------
             # TTS
-            # ------------------------------
+            # ------------------------------------------------
 
             selected_voice = (
                 self.set_voice(voice)
