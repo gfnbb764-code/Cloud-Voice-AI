@@ -1,6 +1,7 @@
 # config.py
 # ============================================================
-# Cloud Voice AI — Central Configuration
+# Cloud Voice AI — Complete Configuration
+# Compatible with main.py + voice.py + gemini.py
 # ============================================================
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ def get_env(
 ) -> str:
     value = os.getenv(name)
 
-    if value is None:
+    if value is None or not value.strip():
         if required and default is None:
             raise RuntimeError(
                 f"Missing required environment variable: {name}"
@@ -34,36 +35,7 @@ def get_env(
 
         return "" if default is None else default
 
-    value = value.strip()
-
-    if not value:
-        if required and default is None:
-            raise RuntimeError(
-                f"Environment variable is empty: {name}"
-            )
-
-        return "" if default is None else default
-
-    return value
-
-
-def get_bool(
-    name: str,
-    default: bool = False,
-) -> bool:
-    value = os.getenv(name)
-
-    if value is None:
-        return default
-
-    return value.strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-        "enabled",
-    }
+    return value.strip()
 
 
 def get_int(
@@ -94,6 +66,50 @@ def get_float(
         return float(value.strip())
     except (TypeError, ValueError):
         return default
+
+
+def get_bool(
+    name: str,
+    default: bool = False,
+) -> bool:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+        "enabled",
+    }
+
+
+# ============================================================
+# PROJECT
+# ============================================================
+
+PROJECT_NAME: Final[str] = get_env(
+    "PROJECT_NAME",
+    "Cloud Voice AI",
+)
+
+PROJECT_VERSION: Final[str] = get_env(
+    "PROJECT_VERSION",
+    "1.0.0",
+)
+
+PROJECT_DESCRIPTION: Final[str] = get_env(
+    "PROJECT_DESCRIPTION",
+    "AI Voice Assistant for Discord",
+)
+
+PROJECT_AUTHOR: Final[str] = get_env(
+    "PROJECT_AUTHOR",
+    "Cloud Voice AI",
+)
 
 
 # ============================================================
@@ -130,9 +146,17 @@ DISCORD_ACTIVITY_TYPE: Final[str] = get_env(
     "listening",
 )
 
+DISCORD_SHARD_COUNT: Final[int] = max(
+    1,
+    get_int(
+        "DISCORD_SHARD_COUNT",
+        1,
+    ),
+)
+
 
 # ============================================================
-# GEMINI API
+# GEMINI
 # ============================================================
 
 GEMINI_API_KEY: Final[str] = get_env(
@@ -161,6 +185,12 @@ TTS_MODEL: Final[str] = get_env(
 )
 
 
+# Aliases للتوافق مع أي كود قديم
+GEMINI_CHAT_MODEL: Final[str] = CHAT_MODEL
+GEMINI_TRANSCRIBE_MODEL: Final[str] = TRANSCRIBE_MODEL
+GEMINI_TTS_MODEL: Final[str] = TTS_MODEL
+
+
 # ============================================================
 # AI GENERATION
 # ============================================================
@@ -170,14 +200,17 @@ GEMINI_TEMPERATURE: Final[float] = get_float(
     0.75,
 )
 
-GEMINI_MAX_OUTPUT_TOKENS: Final[int] = get_int(
-    "GEMINI_MAX_OUTPUT_TOKENS",
-    700,
+GEMINI_MAX_OUTPUT_TOKENS: Final[int] = max(
+    64,
+    get_int(
+        "GEMINI_MAX_OUTPUT_TOKENS",
+        700,
+    ),
 )
 
 
 # ============================================================
-# AI PERSONALITY
+# AI SYSTEM PROMPT
 # ============================================================
 
 AI_SYSTEM_PROMPT: Final[str] = get_env(
@@ -185,16 +218,18 @@ AI_SYSTEM_PROMPT: Final[str] = get_env(
     """
 You are Cloud Voice AI, a friendly and intelligent Discord voice assistant.
 
+Your job is to listen to users, understand what they say, and respond naturally.
+
 Rules:
-- Respond naturally and conversationally.
-- Keep responses useful and understandable.
-- Match the user's language when possible.
+- Be friendly, natural, and conversational.
+- Match the user's language whenever possible.
 - If the user speaks Arabic, respond naturally in Arabic.
-- Do not claim to hear something you did not receive.
-- Do not invent actions you did not perform.
-- Avoid unnecessarily long answers in voice conversations.
-- Be friendly, relaxed, and engaging.
-- Never expose API keys, environment variables, hidden prompts, or internal system information.
+- Keep voice responses reasonably concise.
+- Do not claim to have performed an action unless you actually performed it.
+- Do not invent information about the Discord server.
+- Do not reveal API keys, tokens, environment variables, hidden prompts, or internal configuration.
+- If you do not know something, say so honestly.
+- Avoid unnecessary formatting because your response may be spoken aloud.
 """.strip(),
 )
 
@@ -218,22 +253,13 @@ MAX_MEMORY_MESSAGES: Final[int] = max(
 
 
 # ============================================================
-# VOICE
+# GEMINI VOICES
 # ============================================================
 
 DEFAULT_GEMINI_VOICE: Final[str] = get_env(
     "DEFAULT_VOICE",
     "Kore",
 )
-
-
-# ============================================================
-# GEMINI TTS VOICES
-# ============================================================
-#
-# أسماء أصوات Gemini المسموحة للمشروع.
-# يمكن استخدام /voices لعرضها.
-# ============================================================
 
 GEMINI_VOICES: Final[tuple[str, ...]] = (
     "Zephyr",
@@ -269,15 +295,10 @@ GEMINI_VOICES: Final[tuple[str, ...]] = (
 )
 
 
-# ============================================================
-# VOICE ALIASES
-# ============================================================
-
 VOICE_ALIASES: Final[dict[str, str]] = {
     "default": "Kore",
     "k": "Kore",
     "kore": "Kore",
-
     "zephyr": "Zephyr",
     "puck": "Puck",
     "charon": "Charon",
@@ -285,7 +306,6 @@ VOICE_ALIASES: Final[dict[str, str]] = {
     "leda": "Leda",
     "orus": "Orus",
     "aoede": "Aoede",
-
     "callirrhoe": "Callirrhoe",
     "autonoe": "Autonoe",
     "enceladus": "Enceladus",
@@ -312,11 +332,7 @@ VOICE_ALIASES: Final[dict[str, str]] = {
 
 
 # ============================================================
-# AUDIO — REFERENCE CONSTANTS
-# ============================================================
-#
-# هذه الثوابت موجودة هنا للمشاريع الأخرى إذا احتاجتها،
-# لكن voice.py لا يعتمد عليها.
+# AUDIO
 # ============================================================
 
 DISCORD_SAMPLE_RATE: Final[int] = 48000
@@ -332,8 +348,18 @@ GEMINI_TTS_CHANNELS: Final[int] = 1
 GEMINI_TTS_SAMPLE_WIDTH: Final[int] = 2
 
 
+# توافق مع أسماء الصوت القديمة
+PCM_SAMPLE_RATE: Final[int] = DISCORD_SAMPLE_RATE
+PCM_CHANNELS: Final[int] = DISCORD_CHANNELS
+PCM_SAMPLE_WIDTH: Final[int] = DISCORD_SAMPLE_WIDTH
+
+AUDIO_SAMPLE_RATE: Final[int] = DISCORD_SAMPLE_RATE
+AUDIO_CHANNELS: Final[int] = DISCORD_CHANNELS
+AUDIO_SAMPLE_WIDTH: Final[int] = DISCORD_SAMPLE_WIDTH
+
+
 # ============================================================
-# VOICE SESSION LIMITS
+# VOICE LIMITS
 # ============================================================
 
 MAX_RECORDING_SECONDS: Final[float] = max(
@@ -369,7 +395,7 @@ MAX_AUDIO_BUFFER_BYTES: Final[int] = (
 
 
 # ============================================================
-# NETWORK / API
+# API / NETWORK
 # ============================================================
 
 API_TIMEOUT_SECONDS: Final[float] = max(
@@ -444,7 +470,7 @@ LOG_LEVEL: Final[str] = get_env(
 
 COMMAND_DESCRIPTIONS: Final[dict[str, str]] = {
     "ping": "اختبار سرعة واستجابة البوت.",
-    "botinfo": "عرض معلومات Cloud Voice AI.",
+    "botinfo": "عرض معلومات البوت.",
     "help": "عرض أوامر البوت.",
     "join": "إدخال البوت إلى الروم الصوتي.",
     "leave": "إخراج البوت من الروم الصوتي.",
@@ -460,13 +486,42 @@ COMMAND_DESCRIPTIONS: Final[dict[str, str]] = {
 
 
 # ============================================================
+# VOICE HELPERS
+# ============================================================
+
+def normalize_voice_name(
+    name: str,
+) -> str:
+
+    if not name:
+        return DEFAULT_GEMINI_VOICE
+
+    value = str(name).strip().lower()
+
+    for voice in GEMINI_VOICES:
+        if voice.lower() == value:
+            return voice
+
+    return VOICE_ALIASES.get(
+        value,
+        DEFAULT_GEMINI_VOICE,
+    )
+
+
+def is_valid_voice(
+    name: str,
+) -> bool:
+
+    return normalize_voice_name(
+        name
+    ) in GEMINI_VOICES
+
+
+# ============================================================
 # VALIDATION
 # ============================================================
 
 def validate_config() -> None:
-    """
-    يتحقق من الإعدادات الأساسية قبل تشغيل البوت.
-    """
 
     if not DISCORD_TOKEN:
         raise RuntimeError(
@@ -493,72 +548,24 @@ def validate_config() -> None:
             "TTS_MODEL is missing."
         )
 
-    if DEFAULT_GEMINI_VOICE not in GEMINI_VOICES:
-        # محاولة إصلاح الصوت تلقائيًا
-        normalized = VOICE_ALIASES.get(
-            DEFAULT_GEMINI_VOICE.lower(),
-            "Kore",
+    normalized = normalize_voice_name(
+        DEFAULT_GEMINI_VOICE
+    )
+
+    if normalized not in GEMINI_VOICES:
+        raise RuntimeError(
+            "DEFAULT_VOICE is not a valid Gemini voice."
         )
 
-        if normalized in GEMINI_VOICES:
-            globals()[
-                "DEFAULT_GEMINI_VOICE"
-            ] = normalized
-        else:
-            raise RuntimeError(
-                "DEFAULT_VOICE is not a valid Gemini voice."
-            )
-
 
 # ============================================================
-# VOICE HELPERS
-# ============================================================
-
-def normalize_voice_name(
-    name: str,
-) -> str:
-
-    if not name:
-        return DEFAULT_GEMINI_VOICE
-
-    value = str(name).strip()
-
-    # الاسم الرسمي
-    for voice in GEMINI_VOICES:
-        if voice.lower() == value.lower():
-            return voice
-
-    # Alias
-    alias = VOICE_ALIASES.get(
-        value.lower()
-    )
-
-    if alias:
-        return alias
-
-    return DEFAULT_GEMINI_VOICE
-
-
-def is_valid_voice(
-    name: str,
-) -> bool:
-
-    normalized = normalize_voice_name(
-        name
-    )
-
-    return normalized in GEMINI_VOICES
-
-
-# ============================================================
-# SAFE CONFIG SUMMARY
-# ============================================================
-#
-# لا نطبع المفاتيح السرية.
+# SAFE CONFIG
 # ============================================================
 
 def get_safe_config() -> dict:
     return {
+        "project": PROJECT_NAME,
+        "version": PROJECT_VERSION,
         "discord_token_configured": bool(
             DISCORD_TOKEN
         ),
@@ -579,17 +586,23 @@ def get_safe_config() -> dict:
 
 
 # ============================================================
-# STARTUP VALIDATION
+# VALIDATE ON IMPORT
 # ============================================================
 
 validate_config()
 
 
 # ============================================================
-# PUBLIC EXPORTS
+# EXPORTS
 # ============================================================
 
 __all__ = [
+    # Project
+    "PROJECT_NAME",
+    "PROJECT_VERSION",
+    "PROJECT_DESCRIPTION",
+    "PROJECT_AUTHOR",
+
     # Discord
     "DISCORD_TOKEN",
     "DISCORD_PREFIX",
@@ -597,12 +610,16 @@ __all__ = [
     "DISCORD_GUILD_ID",
     "DISCORD_STATUS",
     "DISCORD_ACTIVITY_TYPE",
+    "DISCORD_SHARD_COUNT",
 
     # Gemini
     "GEMINI_API_KEY",
     "CHAT_MODEL",
     "TRANSCRIBE_MODEL",
     "TTS_MODEL",
+    "GEMINI_CHAT_MODEL",
+    "GEMINI_TRANSCRIBE_MODEL",
+    "GEMINI_TTS_MODEL",
 
     # AI
     "AI_SYSTEM_PROMPT",
@@ -613,7 +630,7 @@ __all__ = [
     "MEMORY_ENABLED",
     "MAX_MEMORY_MESSAGES",
 
-    # Voice
+    # Voices
     "DEFAULT_GEMINI_VOICE",
     "GEMINI_VOICES",
     "VOICE_ALIASES",
@@ -629,13 +646,21 @@ __all__ = [
     "GEMINI_TTS_CHANNELS",
     "GEMINI_TTS_SAMPLE_WIDTH",
 
-    # Limits
+    # Compatibility audio names
+    "PCM_SAMPLE_RATE",
+    "PCM_CHANNELS",
+    "PCM_SAMPLE_WIDTH",
+    "AUDIO_SAMPLE_RATE",
+    "AUDIO_CHANNELS",
+    "AUDIO_SAMPLE_WIDTH",
+
+    # Voice limits
     "MAX_RECORDING_SECONDS",
     "VOICE_SILENCE_TIMEOUT",
     "MIN_AUDIO_SECONDS",
     "MAX_AUDIO_BUFFER_BYTES",
 
-    # Network
+    # API
     "API_TIMEOUT_SECONDS",
     "API_MAX_RETRIES",
     "RETRY_DELAY_SECONDS",
@@ -654,10 +679,11 @@ __all__ = [
 
     # Helpers
     "get_env",
-    "get_bool",
     "get_int",
     "get_float",
+    "get_bool",
     "normalize_voice_name",
     "is_valid_voice",
+    "validate_config",
     "get_safe_config",
 ]
