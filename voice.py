@@ -13,18 +13,18 @@ import discord
 from discord.ext import commands, voice_recv
 
 from config import (
+    DISCORD_CHANNELS,
+    DISCORD_SAMPLE_RATE,
+    DISCORD_SAMPLE_WIDTH,
     GEMINI_INPUT_CHANNELS,
     GEMINI_INPUT_SAMPLE_RATE,
     GEMINI_INPUT_SAMPLE_WIDTH,
     GEMINI_TTS_CHANNELS,
     GEMINI_TTS_SAMPLE_RATE,
     GEMINI_TTS_SAMPLE_WIDTH,
-    DISCORD_PLAYBACK_CHANNELS,
-    DISCORD_PLAYBACK_SAMPLE_RATE,
-    DISCORD_PLAYBACK_SAMPLE_WIDTH,
-    VOICE_MAX_BUFFER_SECONDS,
-    VOICE_SILENCE_SECONDS,
-    VOICE_MIN_AUDIO_SECONDS,
+    MAX_RECORDING_SECONDS,
+    VOICE_SILENCE_TIMEOUT,
+    MIN_AUDIO_SECONDS,
 )
 
 from gemini import GeminiEngine
@@ -45,9 +45,13 @@ TTS_RATE = GEMINI_TTS_SAMPLE_RATE
 TTS_CHANNELS = GEMINI_TTS_CHANNELS
 TTS_WIDTH = GEMINI_TTS_SAMPLE_WIDTH
 
-DISCORD_RATE = DISCORD_PLAYBACK_SAMPLE_RATE
-DISCORD_CHANNELS = DISCORD_PLAYBACK_CHANNELS
-DISCORD_WIDTH = DISCORD_PLAYBACK_SAMPLE_WIDTH
+DISCORD_RATE = DISCORD_SAMPLE_RATE
+DISCORD_CHANNELS = DISCORD_CHANNELS
+DISCORD_WIDTH = DISCORD_SAMPLE_WIDTH
+
+VOICE_MAX_BUFFER_SECONDS = MAX_RECORDING_SECONDS
+VOICE_SILENCE_SECONDS = VOICE_SILENCE_TIMEOUT
+VOICE_MIN_AUDIO_SECONDS = MIN_AUDIO_SECONDS
 
 
 # ============================================================
@@ -83,18 +87,36 @@ def pcm_48k_stereo_to_16k_mono(pcm: bytes) -> bytes:
     output = bytearray()
 
     # 48 kHz -> 16 kHz
-    # Take every third stereo frame.
+    # Take every third frame.
     for offset in range(0, len(pcm), frame_size * 3):
+
         if offset + frame_size > len(pcm):
             break
 
         if DISCORD_CHANNELS >= 2 and DISCORD_WIDTH == 2:
-            left, right = struct.unpack_from("<hh", pcm, offset)
-            mono = (left + right) // 2
-        else:
-            mono = struct.unpack_from("<h", pcm, offset)[0]
 
-        output.extend(struct.pack("<h", mono))
+            left, right = struct.unpack_from(
+                "<hh",
+                pcm,
+                offset,
+            )
+
+            mono = (left + right) // 2
+
+        else:
+
+            mono = struct.unpack_from(
+                "<h",
+                pcm,
+                offset,
+            )[0]
+
+        output.extend(
+            struct.pack(
+                "<h",
+                mono,
+            )
+        )
 
     return bytes(output)
 
@@ -107,7 +129,7 @@ def pcm_to_wav(
     sample_width: int,
 ) -> bytes:
     """
-    Wrap raw PCM data in a WAV container.
+    Wrap raw PCM data inside a WAV container.
     """
 
     if not pcm:
@@ -116,6 +138,7 @@ def pcm_to_wav(
     buffer = io.BytesIO()
 
     with wave.open(buffer, "wb") as wav:
+
         wav.setnchannels(channels)
         wav.setsampwidth(sample_width)
         wav.setframerate(sample_rate)
@@ -124,7 +147,9 @@ def pcm_to_wav(
     return buffer.getvalue()
 
 
-def tts_pcm_to_discord_pcm(pcm: bytes) -> bytes:
+def tts_pcm_to_discord_pcm(
+    pcm: bytes,
+) -> bytes:
     """
     Convert Gemini TTS PCM:
 
@@ -139,7 +164,9 @@ def tts_pcm_to_discord_pcm(pcm: bytes) -> bytes:
         return b""
 
     if TTS_WIDTH != 2:
-        raise ValueError("Only 16-bit TTS PCM is supported.")
+        raise ValueError(
+            "Only 16-bit TTS PCM is supported."
+        )
 
     usable = len(pcm) - (len(pcm) % 2)
 
@@ -151,14 +178,23 @@ def tts_pcm_to_discord_pcm(pcm: bytes) -> bytes:
     output = bytearray()
 
     # 24 kHz -> 48 kHz
-    # Duplicate every sample.
+    # Duplicate each sample.
     for offset in range(0, len(pcm), 2):
-        sample = struct.unpack_from("<h", pcm, offset)[0]
+
+        sample = struct.unpack_from(
+            "<h",
+            pcm,
+            offset,
+        )[0]
 
         # Mono -> stereo
-        # 24k -> 48k
-        frame = struct.pack("<hh", sample, sample)
+        frame = struct.pack(
+            "<hh",
+            sample,
+            sample,
+        )
 
+        # Duplicate sample for 24k -> 48k.
         output.extend(frame)
         output.extend(frame)
 
@@ -184,10 +220,17 @@ def pcm_is_silent(
 
     sample_count = usable // 2
 
-    # Inspect a limited number of samples.
-    step = max(1, sample_count // 2000)
+    step = max(
+        1,
+        sample_count // 2000,
+    )
 
-    for index in range(0, sample_count, step):
+    for index in range(
+        0,
+        sample_count,
+        step,
+    ):
+
         offset = index * 2
 
         sample = struct.unpack_from(
@@ -216,11 +259,13 @@ class UserAudioState:
     processing: bool = False
 
     def __post_init__(self) -> None:
+
         if not self.pcm_chunks:
             self.pcm_chunks = []
 
     @property
     def duration(self) -> float:
+
         return max(
             0.0,
             time.monotonic() - self.started_at,
@@ -228,25 +273,37 @@ class UserAudioState:
 
     @property
     def audio_bytes(self) -> int:
+
         return sum(
             len(chunk)
             for chunk in self.pcm_chunks
         )
 
-    def append(self, pcm: bytes) -> None:
+    def append(
+        self,
+        pcm: bytes,
+    ) -> None:
+
         if not pcm:
             return
 
         self.pcm_chunks.append(pcm)
-        self.last_audio_at = time.monotonic()
+
+        self.last_audio_at = (
+            time.monotonic()
+        )
 
     def build_audio(self) -> bytes:
+
         if not self.pcm_chunks:
             return b""
 
-        return b"".join(self.pcm_chunks)
+        return b"".join(
+            self.pcm_chunks
+        )
 
     def clear(self) -> None:
+
         self.pcm_chunks.clear()
 
 
@@ -256,8 +313,8 @@ class UserAudioState:
 
 class VoiceAISink(voice_recv.AudioSink):
     """
-    Receives decoded Discord PCM and forwards it
-    to VoiceSession.
+    Receives decoded Discord PCM
+    and forwards it to VoiceSession.
     """
 
     def __init__(
@@ -294,12 +351,14 @@ class VoiceAISink(voice_recv.AudioSink):
             return
 
         try:
+
             self.session.receive_pcm(
                 user,
                 pcm,
             )
 
         except Exception:
+
             logger.exception(
                 "VoiceAISink failed while receiving audio from %s",
                 getattr(
@@ -310,6 +369,7 @@ class VoiceAISink(voice_recv.AudioSink):
             )
 
     def cleanup(self) -> None:
+
         self._closed = True
 
 
@@ -329,6 +389,7 @@ class VoiceSession:
         *,
         guild_id: int,
     ):
+
         self.bot = bot
         self.voice_client = voice_client
         self.guild_id = guild_id
@@ -342,9 +403,13 @@ class VoiceSession:
 
         self.processing_users: set[int] = set()
 
-        self.processing_semaphore = asyncio.Semaphore(2)
+        self.processing_semaphore = asyncio.Semaphore(
+            2
+        )
 
-        self.sink = VoiceAISink(self)
+        self.sink = VoiceAISink(
+            self
+        )
 
         self._monitor_task: Optional[
             asyncio.Task
@@ -358,6 +423,7 @@ class VoiceSession:
     # --------------------------------------------------------
 
     def start(self) -> None:
+
         if self._started:
             return
 
@@ -386,7 +452,7 @@ class VoiceSession:
         )
 
     # --------------------------------------------------------
-    # RECEIVE CALLBACK
+    # RECEIVE PCM
     # --------------------------------------------------------
 
     def receive_pcm(
@@ -410,6 +476,7 @@ class VoiceSession:
         )
 
         if state is None:
+
             state = UserAudioState(
                 user_id=user_id,
                 username=(
@@ -431,8 +498,10 @@ class VoiceSession:
 
             self.states[user_id] = state
 
-        gemini_pcm = pcm_48k_stereo_to_16k_mono(
-            pcm
+        gemini_pcm = (
+            pcm_48k_stereo_to_16k_mono(
+                pcm
+            )
         )
 
         if not gemini_pcm:
@@ -451,11 +520,17 @@ class VoiceSession:
     # MONITOR
     # --------------------------------------------------------
 
-    async def _monitor_loop(self) -> None:
+    async def _monitor_loop(
+        self,
+    ) -> None:
+
         try:
+
             while not self._closed:
 
-                await asyncio.sleep(0.10)
+                await asyncio.sleep(
+                    0.10
+                )
 
                 now = time.monotonic()
 
@@ -497,13 +572,19 @@ class VoiceSession:
                     if not audio:
                         continue
 
-                    duration = len(audio) / (
-                        INPUT_RATE
-                        * INPUT_CHANNELS
-                        * INPUT_WIDTH
+                    duration = (
+                        len(audio)
+                        / (
+                            INPUT_RATE
+                            * INPUT_CHANNELS
+                            * INPUT_WIDTH
+                        )
                     )
 
-                    if duration < VOICE_MIN_AUDIO_SECONDS:
+                    if (
+                        duration
+                        < VOICE_MIN_AUDIO_SECONDS
+                    ):
                         continue
 
                     state.processing = True
@@ -532,15 +613,17 @@ class VoiceSession:
                     )
 
         except asyncio.CancelledError:
+
             pass
 
         except Exception:
+
             logger.exception(
                 "Voice monitor crashed"
             )
 
     # --------------------------------------------------------
-    # PROCESS USER
+    # PROCESS USER AUDIO
     # --------------------------------------------------------
 
     async def _process_user_audio(
@@ -550,6 +633,7 @@ class VoiceSession:
     ) -> None:
 
         try:
+
             async with self.processing_semaphore:
 
                 logger.info(
@@ -568,20 +652,20 @@ class VoiceSession:
                 if not wav_audio:
                     return
 
-                response = await self.engine.process_voice(
-                    audio=wav_audio,
-                    username=state.username,
-                    mime_type="audio/wav",
+                response = (
+                    await self.engine.process_voice(
+                        audio=wav_audio,
+                        username=state.username,
+                        mime_type="audio/wav",
+                    )
                 )
 
                 if not response:
                     return
 
-                tts_pcm = response
-
                 discord_pcm = (
                     tts_pcm_to_discord_pcm(
-                        tts_pcm
+                        response
                     )
                 )
 
@@ -593,15 +677,18 @@ class VoiceSession:
                 )
 
         except asyncio.CancelledError:
+
             raise
 
         except Exception:
+
             logger.exception(
                 "Voice AI processing failed for %s",
                 state.username,
             )
 
         finally:
+
             state.processing = False
 
             self.processing_users.discard(
@@ -631,7 +718,9 @@ class VoiceSession:
             if self._closed:
                 return
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(
+                0.05
+            )
 
         source = discord.PCMAudio(
             io.BytesIO(pcm)
@@ -644,29 +733,35 @@ class VoiceSession:
         ) -> None:
 
             if error:
+
                 logger.error(
                     "Voice playback error: %s",
                     error,
                 )
 
             try:
+
                 self.bot.loop.call_soon_threadsafe(
                     finished.set
                 )
 
             except RuntimeError:
+
                 pass
 
         try:
+
             self.voice_client.play(
                 source,
                 after=after,
             )
 
         except Exception:
+
             logger.exception(
                 "Failed to start voice playback"
             )
+
             return
 
         await finished.wait()
@@ -681,6 +776,7 @@ class VoiceSession:
     ) -> None:
 
         if error:
+
             logger.error(
                 "Voice receive stopped with error: %r",
                 error,
@@ -690,7 +786,9 @@ class VoiceSession:
     # STOP
     # --------------------------------------------------------
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+    ) -> None:
 
         if self._closed:
             return
@@ -702,12 +800,15 @@ class VoiceSession:
             self._monitor_task.cancel()
 
             try:
+
                 await self._monitor_task
 
             except asyncio.CancelledError:
+
                 pass
 
             except Exception:
+
                 logger.exception(
                     "Voice monitor shutdown error"
                 )
@@ -715,9 +816,11 @@ class VoiceSession:
             self._monitor_task = None
 
         try:
+
             self.sink.cleanup()
 
         except Exception:
+
             logger.exception(
                 "Voice sink cleanup failed"
             )
@@ -743,6 +846,7 @@ class VoiceSessionManager:
         self,
         bot: commands.Bot,
     ):
+
         self.bot = bot
 
         self.sessions: dict[
@@ -768,7 +872,10 @@ class VoiceSessionManager:
 
         if existing:
 
-            if existing.voice_client.channel == channel:
+            if (
+                existing.voice_client.channel
+                == channel
+            ):
                 return existing
 
             await self.leave(
@@ -820,11 +927,13 @@ class VoiceSessionManager:
             if vc.is_connected():
 
                 try:
+
                     await vc.disconnect(
                         force=True
                     )
 
                 except Exception:
+
                     logger.exception(
                         "Failed to disconnect voice client"
                     )
@@ -851,11 +960,14 @@ class VoiceSessionManager:
     # LEAVE ALL
     # --------------------------------------------------------
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
 
         for guild_id in list(
             self.sessions
         ):
+
             await self.leave(
                 guild_id
             )
