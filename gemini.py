@@ -1,6 +1,6 @@
 # gemini.py
 # ============================================================
-# Cloud Voice AI — Groq + Local Piper
+# Cloud Voice AI — Groq STT + Groq Chat + Groq Saudi TTS
 #
 # Pipeline:
 #
@@ -12,11 +12,14 @@
 #     ↓
 # Groq GPT-OSS 20B
 #     ↓
-# Piper TTS in a separate worker process
+# Groq Orpheus Arabic Saudi TTS
 #     ↓
-# Discord PCM
+# WAV -> PCM 24kHz mono
+#     ↓
+# Discord
 #
 # Gemini is no longer used by this file.
+# Piper is completely removed.
 # ============================================================
 
 from __future__ import annotations
@@ -25,21 +28,13 @@ import asyncio
 import audioop
 import logging
 import os
+import tempfile
+import wave
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
-# Limit CPU threading used by ONNX/Piper.
-# These are defaults and can still be overridden by environment variables.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("ORT_NUM_THREADS", "1")
-
 from groq import Groq
-
-from piper import PiperVoice
-from piper.config import SynthesisConfig
-from piper.download_voices import download_voice
 
 from config import (
     AI_SYSTEM_PROMPT,
@@ -72,27 +67,57 @@ GROQ_API_KEY = (
 # MODELS
 # ============================================================
 
-# Speech-to-text
 GROQ_STT_MODEL = os.getenv(
     "GROQ_STT_MODEL",
     "whisper-large-v3-turbo",
 ).strip() or "whisper-large-v3-turbo"
 
-# Chat / AI
+
 GROQ_CHAT_MODEL = os.getenv(
     "GROQ_CHAT_MODEL",
     "openai/gpt-oss-20b",
 ).strip() or "openai/gpt-oss-20b"
 
-# Local TTS
-PIPER_VOICE_MODEL = os.getenv(
-    "PIPER_MODEL",
-    "ar_JO-kareem-low",
-).strip() or "ar_JO-kareem-low"
 
-LOCAL_TTS_NAME = (
-    f"Piper/{PIPER_VOICE_MODEL}"
-)
+GROQ_TTS_MODEL = os.getenv(
+    "GROQ_TTS_MODEL",
+    "canopylabs/orpheus-arabic-saudi",
+).strip() or "canopylabs/orpheus-arabic-saudi"
+
+
+# ============================================================
+# GROQ ARABIC TTS VOICES
+# ============================================================
+
+# Your old Gemini-style voice names are kept for compatibility.
+# They are mapped to Groq's Saudi Arabic voices.
+
+GROQ_TTS_VOICE_MAP: dict[str, str] = {
+    "Kore": "fahad",
+    "Puck": "abdullah",
+    "Charon": "sultan",
+    "Fenrir": "abdullah",
+    "Aoede": "noura",
+    "Leda": "lulwa",
+    "Orus": "sultan",
+    "Zephyr": "aisha",
+}
+
+
+DEFAULT_GROQ_TTS_VOICE = os.getenv(
+    "GROQ_TTS_VOICE",
+    "fahad",
+).strip().lower() or "fahad"
+
+
+VALID_GROQ_TTS_VOICES = {
+    "abdullah",
+    "fahad",
+    "sultan",
+    "lulwa",
+    "noura",
+    "aisha",
+}
 
 
 # ============================================================
@@ -101,12 +126,17 @@ LOCAL_TTS_NAME = (
 
 DEFAULT_AUDIO_MIME_TYPE = "audio/wav"
 
-# Piper output exposed to voice.py
-PIPER_OUTPUT_SAMPLE_RATE = 24000
-PIPER_OUTPUT_CHANNELS = 1
+# voice.py expects mono PCM at 24 kHz.
+TTS_OUTPUT_SAMPLE_RATE = 24000
+TTS_OUTPUT_CHANNELS = 1
+TTS_OUTPUT_SAMPLE_WIDTH = 2
 
 MAX_TRANSCRIPT_LENGTH = 2500
 MAX_RESPONSE_LENGTH = 1800
+
+# Orpheus Arabic Saudi currently accepts max 200 characters
+# per TTS request.
+MAX_TTS_CHARS = 200
 
 VOICE_MEMORY_LIMIT = min(
     max(int(MAX_MEMORY_MESSAGES), 0),
@@ -114,29 +144,6 @@ VOICE_MEMORY_LIMIT = min(
 )
 
 DEFAULT_SPEECH_SPEED = 1.0
-
-
-# ============================================================
-# PIPER STORAGE
-# ============================================================
-
-PIPER_MODEL_DIR = Path(
-    "piper_models"
-)
-
-
-# ============================================================
-# MAIN-PROCESS PIPER STATE
-# ============================================================
-
-_PIPER_EXECUTOR: ProcessPoolExecutor | None = None
-
-
-# ============================================================
-# PIPER WORKER PROCESS STATE
-# ============================================================
-
-_WORKER_PIPER_VOICE: PiperVoice | None = None
 
 
 # ============================================================
@@ -310,7 +317,7 @@ def _build_character_prompt(
 
 
 # ============================================================
-# MARKDOWN CLEANUP
+# TEXT CLEANUP FOR VOICE
 # ============================================================
 
 def _strip_markdown_for_voice(
@@ -368,313 +375,77 @@ def _strip_markdown_for_voice(
 
 
 # ============================================================
-# PIPER MODEL PATHS
+# TTS TEXT SPLITTER
 # ============================================================
 
-def _piper_paths() -> tuple[Path, Path]:
-
-    PIPER_MODEL_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    model_path = (
-        PIPER_MODEL_DIR
-        / f"{PIPER_VOICE_MODEL}.onnx"
-    )
-
-    config_path = (
-        PIPER_MODEL_DIR
-        / f"{PIPER_VOICE_MODEL}.onnx.json"
-    )
-
-    return (
-        model_path,
-        config_path,
-    )
-
-
-def _ensure_piper_model_sync() -> Path:
-
-    model_path, config_path = (
-        _piper_paths()
-    )
-
-    if (
-        not model_path.exists()
-        or not config_path.exists()
-    ):
-
-        logger.info(
-            "Downloading Piper voice | model=%s",
-            PIPER_VOICE_MODEL,
-        )
-
-        download_voice(
-            PIPER_VOICE_MODEL,
-            PIPER_MODEL_DIR,
-        )
-
-    if not model_path.exists():
-        raise RuntimeError(
-            f"Piper model missing: {model_path}"
-        )
-
-    if not config_path.exists():
-        raise RuntimeError(
-            f"Piper config missing: {config_path}"
-        )
-
-    return model_path
-
-
-def _load_piper_sync() -> PiperVoice:
-
-    model_path = (
-        _ensure_piper_model_sync()
-    )
-
-    logger.info(
-        "Loading local Piper voice | model=%s",
-        PIPER_VOICE_MODEL,
-    )
-
-    voice = PiperVoice.load(
-        str(model_path)
-    )
-
-    logger.info(
-        "Piper voice loaded | model=%s | sample_rate=%s",
-        PIPER_VOICE_MODEL,
-        voice.config.sample_rate,
-    )
-
-    return voice
-
-
-# ============================================================
-# PIPER WORKER PROCESS
-# ============================================================
-
-def _piper_worker_init(
-    model_dir: str,
-    model_name: str,
-) -> None:
-    """
-    Runs once when the dedicated Piper worker process starts.
-    """
-
-    global _WORKER_PIPER_VOICE
-
-    # Re-apply CPU limits inside the child process.
-    os.environ.setdefault(
-        "OMP_NUM_THREADS",
-        "1",
-    )
-
-    os.environ.setdefault(
-        "ORT_NUM_THREADS",
-        "1",
-    )
-
-    worker_model_dir = Path(
-        model_dir
-    )
-
-    worker_model_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    model_path = (
-        worker_model_dir
-        / f"{model_name}.onnx"
-    )
-
-    config_path = (
-        worker_model_dir
-        / f"{model_name}.onnx.json"
-    )
-
-    if (
-        not model_path.exists()
-        or not config_path.exists()
-    ):
-        download_voice(
-            model_name,
-            worker_model_dir,
-        )
-
-    if not model_path.exists():
-        raise RuntimeError(
-            f"Piper model missing in worker: {model_path}"
-        )
-
-    _WORKER_PIPER_VOICE = PiperVoice.load(
-        str(model_path)
-    )
-
-
-def _piper_worker_synthesize(
+def _split_tts_text(
     text: str,
-    speed: float,
-) -> bytes:
+    maximum: int = MAX_TTS_CHARS,
+) -> list[str]:
+    """
+    Split text into chunks that fit Groq Orpheus' input limit.
 
-    global _WORKER_PIPER_VOICE
-
-    if _WORKER_PIPER_VOICE is None:
-        raise RuntimeError(
-            "Piper worker voice is not initialized."
-        )
+    Prefers punctuation and spaces so sentences sound natural.
+    """
 
     text = _clean_text(
         text
     )
 
     if not text:
-        return b""
+        return []
 
-    speed = normalize_speech_speed(
-        speed
+    if len(text) <= maximum:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    punctuation = (
+        "؟",
+        "!",
+        ".",
+        "،",
+        ",",
+        "؛",
+        ";",
+        ":",
     )
 
-    synthesis_config = SynthesisConfig(
-        length_scale=1.0 / speed,
-        volume=1.0,
-        noise_scale=0.667,
-        noise_w_scale=0.8,
-        normalize_audio=True,
-    )
+    while len(remaining) > maximum:
 
-    chunks: list[bytes] = []
-    first_chunk_logged = True
+        window = remaining[:maximum]
 
-    for chunk in _WORKER_PIPER_VOICE.synthesize(
-        text,
-        synthesis_config,
-    ):
+        split_at = -1
 
-        if first_chunk_logged:
+        for marker in punctuation:
+            position = window.rfind(marker)
 
-            logger.info(
-                "Piper first audio chunk ready"
-            )
+            if position > split_at:
+                split_at = position
 
-            first_chunk_logged = False
+        # Avoid tiny chunks.
+        if split_at < 80:
+            split_at = window.rfind(" ")
 
-        audio_bytes = getattr(
-            chunk,
-            "audio_int16_bytes",
-            None,
-        )
+        if split_at < 40:
+            split_at = maximum
 
-        if audio_bytes:
+        chunk = remaining[:split_at].strip()
+
+        if chunk:
             chunks.append(
-                bytes(audio_bytes)
+                chunk
             )
 
-    pcm = b"".join(
-        chunks
-    )
+        remaining = remaining[split_at:].strip()
 
-    if not pcm:
-        raise RuntimeError(
-            "Piper returned no audio."
+    if remaining:
+        chunks.append(
+            remaining
         )
 
-    source_rate = int(
-        _WORKER_PIPER_VOICE.config.sample_rate
-    )
-
-    if (
-        source_rate
-        != PIPER_OUTPUT_SAMPLE_RATE
-    ):
-
-        pcm, _ = audioop.ratecv(
-            pcm,
-            2,
-            1,
-            source_rate,
-            PIPER_OUTPUT_SAMPLE_RATE,
-            None,
-        )
-
-    return pcm
-
-
-# ============================================================
-# PIPER EXECUTOR
-# ============================================================
-
-def _get_piper_executor() -> ProcessPoolExecutor:
-
-    global _PIPER_EXECUTOR
-
-    if _PIPER_EXECUTOR is None:
-
-        _PIPER_EXECUTOR = ProcessPoolExecutor(
-            max_workers=1,
-            initializer=_piper_worker_init,
-            initargs=(
-                str(PIPER_MODEL_DIR),
-                PIPER_VOICE_MODEL,
-            ),
-        )
-
-        logger.info(
-            "Piper worker process created | model=%s",
-            PIPER_VOICE_MODEL,
-        )
-
-    return _PIPER_EXECUTOR
-
-
-async def _synthesize_piper_process(
-    text: str,
-    speed: float,
-) -> bytes:
-
-    loop = asyncio.get_running_loop()
-
-    executor = _get_piper_executor()
-
-    future = loop.run_in_executor(
-        executor,
-        _piper_worker_synthesize,
-        text,
-        speed,
-    )
-
-    try:
-
-        audio = await asyncio.wait_for(
-            future,
-            timeout=max(
-                60.0,
-                float(
-                    API_TIMEOUT_SECONDS
-                ),
-            ),
-        )
-
-    except asyncio.TimeoutError as error:
-
-        logger.error(
-            "Piper TTS timed out after %.1fs",
-            max(
-                60.0,
-                float(
-                    API_TIMEOUT_SECONDS
-                ),
-            ),
-        )
-
-        raise RuntimeError(
-            "Piper TTS timed out."
-        ) from error
-
-    return audio
+    return chunks
 
 
 # ============================================================
@@ -683,12 +454,17 @@ async def _synthesize_piper_process(
 
 class GeminiEngine:
     """
-    Kept under the old class name so the existing main.py and
-    voice.py do not need to be rewritten.
+    Kept under the old class name so main.py and voice.py
+    do not need to be rewritten.
 
-    STT  -> Groq Whisper Large V3 Turbo
-    Chat -> Groq GPT-OSS 20B
-    TTS  -> Local Piper in a separate worker process
+    STT:
+        Groq Whisper Large V3 Turbo
+
+    Chat:
+        Groq GPT-OSS 20B
+
+    TTS:
+        Groq Orpheus Arabic Saudi
     """
 
     def __init__(
@@ -720,8 +496,11 @@ class GeminiEngine:
             or GROQ_STT_MODEL
         )
 
-        # Actual TTS remains local Piper.
-        self.tts_model = LOCAL_TTS_NAME
+        # Actual TTS is Groq Orpheus.
+        self.tts_model = (
+            tts_model
+            or GROQ_TTS_MODEL
+        )
 
         self.client = Groq(
             api_key=self.api_key
@@ -766,6 +545,23 @@ class GeminiEngine:
         self.current_voice = normalized
 
         return normalized
+
+    def _get_tts_voice(self) -> str:
+
+        mapped = GROQ_TTS_VOICE_MAP.get(
+            self.current_voice
+        )
+
+        if mapped in VALID_GROQ_TTS_VOICES:
+            return mapped
+
+        if (
+            DEFAULT_GROQ_TTS_VOICE
+            in VALID_GROQ_TTS_VOICES
+        ):
+            return DEFAULT_GROQ_TTS_VOICE
+
+        return "fahad"
 
     # ========================================================
     # ERROR / RETRY
@@ -926,27 +722,17 @@ class GeminiEngine:
         audio: bytes,
     ):
 
-        filename = (
-            "discord_audio.wav"
-        )
-
-        kwargs: dict[str, Any] = {
-            "file": (
-                filename,
+        return self.client.audio.transcriptions.create(
+            file=(
+                "discord_audio.wav",
                 audio,
             ),
-            "model": self.transcribe_model,
-            "response_format": "json",
-            "temperature": 0.0,
+            model=self.transcribe_model,
+            response_format="json",
+            temperature=0.0,
 
-            # ==================================================
-            # FORCE ARABIC
-            # ==================================================
-            "language": "ar",
-        }
-
-        return self.client.audio.transcriptions.create(
-            **kwargs
+            # Force Arabic.
+            language="ar",
         )
 
     async def transcribe(
@@ -1183,6 +969,12 @@ class GeminiEngine:
         return self.client.chat.completions.create(
             model=self.chat_model,
             messages=final_messages,
+
+            # GPT-OSS reasoning is disabled for
+            # fast voice responses and to ensure
+            # the final answer is returned in content.
+            include_reasoning=False,
+
             temperature=min(
                 float(
                     os.getenv(
@@ -1192,7 +984,9 @@ class GeminiEngine:
                 ),
                 0.8,
             ),
-            max_tokens=min(
+
+            # Use completion tokens for GPT-OSS.
+            max_completion_tokens=min(
                 int(
                     os.getenv(
                         "GEMINI_MAX_OUTPUT_TOKENS",
@@ -1314,11 +1108,146 @@ class GeminiEngine:
                 answer,
             )
 
+        else:
+
+            logger.warning(
+                "AI returned an empty response | model=%s",
+                self.chat_model,
+            )
+
         return answer
 
     # ========================================================
-    # LOCAL PIPER TTS
+    # GROQ TTS
     # ========================================================
+
+    def _generate_tts_chunk_sync(
+        self,
+        text: str,
+        voice: str,
+        speed: float,
+    ) -> bytes:
+        """
+        Calls Groq Orpheus Arabic Saudi and returns
+        the response as 24kHz mono PCM16.
+        """
+
+        text = _clean_text(
+            text
+        )
+
+        if not text:
+            return b""
+
+        # Orpheus supports text input up to 200 chars.
+        text = text[:MAX_TTS_CHARS]
+
+        response = self.client.audio.speech.create(
+            model=self.tts_model,
+            voice=voice,
+            input=text,
+            response_format="wav",
+        )
+
+        temp_path: str | None = None
+
+        try:
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                delete=False,
+            ) as temp_file:
+
+                temp_path = temp_file.name
+
+            response.write_to_file(
+                temp_path
+            )
+
+            with wave.open(
+                temp_path,
+                "rb",
+            ) as wav_file:
+
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                sample_rate = wav_file.getframerate()
+                frame_count = wav_file.getnframes()
+
+                if frame_count <= 0:
+                    return b""
+
+                pcm = wav_file.readframes(
+                    frame_count
+                )
+
+            # Convert to 16-bit PCM if needed.
+            if sample_width != 2:
+
+                pcm = audioop.lin2lin(
+                    pcm,
+                    sample_width,
+                    2,
+                )
+
+                sample_width = 2
+
+            # Convert stereo/multi-channel to mono.
+            if channels > 1:
+
+                if channels == 2:
+
+                    pcm = audioop.tomono(
+                        pcm,
+                        2,
+                        0.5,
+                        0.5,
+                    )
+
+                else:
+
+                    # For uncommon channel counts,
+                    # keep the first channel.
+                    pcm = audioop.tomono(
+                        pcm,
+                        2,
+                        1.0,
+                        0.0,
+                    )
+
+                channels = 1
+
+            # Resample to the format voice.py expects.
+            if sample_rate != TTS_OUTPUT_SAMPLE_RATE:
+
+                pcm, _ = audioop.ratecv(
+                    pcm,
+                    2,
+                    1,
+                    sample_rate,
+                    TTS_OUTPUT_SAMPLE_RATE,
+                    None,
+                )
+
+            return pcm
+
+        finally:
+
+            if temp_path:
+
+                try:
+                    Path(
+                        temp_path
+                    ).unlink(
+                        missing_ok=True
+                    )
+
+                except Exception:
+
+                    logger.warning(
+                        "Failed to remove temporary TTS file: %s",
+                        temp_path,
+                    )
 
     async def generate_speech(
         self,
@@ -1343,38 +1272,78 @@ class GeminiEngine:
             else self.voice
         )
 
-        selected_speed = (
-            normalize_speech_speed(
-                speed
-            )
+        selected_speed = normalize_speech_speed(
+            speed
         )
 
+        groq_voice = self._get_tts_voice()
+
         logger.info(
-            "Local Piper TTS | model=%s | "
-            "mapped_voice=%s | speed=%.2f | process=separate",
-            PIPER_VOICE_MODEL,
+            "Groq TTS | model=%s | mapped_voice=%s | "
+            "voice=%s | speed=%.2f",
+            self.tts_model,
             selected_voice,
+            groq_voice,
             selected_speed,
         )
+
+        # Speed support varies by Groq TTS model/API version.
+        # We keep the public speed setting for compatibility,
+        # but the Saudi Orpheus model currently does not expose
+        # a speed parameter in the documented endpoint.
+        if selected_speed != 1.0:
+
+            logger.info(
+                "TTS speed=%.2f requested; "
+                "Groq Orpheus Saudi endpoint will use native speed.",
+                selected_speed,
+            )
+
+        chunks = _split_tts_text(
+            text,
+            MAX_TTS_CHARS,
+        )
+
+        if not chunks:
+            return b""
+
+        output_parts: list[bytes] = []
 
         started = (
             asyncio.get_running_loop().time()
         )
 
-        try:
+        for index, chunk in enumerate(
+            chunks,
+            start=1,
+        ):
 
-            audio = await _synthesize_piper_process(
-                text,
-                selected_speed,
+            logger.info(
+                "Groq TTS chunk %d/%d | chars=%d",
+                index,
+                len(chunks),
+                len(chunk),
             )
 
-        except Exception:
-
-            logger.exception(
-                "Piper TTS failed"
+            audio = await self._with_retry(
+                lambda chunk=chunk: self._generate_tts_chunk_sync(
+                    chunk,
+                    groq_voice,
+                    selected_speed,
+                ),
+                operation_name=(
+                    f"Groq TTS chunk {index}/{len(chunks)}"
+                ),
             )
 
-            raise
+            if audio:
+                output_parts.append(
+                    audio
+                )
+
+        final_audio = b"".join(
+            output_parts
+        )
 
         elapsed = (
             asyncio.get_running_loop().time()
@@ -1382,16 +1351,16 @@ class GeminiEngine:
         )
 
         logger.info(
-            "Piper TTS generated | model=%s | "
-            "voice=%s | speed=%.2f | bytes=%s | %.2fs",
-            PIPER_VOICE_MODEL,
-            selected_voice,
-            selected_speed,
-            len(audio),
+            "Groq TTS generated | model=%s | "
+            "voice=%s | chunks=%d | bytes=%d | %.2fs",
+            self.tts_model,
+            groq_voice,
+            len(chunks),
+            len(final_audio),
             elapsed,
         )
 
-        return audio
+        return final_audio
 
     # ========================================================
     # COMPLETE VOICE PIPELINE
@@ -1432,7 +1401,7 @@ class GeminiEngine:
                 "name",
                 None,
             ),
-            "tts_model": LOCAL_TTS_NAME,
+            "tts_model": self.tts_model,
             "error": None,
         }
 
@@ -1511,7 +1480,7 @@ class GeminiEngine:
             )
 
             # ==================================================
-            # LOCAL TTS
+            # TTS
             # ==================================================
 
             selected_voice = (
@@ -1537,7 +1506,7 @@ class GeminiEngine:
             if not speech:
 
                 result["error"] = (
-                    "Piper returned no audio."
+                    "Groq TTS returned no audio."
                 )
 
                 return result
@@ -1557,8 +1526,8 @@ class GeminiEngine:
                 username,
                 self.transcribe_model,
                 self.chat_model,
-                LOCAL_TTS_NAME,
-                selected_voice,
+                self.tts_model,
+                self._get_tts_voice(),
                 normalize_speech_speed(
                     speed
                 ),
@@ -1619,10 +1588,9 @@ class GeminiEngine:
                 self.transcribe_model
             ),
             "stt_language": "ar",
-            "tts_model": LOCAL_TTS_NAME,
-            "tts_local": True,
-            "piper_voice": PIPER_VOICE_MODEL,
-            "piper_worker": True,
+            "tts_model": self.tts_model,
+            "tts_local": False,
+            "tts_voice": self._get_tts_voice(),
         }
 
     # ========================================================
@@ -1633,28 +1601,7 @@ class GeminiEngine:
         self,
     ) -> None:
 
-        global _PIPER_EXECUTOR
-
         self.client = None
-
-        if _PIPER_EXECUTOR is not None:
-
-            try:
-
-                _PIPER_EXECUTOR.shutdown(
-                    wait=False,
-                    cancel_futures=True,
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to shutdown Piper worker"
-                )
-
-            finally:
-
-                _PIPER_EXECUTOR = None
 
 
 # ============================================================
