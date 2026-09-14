@@ -1,7 +1,15 @@
 # config.py
 # ============================================================
 # Cloud Voice AI — Complete Configuration
-# Compatible with main.py + voice.py + gemini.py
+# Groq + Local Piper
+#
+# Compatible with:
+#   main.py
+#   voice.py
+#   gemini.py
+#
+# Google Gemini is NO LONGER required.
+# Legacy GEMINI_* names are kept for compatibility only.
 # ============================================================
 
 from __future__ import annotations
@@ -25,9 +33,13 @@ def get_env(
     *,
     required: bool = False,
 ) -> str:
-    value = os.getenv(name, default)
+    value = os.getenv(
+        name,
+        default,
+    )
 
     if value is None or not value.strip():
+
         if required:
             raise RuntimeError(
                 f"Required environment variable is missing: {name}"
@@ -52,17 +64,26 @@ def get_int(
         value = default
 
     else:
+
         try:
-            value = int(raw.strip())
+            value = int(
+                raw.strip()
+            )
 
         except ValueError:
             value = default
 
     if minimum is not None:
-        value = max(minimum, value)
+        value = max(
+            minimum,
+            value,
+        )
 
     if maximum is not None:
-        value = min(maximum, value)
+        value = min(
+            maximum,
+            value,
+        )
 
     return value
 
@@ -81,17 +102,26 @@ def get_float(
         value = default
 
     else:
+
         try:
-            value = float(raw.strip())
+            value = float(
+                raw.strip()
+            )
 
         except ValueError:
             value = default
 
     if minimum is not None:
-        value = max(minimum, value)
+        value = max(
+            minimum,
+            value,
+        )
 
     if maximum is not None:
-        value = min(maximum, value)
+        value = min(
+            maximum,
+            value,
+        )
 
     return value
 
@@ -120,10 +150,13 @@ def get_bool(
 # ============================================================
 
 PROJECT_NAME: Final[str] = "Cloud Voice AI"
-PROJECT_VERSION: Final[str] = "2.0.0"
+
+PROJECT_VERSION: Final[str] = "3.0.0"
+
 PROJECT_DESCRIPTION: Final[str] = (
-    "AI Voice Assistant for Discord"
+    "AI Voice Assistant for Discord — Groq + Piper"
 )
+
 PROJECT_AUTHOR: Final[str] = "Cloud Voice AI"
 
 
@@ -171,32 +204,47 @@ DISCORD_SHARD_COUNT: Final[int] = get_int(
 
 
 # ============================================================
-# GEMINI
+# GROQ
 # ============================================================
 
-GEMINI_API_KEY: Final[str] = get_env(
-    "GEMINI_API_KEY",
+GROQ_API_KEY: Final[str] = get_env(
+    "GROQ_API_KEY",
     required=True,
 )
 
-CHAT_MODEL: Final[str] = get_env(
-    "CHAT_MODEL",
-    "gemini-3.5-flash-lite",
+GROQ_STT_MODEL: Final[str] = get_env(
+    "GROQ_STT_MODEL",
+    "whisper-large-v3-turbo",
 )
 
-TRANSCRIBE_MODEL: Final[str] = get_env(
-    "TRANSCRIBE_MODEL",
-    "gemini-3.5-transcribe",
+GROQ_CHAT_MODEL: Final[str] = get_env(
+    "GROQ_CHAT_MODEL",
+    "openai/gpt-oss-20b",
 )
 
-TTS_MODEL: Final[str] = get_env(
-    "TTS_MODEL",
-    "gemini-3.1-flash-tts-preview",
-)
 
-# Backwards-compatible aliases
+# ============================================================
+# LEGACY GEMINI COMPATIBILITY
+# ============================================================
+#
+# These names remain available so older parts of the project
+# don't crash if they import them.
+#
+# They are NOT used for API calls anymore.
+# ============================================================
+
+GEMINI_API_KEY: Final[str] = ""
+
+CHAT_MODEL: Final[str] = GROQ_CHAT_MODEL
+
+TRANSCRIBE_MODEL: Final[str] = GROQ_STT_MODEL
+
+TTS_MODEL: Final[str] = "piper/ar_JO-kareem-low"
+
 GEMINI_CHAT_MODEL: Final[str] = CHAT_MODEL
+
 GEMINI_TRANSCRIBE_MODEL: Final[str] = TRANSCRIBE_MODEL
+
 GEMINI_TTS_MODEL: Final[str] = TTS_MODEL
 
 
@@ -261,7 +309,13 @@ MAX_MEMORY_MESSAGES: Final[int] = get_int(
 
 
 # ============================================================
-# GEMINI VOICES
+# VOICES
+# ============================================================
+#
+# These names are kept for the existing Discord commands and
+# character system.
+#
+# Actual speech synthesis is handled locally by Piper.
 # ============================================================
 
 GEMINI_VOICES: Final[tuple[str, ...]] = (
@@ -390,26 +444,22 @@ MAX_SPEECH_SPEED: Final[float] = get_float(
 
 
 # ============================================================
-# CHARACTER DEFAULTS
-# ============================================================
-
-DEFAULT_CHARACTER_VOICE: Final[str] = normalize_voice_name(
-    DEFAULT_GEMINI_VOICE
-) if "normalize_voice_name" in globals() else DEFAULT_GEMINI_VOICE
-
-
-# ============================================================
 # AUDIO
 # ============================================================
 
 DISCORD_SAMPLE_RATE: Final[int] = 48000
+
 DISCORD_CHANNELS: Final[int] = 2
+
 DISCORD_SAMPLE_WIDTH: Final[int] = 2
 
 GEMINI_INPUT_SAMPLE_RATE: Final[int] = 16000
+
 GEMINI_INPUT_CHANNELS: Final[int] = 1
 
+# Piper output format used by voice.py.
 GEMINI_TTS_SAMPLE_RATE: Final[int] = 24000
+
 GEMINI_TTS_CHANNELS: Final[int] = 1
 
 DEFAULT_AUDIO_MIME_TYPE: Final[str] = "audio/wav"
@@ -461,7 +511,7 @@ API_TIMEOUT_SECONDS: Final[float] = get_float(
 
 API_RETRIES: Final[int] = get_int(
     "API_RETRIES",
-    3,
+    2,
     minimum=0,
     maximum=10,
 )
@@ -511,7 +561,7 @@ ALLOW_VOICE_CHANGE: Final[bool] = get_bool(
 
 
 # ============================================================
-# SERVER MODERATION / OWNER AI
+# SERVER MODERATION
 # ============================================================
 
 MODERATION_AI_ENABLED: Final[bool] = get_bool(
@@ -592,7 +642,7 @@ COMMAND_DESCRIPTIONS: Final[dict[str, str]] = {
     "leave": "إخراج البوت من الروم الصوتي.",
     "voice": "عرض الصوت الحالي.",
     "setvoice": "تغيير صوت الذكاء الاصطناعي.",
-    "voices": "عرض جميع أصوات Gemini.",
+    "voices": "عرض جميع الأصوات المتاحة.",
     "voiceinfo": "عرض معلومات صوت معين.",
     "speed": "تغيير سرعة الكلام.",
     "memory": "عرض حالة ذاكرة المحادثة.",
@@ -618,7 +668,7 @@ COMMAND_DESCRIPTIONS: Final[dict[str, str]] = {
 
 
 # ============================================================
-# HELPERS
+# VOICE HELPERS
 # ============================================================
 
 def normalize_voice_name(
@@ -647,6 +697,10 @@ def is_valid_voice(
     return normalized in GEMINI_VOICES
 
 
+# ============================================================
+# SPEECH SPEED
+# ============================================================
+
 def normalize_speech_speed(
     speed: float,
 ) -> float:
@@ -664,45 +718,66 @@ def normalize_speech_speed(
 
 
 # ============================================================
+# DEFAULT CHARACTER VOICE
+# ============================================================
+
+DEFAULT_CHARACTER_VOICE: Final[str] = (
+    DEFAULT_GEMINI_VOICE
+)
+
+
+# ============================================================
 # CONFIG VALIDATION
 # ============================================================
 
 def validate_config() -> None:
+
+    # --------------------------------------------------------
+    # Discord
+    # --------------------------------------------------------
 
     if not DISCORD_TOKEN:
         raise RuntimeError(
             "DISCORD_TOKEN is missing."
         )
 
-    if not GEMINI_API_KEY:
+    # --------------------------------------------------------
+    # Groq
+    # --------------------------------------------------------
+
+    if not GROQ_API_KEY:
         raise RuntimeError(
-            "GEMINI_API_KEY is missing."
+            "GROQ_API_KEY is missing."
         )
 
-    if not CHAT_MODEL:
+    if not GROQ_STT_MODEL:
         raise RuntimeError(
-            "CHAT_MODEL is missing."
+            "GROQ_STT_MODEL is missing."
         )
 
-    if not TRANSCRIBE_MODEL:
+    if not GROQ_CHAT_MODEL:
         raise RuntimeError(
-            "TRANSCRIBE_MODEL is missing."
+            "GROQ_CHAT_MODEL is missing."
         )
 
-    if not TTS_MODEL:
-        raise RuntimeError(
-            "TTS_MODEL is missing."
-        )
+    # --------------------------------------------------------
+    # Voice
+    # --------------------------------------------------------
 
     if not is_valid_voice(
         DEFAULT_GEMINI_VOICE
     ):
         raise RuntimeError(
-            f"Invalid DEFAULT_VOICE: "
+            "Invalid DEFAULT_VOICE: "
             f"{DEFAULT_GEMINI_VOICE}"
         )
 
+    # --------------------------------------------------------
+    # Speed
+    # --------------------------------------------------------
+
     if MIN_SPEECH_SPEED > MAX_SPEECH_SPEED:
+
         raise RuntimeError(
             "MIN_SPEECH_SPEED cannot be greater "
             "than MAX_SPEECH_SPEED."
@@ -713,9 +788,29 @@ def validate_config() -> None:
         <= DEFAULT_SPEECH_SPEED
         <= MAX_SPEECH_SPEED
     ):
+
         raise RuntimeError(
             "DEFAULT_SPEECH_SPEED must be between "
             "MIN_SPEECH_SPEED and MAX_SPEECH_SPEED."
+        )
+
+    # --------------------------------------------------------
+    # Audio
+    # --------------------------------------------------------
+
+    if DISCORD_SAMPLE_RATE <= 0:
+        raise RuntimeError(
+            "DISCORD_SAMPLE_RATE must be positive."
+        )
+
+    if GEMINI_INPUT_SAMPLE_RATE <= 0:
+        raise RuntimeError(
+            "GEMINI_INPUT_SAMPLE_RATE must be positive."
+        )
+
+    if GEMINI_TTS_SAMPLE_RATE <= 0:
+        raise RuntimeError(
+            "GEMINI_TTS_SAMPLE_RATE must be positive."
         )
 
 
@@ -728,23 +823,58 @@ def get_safe_config() -> dict[str, object]:
     return {
         "project": PROJECT_NAME,
         "version": PROJECT_VERSION,
+
         "discord_prefix": DISCORD_PREFIX,
-        "guild_id_configured": bool(DISCORD_GUILD_ID),
-        "chat_model": CHAT_MODEL,
-        "transcribe_model": TRANSCRIBE_MODEL,
+        "guild_id_configured": bool(
+            DISCORD_GUILD_ID
+        ),
+
+        # New providers
+        "chat_model": GROQ_CHAT_MODEL,
+        "transcribe_model": GROQ_STT_MODEL,
         "tts_model": TTS_MODEL,
+
+        # Voices
         "default_voice": DEFAULT_GEMINI_VOICE,
-        "voice_count": len(GEMINI_VOICES),
+        "voice_count": len(
+            GEMINI_VOICES
+        ),
+
+        # Memory
         "memory_enabled": MEMORY_ENABLED,
-        "max_memory_messages": MAX_MEMORY_MESSAGES,
-        "characters_enabled": CHARACTERS_ENABLED,
-        "max_characters_per_guild": MAX_CHARACTERS_PER_GUILD,
-        "default_speech_speed": DEFAULT_SPEECH_SPEED,
-        "min_speech_speed": MIN_SPEECH_SPEED,
-        "max_speech_speed": MAX_SPEECH_SPEED,
-        "moderation_enabled": MODERATION_AI_ENABLED,
-        "moderation_owner_only": MODERATION_OWNER_ONLY,
-        "moderation_confirmation": MODERATION_CONFIRM_DANGEROUS_ACTIONS,
+        "max_memory_messages": (
+            MAX_MEMORY_MESSAGES
+        ),
+
+        # Characters
+        "characters_enabled": (
+            CHARACTERS_ENABLED
+        ),
+        "max_characters_per_guild": (
+            MAX_CHARACTERS_PER_GUILD
+        ),
+
+        # Speech
+        "default_speech_speed": (
+            DEFAULT_SPEECH_SPEED
+        ),
+        "min_speech_speed": (
+            MIN_SPEECH_SPEED
+        ),
+        "max_speech_speed": (
+            MAX_SPEECH_SPEED
+        ),
+
+        # Moderation
+        "moderation_enabled": (
+            MODERATION_AI_ENABLED
+        ),
+        "moderation_owner_only": (
+            MODERATION_OWNER_ONLY
+        ),
+        "moderation_confirmation": (
+            MODERATION_CONFIRM_DANGEROUS_ACTIONS
+        ),
     }
 
 
@@ -768,7 +898,12 @@ __all__ = [
     "DISCORD_ACTIVITY_TYPE",
     "DISCORD_SHARD_COUNT",
 
-    # Gemini
+    # Groq
+    "GROQ_API_KEY",
+    "GROQ_STT_MODEL",
+    "GROQ_CHAT_MODEL",
+
+    # Legacy compatibility
     "GEMINI_API_KEY",
     "CHAT_MODEL",
     "TRANSCRIBE_MODEL",
@@ -816,7 +951,7 @@ __all__ = [
     "GEMINI_TTS_CHANNELS",
     "DEFAULT_AUDIO_MIME_TYPE",
 
-    # Voice recording
+    # Recording
     "MAX_RECORDING_SECONDS",
     "SILENCE_TIMEOUT_SECONDS",
     "MIN_AUDIO_SECONDS",
@@ -827,7 +962,7 @@ __all__ = [
     "API_RETRIES",
     "API_RETRY_DELAY_SECONDS",
 
-    # Voice sessions
+    # Voice session
     "AUTO_LEAVE_EMPTY_CHANNEL",
     "AUTO_LEAVE_DELAY_SECONDS",
     "MAX_CONCURRENT_AI_REQUESTS",
