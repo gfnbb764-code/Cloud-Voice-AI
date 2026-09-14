@@ -5,7 +5,7 @@
 # Pipeline:
 # Discord PCM
 #     ↓
-# Gemini 3.5 Transcribe
+# Groq Whisper Large V3
 #     ↓
 # Strong Arabic STT Filter
 #     ↓
@@ -16,6 +16,10 @@
 # PCM 24kHz Mono
 #     ↓
 # Discord
+#
+# Gemini removed completely.
+# Claude removed completely.
+# Piper removed completely.
 # ============================================================
 
 from __future__ import annotations
@@ -31,7 +35,6 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
-from google import genai
 from groq import Groq
 
 from config import (
@@ -54,11 +57,6 @@ logger = logging.getLogger(__name__)
 # ENVIRONMENT
 # ============================================================
 
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    "",
-).strip()
-
 GROQ_API_KEY = os.getenv(
     "GROQ_API_KEY",
     "",
@@ -69,10 +67,10 @@ GROQ_API_KEY = os.getenv(
 # MODELS
 # ============================================================
 
-GEMINI_STT_MODEL = os.getenv(
-    "GEMINI_STT_MODEL",
-    "gemini-3.5-transcribe",
-).strip() or "gemini-3.5-transcribe"
+GROQ_STT_MODEL = os.getenv(
+    "GROQ_STT_MODEL",
+    "whisper-large-v3",
+).strip() or "whisper-large-v3"
 
 GROQ_CHAT_MODEL = os.getenv(
     "GROQ_CHAT_MODEL",
@@ -143,7 +141,7 @@ DEFAULT_SPEECH_SPEED = 1.0
 
 
 # ============================================================
-# ARABIC STT FILTER
+# STRONG ARABIC STT FILTER
 # ============================================================
 
 _ARABIC_RE = re.compile(
@@ -581,6 +579,18 @@ def _split_tts_text(
 # ============================================================
 
 class GeminiEngine:
+    """
+    Compatibility name retained for main.py / voice.py.
+
+    STT:
+        Groq Whisper Large V3
+
+    Chat:
+        Groq GPT-OSS 120B
+
+    TTS:
+        Groq Orpheus Arabic Saudi
+    """
 
     def __init__(
         self,
@@ -591,17 +601,10 @@ class GeminiEngine:
         tts_model: str | None = None,
     ) -> None:
 
-        self.gemini_api_key = (
-            api_key
-            or GEMINI_API_KEY
+        # api_key is retained for compatibility.
+        self.groq_api_key = (
+            api_key or GROQ_API_KEY
         ).strip()
-
-        self.groq_api_key = GROQ_API_KEY.strip()
-
-        if not self.gemini_api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY is missing."
-            )
 
         if not self.groq_api_key:
             raise RuntimeError(
@@ -610,7 +613,7 @@ class GeminiEngine:
 
         self.transcribe_model = (
             transcribe_model
-            or GEMINI_STT_MODEL
+            or GROQ_STT_MODEL
         )
 
         self.chat_model = (
@@ -621,10 +624,6 @@ class GeminiEngine:
         self.tts_model = (
             tts_model
             or GROQ_TTS_MODEL
-        )
-
-        self.gemini = genai.Client(
-            api_key=self.gemini_api_key
         )
 
         self.groq = Groq(
@@ -828,6 +827,7 @@ class GeminiEngine:
         # Discord PCM = 48kHz / stereo / signed 16-bit.
         pcm = audio
 
+        # Stereo -> mono.
         pcm = audioop.tomono(
             pcm,
             2,
@@ -835,6 +835,7 @@ class GeminiEngine:
             0.5,
         )
 
+        # 48kHz -> 16kHz.
         pcm, _ = audioop.ratecv(
             pcm,
             2,
@@ -880,90 +881,48 @@ class GeminiEngine:
             raise
 
     # ========================================================
-    # GEMINI STT
+    # GROQ STT
     # ========================================================
 
     def _transcribe_sync(
         self,
         audio: bytes,
-    ) -> str:
+    ):
 
-        wav_path = self._discord_pcm_to_wav(audio)
+        wav_path = self._discord_pcm_to_wav(
+            audio
+        )
 
         try:
 
-            uploaded = self.gemini.files.upload(
-                file=wav_path,
-            )
-
-            interaction = self.gemini.interactions.create(
+            return self.groq.audio.transcriptions.create(
+                file=(
+                    "discord_audio.wav",
+                    open(wav_path, "rb"),
+                ),
                 model=self.transcribe_model,
-                input=[
-                    {
-                        "type": "audio",
-                        "uri": uploaded.uri,
-                        "mime_type": (
-                            getattr(
-                                uploaded,
-                                "mime_type",
-                                None,
-                            )
-                            or "audio/wav"
-                        ),
-                    }
+                language="ar",
+                temperature=0.0,
+                prompt=(
+                    "تفريغ كلام عربي باللهجة السعودية "
+                    "والعربية العامية. "
+                    "اكتب الكلام كما نُطق بالعربية. "
+                    "لا تترجم الكلام. "
+                    "لا تكتب العربية بأحرف لاتينية. "
+                    "لا تخمن كلامًا غير مسموع. "
+                    "إذا كان الصوت غير واضح فلا تضف كلامًا من عندك. "
+                    "أسماء وكلمات مهمة: "
+                    "ديسكورد، دردشة، مكالمة، بوت، "
+                    "ذكاء اصطناعي، جيميناي، جروك، "
+                    "فويس، السعودية، الأحساء، الهفوف، "
+                    "كم عمرك، وش عمرك، من أنت، وش اسمك، "
+                    "كيف حالك، وش تسوي، وش الأخبار."
+                ),
+                response_format="verbose_json",
+                timestamp_granularities=[
+                    "segment",
                 ],
-                generation_config={
-                    "transcription_config": {
-                        "language_codes": [
-                            "ar-SA",
-                        ],
-                        "mode": "smart",
-                        "custom_vocabulary": [
-                            "Cloud Voice AI",
-                            "ديسكورد",
-                            "دردشة",
-                            "مكالمة",
-                            "مكالمة صوتية",
-                            "بوت",
-                            "ذكاء اصطناعي",
-                            "جيميناي",
-                            "جروك",
-                            "جميني",
-                            "كلاود",
-                            "فويس",
-                            "السعودية",
-                            "الأحساء",
-                            "الهفوف",
-                            "كم عمرك",
-                            "وش عمرك",
-                            "من أنت",
-                            "وش اسمك",
-                            "كيف حالك",
-                            "وش تسوي",
-                            "وش الأخبار",
-                        ],
-                    }
-                },
             )
-
-            text = _normalize_transcript(
-                getattr(
-                    interaction,
-                    "output_text",
-                    "",
-                )
-            )
-
-            text = _filter_transcript(text)
-
-            logger.info(
-                "Gemini STT | model=%s | "
-                "language=ar-SA | transcript=%s",
-                self.transcribe_model,
-                text or "<rejected>",
-            )
-
-            return text
 
         finally:
 
@@ -986,10 +945,110 @@ class GeminiEngine:
 
         _ = mime_type
 
-        return await self._with_retry(
+        response = await self._with_retry(
             lambda: self._transcribe_sync(audio),
-            operation_name="Gemini STT",
+            operation_name="Groq STT",
         )
+
+        raw_text = _normalize_transcript(
+            getattr(
+                response,
+                "text",
+                "",
+            )
+        )
+
+        if not raw_text:
+            logger.warning(
+                "Groq STT returned no transcript."
+            )
+            return ""
+
+        # Use segment confidence information when available.
+        segments = getattr(
+            response,
+            "segments",
+            None,
+        ) or []
+
+        valid_segments: list[str] = []
+
+        for segment in segments:
+
+            segment_text = _normalize_transcript(
+                getattr(
+                    segment,
+                    "text",
+                    "",
+                )
+            )
+
+            if not segment_text:
+                continue
+
+            no_speech_prob = float(
+                getattr(
+                    segment,
+                    "no_speech_prob",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            avg_logprob = float(
+                getattr(
+                    segment,
+                    "avg_logprob",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            if no_speech_prob >= 0.75:
+                logger.warning(
+                    "Rejected STT segment | "
+                    "no_speech_prob=%.2f | text=%r",
+                    no_speech_prob,
+                    segment_text,
+                )
+                continue
+
+            if avg_logprob < -1.8:
+                logger.warning(
+                    "Rejected weak STT segment | "
+                    "avg_logprob=%.2f | text=%r",
+                    avg_logprob,
+                    segment_text,
+                )
+                continue
+
+            valid_segments.append(
+                segment_text
+            )
+
+        candidate_text = (
+            " ".join(valid_segments)
+            if valid_segments
+            else raw_text
+        )
+
+        filtered_text = _filter_transcript(
+            candidate_text
+        )
+
+        filtered_text = _limit_text(
+            filtered_text,
+            MAX_TRANSCRIPT_LENGTH,
+        )
+
+        logger.info(
+            "Groq STT | model=%s | language=ar | "
+            "filtered=true | transcript=%s",
+            self.transcribe_model,
+            filtered_text or "<rejected>",
+        )
+
+        return filtered_text
 
     # ========================================================
     # MEMORY
@@ -1383,6 +1442,7 @@ class GeminiEngine:
         finally:
 
             if temp_path:
+
                 try:
                     Path(temp_path).unlink(
                         missing_ok=True
@@ -1529,7 +1589,7 @@ class GeminiEngine:
         try:
 
             # ------------------------------
-            # Gemini STT
+            # Groq STT
             # ------------------------------
 
             transcript = await self.transcribe(
@@ -1664,9 +1724,9 @@ class GeminiEngine:
             "quota_exhausted": self.quota_exhausted,
             "chat_provider": "Groq",
             "chat_model": self.chat_model,
-            "transcribe_provider": "Google Gemini",
+            "transcribe_provider": "Groq",
             "transcribe_model": self.transcribe_model,
-            "stt_language": "ar-SA",
+            "stt_language": "ar",
             "stt_filter": "strong",
             "tts_provider": "Groq",
             "tts_model": self.tts_model,
@@ -1679,7 +1739,6 @@ class GeminiEngine:
     # ========================================================
 
     async def close(self) -> None:
-        self.gemini = None
         self.groq = None
 
 
