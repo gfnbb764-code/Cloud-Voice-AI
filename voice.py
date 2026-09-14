@@ -108,17 +108,16 @@ AI_SEMAPHORE_LIMIT = max(
 # AUDIO QUALITY SETTINGS
 # ============================================================
 
-# Do NOT use this as a hard rejection threshold.
-# It is only used for diagnostics.
+# Diagnostic only. Never reject audio based on RMS.
 QUIET_RMS = 120.0
 
-# Maximum amount of gain we are willing to apply.
+# Maximum amplification allowed.
 MAX_GAIN = 5.0
 
-# Minimum useful RMS after amplification.
+# Target RMS after optional normalization.
 TARGET_RMS = 5000.0
 
-# Small amount of headroom to prevent clipping.
+# Headroom to reduce clipping.
 CLIP_LIMIT = 30000
 
 
@@ -152,12 +151,12 @@ def _write_int16(
     )
 
 
-def pcm_rms(pcm: bytes) -> float:
+def pcm_rms(
+    pcm: bytes,
+) -> float:
     """
     Calculate RMS level of signed 16-bit PCM.
-
-    This is diagnostic only.
-    We intentionally do not reject quiet audio.
+    Diagnostic only.
     """
 
     if not pcm:
@@ -198,7 +197,9 @@ def pcm_rms(pcm: bytes) -> float:
     )
 
 
-def pcm_peak(pcm: bytes) -> int:
+def pcm_peak(
+    pcm: bytes,
+) -> int:
     """
     Calculate absolute PCM peak.
     """
@@ -234,26 +235,27 @@ def normalize_pcm_volume(
     pcm: bytes,
 ) -> bytes:
     """
-    Raise quiet PCM without aggressively
-    destroying already-loud audio.
-
-    This is intentionally conservative.
+    Raise quiet PCM conservatively without
+    aggressively modifying already-loud audio.
     """
 
     if not pcm:
         return b""
 
-    rms = pcm_rms(pcm)
+    rms = pcm_rms(
+        pcm
+    )
 
     if rms <= 0:
         return pcm
 
-    peak = pcm_peak(pcm)
+    peak = pcm_peak(
+        pcm
+    )
 
     if peak <= 0:
         return pcm
 
-    # If already reasonably loud, leave it alone.
     if rms >= TARGET_RMS:
         return pcm
 
@@ -266,7 +268,6 @@ def normalize_pcm_volume(
         max(1.0, desired_gain),
     )
 
-    # Never allow predicted peak to clip badly.
     if peak * gain > CLIP_LIMIT:
         gain = (
             CLIP_LIMIT / peak
@@ -330,8 +331,8 @@ def pcm_stereo_48k_to_mono_16k(
         mono
         signed 16-bit
 
-    We average the channels and downsample
-    by taking every third frame.
+    Uses averaging over each group of 3 frames
+    instead of simply discarding 2 out of 3 frames.
     """
 
     if not pcm:
@@ -355,48 +356,67 @@ def pcm_stereo_48k_to_mono_16k(
     pcm = pcm[:usable_length]
 
     frame_count = (
-        usable_length
+        len(pcm)
         // frame_width
     )
 
     output = bytearray()
 
-    for frame_index in range(
-        0,
-        frame_count,
-        3,
+    # 48000 -> 16000 = exactly 3:1
+    output_frame_count = frame_count // 3
+
+    for output_index in range(
+        output_frame_count
     ):
-        offset = (
-            frame_index
-            * frame_width
+        base_frame = (
+            output_index * 3
         )
 
-        if DISCORD_CHANNEL_COUNT >= 2:
+        total = 0
 
-            left = _read_int16(
-                pcm,
-                offset,
+        for offset_frame in range(3):
+            frame_index = (
+                base_frame
+                + offset_frame
             )
 
-            right = _read_int16(
-                pcm,
-                offset + 2,
+            offset = (
+                frame_index
+                * frame_width
             )
 
-            mono = (
-                left + right
-            ) // 2
+            if DISCORD_CHANNEL_COUNT >= 2:
 
-        else:
+                left = _read_int16(
+                    pcm,
+                    offset,
+                )
 
-            mono = _read_int16(
-                pcm,
-                offset,
-            )
+                right = _read_int16(
+                    pcm,
+                    offset + 2,
+                )
+
+                mono = (
+                    left + right
+                ) // 2
+
+            else:
+
+                mono = _read_int16(
+                    pcm,
+                    offset,
+                )
+
+            total += mono
+
+        averaged = (
+            total // 3
+        )
 
         output.extend(
             _write_int16(
-                mono
+                averaged
             )
         )
 
@@ -562,7 +582,9 @@ class UserAudioState:
             time.monotonic()
         )
 
-    def elapsed(self) -> float:
+    def elapsed(
+        self,
+    ) -> float:
 
         if self.started_at <= 0:
             return 0.0
@@ -572,7 +594,9 @@ class UserAudioState:
             - self.started_at
         )
 
-    def silence_elapsed(self) -> float:
+    def silence_elapsed(
+        self,
+    ) -> float:
 
         if self.last_packet_at <= 0:
             return 0.0
@@ -582,7 +606,9 @@ class UserAudioState:
             - self.last_packet_at
         )
 
-    def take_buffer(self) -> bytes:
+    def take_buffer(
+        self,
+    ) -> bytes:
 
         data = bytes(
             self.buffer
@@ -595,7 +621,9 @@ class UserAudioState:
 
         return data
 
-    def clear(self) -> None:
+    def clear(
+        self,
+    ) -> None:
 
         self.buffer.clear()
 
@@ -639,7 +667,9 @@ class VoiceAISink(
     # VOICE RECV
     # ========================================================
 
-    def wants_opus(self) -> bool:
+    def wants_opus(
+        self,
+    ) -> bool:
         """
         Ask discord-ext-voice-recv for decoded PCM.
         """
@@ -813,21 +843,16 @@ class VoiceAISink(
                 pcm
             )
 
-            elapsed = state.elapsed()
+            elapsed = (
+                state.elapsed()
+            )
 
             silence = (
                 state.silence_elapsed()
             )
 
-            # IMPORTANT:
-            #
-            # We do NOT inspect RMS here.
-            #
-            # Quiet / muffled / distorted speech
-            # must still be sent to Gemini.
-            #
-            # Only time-based buffering is used.
-
+            # Only time-based buffering.
+            # Do not reject quiet or distorted speech.
             should_process = (
                 elapsed >= MAX_BUFFER_SECONDS
                 or silence >= SILENCE_TIMEOUT
@@ -890,7 +915,6 @@ class VoiceAISink(
         if duration < MIN_AUDIO_LENGTH:
             return
 
-        # Diagnostics only.
         raw_rms = pcm_rms(
             pcm
         )
@@ -915,7 +939,7 @@ class VoiceAISink(
         try:
 
             # ------------------------------------------------
-            # 1. Convert Discord stereo 48k -> mono 16k
+            # 1. Discord 48k stereo -> Gemini 16k mono
             # ------------------------------------------------
 
             gemini_pcm = (
@@ -928,7 +952,7 @@ class VoiceAISink(
                 return
 
             # ------------------------------------------------
-            # 2. Boost quiet audio
+            # 2. Normalize quiet audio
             # ------------------------------------------------
 
             before_rms = pcm_rms(
@@ -956,7 +980,29 @@ class VoiceAISink(
                 )
 
             # ------------------------------------------------
-            # 3. WAV for Gemini STT
+            # 3. Gemini audio diagnostics
+            # ------------------------------------------------
+
+            logger.info(
+                "Gemini audio for %s | "
+                "duration=%.2fs | "
+                "bytes=%d | "
+                "rms=%.1f | "
+                "peak=%d",
+                username,
+                pcm_duration_seconds(
+                    boosted_pcm,
+                    INPUT_RATE,
+                    INPUT_CHANNELS,
+                    INPUT_WIDTH,
+                ),
+                len(boosted_pcm),
+                pcm_rms(boosted_pcm),
+                pcm_peak(boosted_pcm),
+            )
+
+            # ------------------------------------------------
+            # 4. WAV for Gemini STT
             # ------------------------------------------------
 
             wav_audio = pcm_to_wav(
@@ -966,8 +1012,14 @@ class VoiceAISink(
                 INPUT_WIDTH,
             )
 
+            logger.info(
+                "Gemini WAV ready for %s | bytes=%d",
+                username,
+                len(wav_audio),
+            )
+
             # ------------------------------------------------
-            # 4. Send EVERYTHING useful to Gemini
+            # 5. Send audio to Gemini
             # ------------------------------------------------
 
             await self.session.process_voice(
@@ -994,7 +1046,9 @@ class VoiceAISink(
     # WATCHDOG
     # ========================================================
 
-    def start_watchdog(self) -> None:
+    def start_watchdog(
+        self,
+    ) -> None:
 
         if self._watchdog_task is not None:
             return
@@ -1005,7 +1059,9 @@ class VoiceAISink(
             )
         )
 
-    async def _watchdog(self) -> None:
+    async def _watchdog(
+        self,
+    ) -> None:
 
         try:
 
@@ -1046,7 +1102,9 @@ class VoiceAISink(
                 if not state.buffer:
                     continue
 
-                elapsed = state.elapsed()
+                elapsed = (
+                    state.elapsed()
+                )
 
                 silence = (
                     state.silence_elapsed()
@@ -1099,7 +1157,9 @@ class VoiceAISink(
     # CLEANUP
     # ========================================================
 
-    def cleanup(self) -> None:
+    def cleanup(
+        self,
+    ) -> None:
 
         self._closed = True
 
@@ -1157,8 +1217,6 @@ class VoiceSession:
             VoiceAISink
         ] = None
 
-        # GeminiEngine DOES NOT accept
-        # voice= in its constructor.
         self.engine = GeminiEngine()
 
         self.engine.set_voice(
@@ -1181,6 +1239,7 @@ class VoiceSession:
         self.failed_requests = 0
 
         self.created_at = time.time()
+
         self.last_activity_at = (
             time.time()
         )
@@ -1190,7 +1249,9 @@ class VoiceSession:
     # ========================================================
 
     @property
-    def memory_count(self) -> int:
+    def memory_count(
+        self,
+    ) -> int:
 
         if not MEMORY_ENABLED:
             return 0
@@ -1212,7 +1273,9 @@ class VoiceSession:
     # CONNECT
     # ========================================================
 
-    async def connect(self) -> None:
+    async def connect(
+        self,
+    ) -> None:
 
         if self._closed:
 
@@ -1292,9 +1355,6 @@ class VoiceSession:
 
             try:
 
-                # IMPORTANT:
-                # GeminiEngine.process_voice is async.
-                # Do NOT use asyncio.to_thread().
                 result = await self.engine.process_voice(
                     audio=audio,
                     username=username,
@@ -1348,17 +1408,6 @@ class VoiceSession:
                         username,
                         error,
                     )
-
-                # Gemini may legitimately decide
-                # that a completely silent packet
-                # contains no speech.
-                #
-                # We do NOT fabricate a transcript
-                # or invent a response here.
-                #
-                # For quiet/distorted speech, however,
-                # the boosted WAV has already been sent
-                # to Gemini.
 
                 if not audio_bytes:
 
@@ -1530,7 +1579,9 @@ class VoiceSession:
     # MEMORY
     # ========================================================
 
-    def clear_memory(self) -> None:
+    def clear_memory(
+        self,
+    ) -> None:
 
         try:
 
@@ -1542,7 +1593,9 @@ class VoiceSession:
                 "Failed to clear Gemini memory."
             )
 
-    def reset(self) -> None:
+    def reset(
+        self,
+    ) -> None:
 
         self.clear_memory()
 
@@ -1562,7 +1615,9 @@ class VoiceSession:
     # DISCONNECT
     # ========================================================
 
-    async def disconnect(self) -> None:
+    async def disconnect(
+        self,
+    ) -> None:
 
         if self._closed:
             return
@@ -1611,9 +1666,6 @@ class VoiceSession:
 
             self.voice_client = None
 
-        # GeminiEngine in the current gemini.py
-        # may not expose close(), so only call it
-        # if available.
         close_method = getattr(
             self.engine,
             "close",
@@ -1650,7 +1702,9 @@ class VoiceSession:
 
 class VoiceSessionManager:
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+    ) -> None:
 
         self.sessions: dict[
             int,
@@ -1660,7 +1714,10 @@ class VoiceSessionManager:
         self._lock = asyncio.Lock()
 
     @property
-    def count(self) -> int:
+    def count(
+        self,
+    ) -> int:
+
         return len(
             self.sessions
         )
