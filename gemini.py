@@ -114,10 +114,117 @@ def _extract_response_text(
     response: Any,
 ) -> str:
     """
-    Safely extracts text from a Gemini GenerateContent response.
+    Extract text from Gemini responses.
+
+    Supports both:
+
+        part.text
+
+    and Gemini transcription responses:
+
+        part.audio_transcription.text
+
+    This is especially important for Gemini Transcribe models,
+    where the transcription may be returned as an
+    AudioTranscription object rather than a normal text part.
     """
 
-    # Normal SDK shortcut.
+    collected: list[str] = []
+
+    try:
+        candidates = getattr(
+            response,
+            "candidates",
+            None,
+        )
+
+        for candidate in candidates or []:
+            content = getattr(
+                candidate,
+                "content",
+                None,
+            )
+
+            if content is None:
+                continue
+
+            parts = getattr(
+                content,
+                "parts",
+                None,
+            )
+
+            for part in parts or []:
+
+                # ------------------------------------------------
+                # Normal text part
+                # ------------------------------------------------
+
+                text = getattr(
+                    part,
+                    "text",
+                    None,
+                )
+
+                if text:
+                    text = _clean_text(text)
+
+                    if text:
+                        collected.append(text)
+
+                # ------------------------------------------------
+                # Gemini audio transcription part
+                # ------------------------------------------------
+
+                audio_transcription = getattr(
+                    part,
+                    "audio_transcription",
+                    None,
+                )
+
+                if audio_transcription is not None:
+                    transcription_text = getattr(
+                        audio_transcription,
+                        "text",
+                        None,
+                    )
+
+                    if transcription_text:
+                        transcription_text = _clean_text(
+                            transcription_text
+                        )
+
+                        if transcription_text:
+                            collected.append(
+                                transcription_text
+                            )
+
+    except Exception:
+        logger.exception(
+            "Failed to extract Gemini response text."
+        )
+
+    # ------------------------------------------------------------
+    # Remove duplicates while preserving order.
+    # ------------------------------------------------------------
+
+    if collected:
+        unique: list[str] = []
+
+        for item in collected:
+            if item not in unique:
+                unique.append(item)
+
+        return "\n".join(unique).strip()
+
+    # ------------------------------------------------------------
+    # Final fallback.
+    #
+    # We intentionally use response.text only AFTER inspecting
+    # structured parts, because Gemini Transcribe can return
+    # audio_transcription instead of normal text.
+    # ------------------------------------------------------------
+
     try:
         text = getattr(
             response,
@@ -127,57 +234,6 @@ def _extract_response_text(
 
         if text:
             return _clean_text(text)
-    except Exception:
-        pass
-
-    # Fallback through candidates/parts.
-    try:
-        candidates = getattr(
-            response,
-            "candidates",
-            None,
-        )
-
-        if candidates:
-            collected: list[str] = []
-
-            for candidate in candidates:
-                content = getattr(
-                    candidate,
-                    "content",
-                    None,
-                )
-
-                if content is None:
-                    continue
-
-                parts = getattr(
-                    content,
-                    "parts",
-                    None,
-                )
-
-                if not parts:
-                    continue
-
-                for part in parts:
-                    text = getattr(
-                        part,
-                        "text",
-                        None,
-                    )
-
-                    if text:
-                        collected.append(
-                            _clean_text(text)
-                        )
-
-            if collected:
-                return "\n".join(
-                    item
-                    for item in collected
-                    if item
-                ).strip()
 
     except Exception:
         pass
@@ -250,8 +306,6 @@ def _extract_audio_bytes(
                     return data.tobytes()
 
                 if isinstance(data, str):
-                    # Most SDK responses already expose decoded bytes,
-                    # but this fallback handles base64 strings.
                     try:
                         return base64.b64decode(
                             data,
@@ -448,7 +502,6 @@ class GeminiEngine:
         self.total_transcriptions = 0
         self.total_responses = 0
         self.total_speeches = 0
-
         self.total_errors = 0
 
         logger.info(
@@ -464,7 +517,9 @@ class GeminiEngine:
     # ========================================================
 
     @property
-    def voice(self) -> str:
+    def voice(
+        self,
+    ) -> str:
         return self.current_voice
 
     def set_voice(
@@ -573,9 +628,7 @@ class GeminiEngine:
         mime_type: str = DEFAULT_AUDIO_MIME_TYPE,
     ) -> str:
         """
-        Converts Discord PCM/WAV audio into text.
-
-        `voice.py` is expected to provide WAV data.
+        Converts WAV audio into text using Gemini Transcribe.
         """
 
         if not audio:
@@ -618,6 +671,15 @@ class GeminiEngine:
 
         if text:
             self.total_transcriptions += 1
+
+            logger.info(
+                "STT successful | transcript=%s",
+                text,
+            )
+        else:
+            logger.warning(
+                "STT returned no transcript."
+            )
 
         return text
 
@@ -682,10 +744,14 @@ class GeminiEngine:
             content,
         )
 
-    def clear_memory(self) -> None:
+    def clear_memory(
+        self,
+    ) -> None:
         self._memory.clear()
 
-    def reset_memory(self) -> None:
+    def reset_memory(
+        self,
+    ) -> None:
         self.clear_memory()
 
     def get_memory(
@@ -704,7 +770,9 @@ class GeminiEngine:
 
         return self.get_memory()
 
-    def memory_size(self) -> int:
+    def memory_size(
+        self,
+    ) -> int:
         return len(self._memory)
 
     # ========================================================
@@ -721,8 +789,6 @@ class GeminiEngine:
 
         contents: list[Any] = []
 
-        # System instructions are handled separately through config.
-        # Conversation history is represented as user/model turns.
         source_memory = (
             list(memory)
             if memory is not None
@@ -745,7 +811,6 @@ class GeminiEngine:
             if not content:
                 continue
 
-            # Gemini uses "user" and "model".
             sdk_role = (
                 "model"
                 if role == "assistant"
@@ -857,6 +922,11 @@ class GeminiEngine:
 
         self.total_responses += 1
 
+        logger.info(
+            "AI response generated | response=%s",
+            answer,
+        )
+
         return answer
 
     # ========================================================
@@ -920,7 +990,7 @@ class GeminiEngine:
 
         self.total_speeches += 1
 
-        logger.debug(
+        logger.info(
             "TTS generated | voice=%s | bytes=%s",
             selected_voice,
             len(audio),
@@ -952,8 +1022,12 @@ class GeminiEngine:
                 ↓
             Gemini TTS
                 ↓
-            PCM audio bytes
+            Audio bytes
         """
+
+        selected_voice = normalize_voice_name(
+            voice or self.current_voice
+        )
 
         if not audio:
             return {
@@ -961,14 +1035,17 @@ class GeminiEngine:
                 "transcript": "",
                 "response": "",
                 "audio": b"",
-                "voice": normalize_voice_name(
-                    voice or self.current_voice
-                ),
+                "voice": selected_voice,
                 "error": "No audio received.",
             }
 
         async with self._lock:
             try:
+
+                # ------------------------------------------------
+                # STT
+                # ------------------------------------------------
+
                 transcript = await self.transcribe(
                     audio,
                     mime_type=mime_type,
@@ -980,11 +1057,19 @@ class GeminiEngine:
                         "transcript": "",
                         "response": "",
                         "audio": b"",
-                        "voice": normalize_voice_name(
-                            voice or self.current_voice
-                        ),
+                        "voice": selected_voice,
                         "error": "No speech detected.",
                     }
+
+                logger.info(
+                    "STT | user=%s | text=%s",
+                    username,
+                    transcript,
+                )
+
+                # ------------------------------------------------
+                # AI
+                # ------------------------------------------------
 
                 response_text = await self.generate_response(
                     transcript,
@@ -998,15 +1083,41 @@ class GeminiEngine:
                         "transcript": transcript,
                         "response": "",
                         "audio": b"",
-                        "voice": normalize_voice_name(
-                            voice or self.current_voice
-                        ),
+                        "voice": selected_voice,
                         "error": "Empty AI response.",
                     }
+
+                logger.info(
+                    "AI | user=%s | response=%s",
+                    username,
+                    response_text,
+                )
+
+                # ------------------------------------------------
+                # TTS
+                # ------------------------------------------------
 
                 speech = await self.generate_speech(
                     response_text,
                     voice=voice,
+                )
+
+                if not speech:
+                    return {
+                        "success": False,
+                        "transcript": transcript,
+                        "response": response_text,
+                        "audio": b"",
+                        "voice": selected_voice,
+                        "error": "TTS returned no audio.",
+                    }
+
+                logger.info(
+                    "Voice pipeline completed | user=%s | transcript=%s | response=%s | audio_bytes=%s",
+                    username,
+                    transcript,
+                    response_text,
+                    len(speech),
                 )
 
                 return {
@@ -1014,9 +1125,7 @@ class GeminiEngine:
                     "transcript": transcript,
                     "response": response_text,
                     "audio": speech,
-                    "voice": normalize_voice_name(
-                        voice or self.current_voice
-                    ),
+                    "voice": selected_voice,
                     "error": None,
                 }
 
@@ -1024,6 +1133,8 @@ class GeminiEngine:
                 raise
 
             except Exception as error:
+                self.total_errors += 1
+
                 logger.exception(
                     "Voice pipeline failed."
                 )
@@ -1033,9 +1144,7 @@ class GeminiEngine:
                     "transcript": "",
                     "response": "",
                     "audio": b"",
-                    "voice": normalize_voice_name(
-                        voice or self.current_voice
-                    ),
+                    "voice": selected_voice,
                     "error": str(error),
                 }
 
@@ -1043,7 +1152,10 @@ class GeminiEngine:
     # STATS
     # ========================================================
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(
+        self,
+    ) -> dict[str, Any]:
+
         return {
             "chat_model": self.chat_model,
             "transcribe_model": self.transcribe_model,
@@ -1062,7 +1174,9 @@ class GeminiEngine:
     # CLOSE
     # ========================================================
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
         """
         Closes the underlying Gemini client if the installed
         SDK exposes an async close method.
@@ -1110,4 +1224,4 @@ def create_gemini_engine() -> GeminiEngine:
 __all__ = [
     "GeminiEngine",
     "create_gemini_engine",
-    ]
+]
