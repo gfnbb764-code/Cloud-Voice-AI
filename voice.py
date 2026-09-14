@@ -12,6 +12,7 @@ import io
 import logging
 import time
 import wave
+from collections.abc import Mapping
 from typing import Any
 
 import discord
@@ -39,7 +40,24 @@ from config import (
 from gemini import GeminiEngine
 
 
+# ============================================================
+# LOGGER SETUP
+# ============================================================
+
 logger = logging.getLogger("voice")
+
+# discord-ext-voice-recv can emit RTCP SenderReportPacket
+# messages continuously at INFO level. They are harmless and
+# extremely noisy, so silence only that specific logger.
+_voice_recv_reader_logger = logging.getLogger(
+    "discord.ext.voice_recv.reader"
+)
+_voice_recv_reader_logger.setLevel(logging.WARNING)
+
+_voice_recv_rtp_logger = logging.getLogger(
+    "discord.ext.voice_recv.rtp"
+)
+_voice_recv_rtp_logger.setLevel(logging.WARNING)
 
 
 # ============================================================
@@ -49,6 +67,75 @@ logger = logging.getLogger("voice")
 # Discord continues sending PCM frames even while the user
 # is silent, so speech detection is based on RMS volume.
 SILENCE_RMS_THRESHOLD = 500
+
+
+# ============================================================
+# CHARACTER HELPERS
+# ============================================================
+
+def _character_value(
+    character: Any,
+    key: str,
+    default: Any = None,
+) -> Any:
+    """
+    Safely read a character field from either:
+
+        {"name": "..."}          -> dict / Mapping
+        Character(name="...")    -> object
+
+    This prevents errors such as:
+
+        AttributeError:
+        'Character' object has no attribute 'get'
+    """
+
+    if character is None:
+        return default
+
+    # Mapping / dict-like character.
+    if isinstance(character, Mapping):
+        try:
+            return character.get(
+                key,
+                default,
+            )
+        except Exception:
+            return default
+
+    # Normal Python object.
+    try:
+        value = getattr(
+            character,
+            key,
+            default,
+        )
+    except Exception:
+        return default
+
+    if value is None:
+        return default
+
+    return value
+
+
+def _character_name(
+    character: Any,
+) -> str:
+    """Return a safe display name for any character type."""
+
+    value = _character_value(
+        character,
+        "name",
+        "Unknown",
+    )
+
+    if value is None:
+        return "Unknown"
+
+    name = str(value).strip()
+
+    return name or "Unknown"
 
 
 # ============================================================
@@ -131,7 +218,6 @@ def resample_pcm(
     # --------------------------------------------------------
 
     if source_rate != target_rate:
-
         result, _ = audioop.ratecv(
             result,
             sample_width,
@@ -319,7 +405,7 @@ class VoiceAISink(voice_recv.AudioSink):
             self._silence_monitor()
         )
 
-        logger.info(
+        logger.debug(
             "VoiceAISink initialized"
         )
 
@@ -812,14 +898,6 @@ class VoiceAISink(voice_recv.AudioSink):
 
             # ------------------------------------------------
             # Gemini
-            #
-            # process_voice() is responsible for:
-            #
-            # 1. Audio -> transcript
-            # 2. Transcript -> AI response
-            # 3. AI response -> Gemini TTS
-            #
-            # The voice system only handles Discord audio.
             # ------------------------------------------------
 
             result = await (
@@ -832,10 +910,15 @@ class VoiceAISink(voice_recv.AudioSink):
                 )
             )
 
-            if not result:
+            if not isinstance(
+                result,
+                dict,
+            ):
                 logger.warning(
-                    "Gemini returned no result | user=%s",
+                    "Gemini returned invalid result type | "
+                    "user=%s | type=%s",
                     user_id,
+                    type(result).__name__,
                 )
                 return
 
@@ -885,14 +968,27 @@ class VoiceAISink(voice_recv.AudioSink):
             # Play Gemini TTS
             # ------------------------------------------------
 
-            if audio:
-                await self.session.play_tts(
-                    audio
-                )
+            if isinstance(
+                audio,
+                (bytes, bytearray, memoryview),
+            ):
+                audio_bytes = bytes(audio)
+
+                if audio_bytes:
+                    await self.session.play_tts(
+                        audio_bytes
+                    )
+                else:
+                    logger.debug(
+                        "Gemini returned empty TTS audio | user=%s",
+                        user_id,
+                    )
             else:
                 logger.debug(
-                    "Gemini returned no TTS audio | user=%s",
+                    "Gemini returned invalid TTS audio | user=%s | "
+                    "type=%s",
                     user_id,
+                    type(audio).__name__,
                 )
 
         except asyncio.CancelledError:
@@ -961,7 +1057,7 @@ class VoiceSession:
         *,
         voice: str = DEFAULT_GEMINI_VOICE,
         speed: float = DEFAULT_SPEECH_SPEED,
-        character: dict[str, Any] | None = None,
+        character: Any | None = None,
     ):
         self.bot = bot
         self.guild = guild
@@ -985,7 +1081,8 @@ class VoiceSession:
             speed
         )
 
-        self.character = character
+        # Supports both dict and Character object.
+        self.character: Any | None = character
 
         self.sink: VoiceAISink | None = None
 
@@ -1072,6 +1169,18 @@ class VoiceSession:
 
         self.voice_name = normalized
 
+        # Keep Gemini engine voice in sync too.
+        try:
+            self.engine.set_voice(
+                normalized
+            )
+        except Exception:
+            logger.debug(
+                "Could not sync Gemini voice | voice=%s",
+                normalized,
+                exc_info=True,
+            )
+
         logger.info(
             "Voice changed | guild=%s | voice=%s",
             self.guild.id,
@@ -1089,10 +1198,17 @@ class VoiceSession:
         speed: float,
     ) -> float:
 
-        self.speech_speed = (
-            normalize_speech_speed(
+        try:
+            normalized_speed = normalize_speech_speed(
                 speed
             )
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid speech speed: {speed}"
+            ) from exc
+
+        self.speech_speed = (
+            normalized_speed
         )
 
         logger.info(
@@ -1109,28 +1225,51 @@ class VoiceSession:
 
     def set_character(
         self,
-        character: dict[str, Any] | None,
+        character: Any | None,
     ) -> None:
+        """
+        Accept both:
+
+            Character object
+            dict / Mapping
+            None
+
+        The old implementation assumed dict and called
+        character.get(), which caused:
+
+            AttributeError:
+            'Character' object has no attribute 'get'
+        """
 
         self.character = character
 
-        if character:
-            name = character.get(
-                "name",
-                "Unknown",
-            )
-
-            logger.info(
-                "Character changed | guild=%s | character=%s",
-                self.guild.id,
-                name,
-            )
-
-        else:
+        if character is None:
             logger.info(
                 "Character cleared | guild=%s",
                 self.guild.id,
             )
+            return
+
+        name = _character_name(
+            character
+        )
+
+        logger.info(
+            "Character changed | guild=%s | character=%s",
+            self.guild.id,
+            name,
+        )
+
+    # ========================================================
+    # GET CHARACTER
+    # ========================================================
+
+    def get_character_name(
+        self,
+    ) -> str:
+        return _character_name(
+            self.character
+        )
 
     # ========================================================
     # PLAY TTS
@@ -1276,7 +1415,9 @@ class VoiceSession:
     # CLOSE
     # ========================================================
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
 
         if self._closed:
             return
@@ -1303,6 +1444,17 @@ class VoiceSession:
 
         except Exception:
             pass
+
+        try:
+
+            await self.engine.close()
+
+        except Exception:
+
+            logger.debug(
+                "Failed to close Gemini engine",
+                exc_info=True,
+            )
 
         logger.info(
             "Voice session closed | guild=%s",
@@ -1353,7 +1505,7 @@ class VoiceSessionManager:
         *,
         voice: str = DEFAULT_GEMINI_VOICE,
         speed: float = DEFAULT_SPEECH_SPEED,
-        character: dict[str, Any] | None = None,
+        character: Any | None = None,
     ) -> VoiceSession:
 
         guild = channel.guild
@@ -1423,6 +1575,40 @@ class VoiceSessionManager:
                             "voice client"
                         )
 
+                else:
+                    # A VoiceRecvClient already exists but
+                    # is not tracked by us. Disconnect it so
+                    # the new session starts cleanly.
+                    try:
+                        if existing_client.is_connected():
+                            await existing_client.disconnect(
+                                force=True
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Failed to disconnect "
+                            "existing VoiceRecvClient"
+                        )
+
+            # ------------------------------------------------
+            # Validate requested voice before connecting
+            # ------------------------------------------------
+
+            selected_voice = normalize_voice_name(
+                voice
+            )
+
+            if not is_valid_voice(
+                selected_voice
+            ):
+                selected_voice = (
+                    DEFAULT_GEMINI_VOICE
+                )
+
+            selected_speed = normalize_speech_speed(
+                speed
+            )
+
             # ------------------------------------------------
             # Connect VoiceRecvClient
             # ------------------------------------------------
@@ -1466,8 +1652,8 @@ class VoiceSessionManager:
                 guild,
                 channel,
                 voice_client,
-                voice=voice,
-                speed=speed,
+                voice=selected_voice,
+                speed=selected_speed,
                 character=character,
             )
 
@@ -1485,6 +1671,11 @@ class VoiceSessionManager:
                     guild.id,
                     None,
                 )
+
+                try:
+                    await session.close()
+                except Exception:
+                    pass
 
                 try:
                     await voice_client.disconnect(
@@ -1553,7 +1744,9 @@ class VoiceSessionManager:
     # LEAVE ALL
     # ========================================================
 
-    async def close_all(self) -> None:
+    async def close_all(
+        self,
+    ) -> None:
 
         guild_ids = list(
             self.sessions.keys()
@@ -1578,7 +1771,9 @@ class VoiceSessionManager:
     # STATS
     # ========================================================
 
-    def stats(self) -> dict[str, int]:
+    def stats(
+        self,
+    ) -> dict[str, int]:
 
         return {
             "active_sessions": len(
