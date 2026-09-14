@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +18,8 @@ from discord.ext import commands
 
 from config import (
     ALLOW_VOICE_CHANGE,
+    AUTO_LEAVE_EMPTY_CHANNEL,
+    AUTO_LEAVE_DELAY_SECONDS,
     CHARACTER_STORAGE_FILE,
     CHARACTERS_ENABLED,
     COMMAND_DESCRIPTIONS,
@@ -38,8 +39,6 @@ from config import (
     MAX_SPEECH_SPEED,
     MIN_SPEECH_SPEED,
     MODERATION_AI_ENABLED,
-    MODERATION_CONFIRM_DANGEROUS_ACTIONS,
-    MODERATION_MAX_BULK_DELETE,
     MODERATION_MAX_REASON_LENGTH,
     MODERATION_OWNER_ONLY,
     get_safe_config,
@@ -49,7 +48,6 @@ from config import (
 )
 
 from voice import (
-    VoiceSession,
     VoiceSessionManager,
     send_voice_list,
 )
@@ -224,6 +222,9 @@ class CharacterManager:
 
                 data = json.load(file)
 
+            if not isinstance(data, dict):
+                return
+
             raw_characters = data.get(
                 "characters",
                 {},
@@ -234,14 +235,29 @@ class CharacterManager:
                 {},
             )
 
-            for guild_id, items in raw_characters.items():
+            if not isinstance(raw_characters, dict):
+                raw_characters = {}
 
-                self.characters[guild_id] = {}
+            if not isinstance(raw_selected, dict):
+                raw_selected = {}
+
+            for guild_id, items in raw_characters.items():
 
                 if not isinstance(items, dict):
                     continue
 
+                guild_characters: dict[
+                    str,
+                    Character,
+                ] = {}
+
                 for name, character_data in items.items():
+
+                    if not isinstance(
+                        character_data,
+                        dict,
+                    ):
+                        continue
 
                     try:
 
@@ -249,18 +265,27 @@ class CharacterManager:
                             character_data
                         )
 
-                        self.characters[guild_id][
-                            name.lower()
+                        guild_characters[
+                            str(name).lower()
                         ] = character
 
                     except Exception:
+
                         logger.exception(
                             "Failed to load character: %s",
                             name,
                         )
 
+                self.characters[
+                    str(guild_id)
+                ] = guild_characters
+
             self.selected = {
-                str(guild_id): value
+                str(guild_id): (
+                    str(value)
+                    if value is not None
+                    else None
+                )
                 for guild_id, value
                 in raw_selected.items()
             }
@@ -270,6 +295,7 @@ class CharacterManager:
             )
 
         except Exception:
+
             logger.exception(
                 "Failed to load character storage"
             )
@@ -278,31 +304,29 @@ class CharacterManager:
         self,
     ) -> None:
 
-        data = {
-            "characters": {
-                guild_id: {
-                    key: character.to_dict()
-                    for key, character
-                    in items.items()
-                }
-                for guild_id, items
-                in self.characters.items()
-            },
-            "selected": self.selected,
-        }
+        async with self._lock:
 
-        self.path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+            data = {
+                "characters": {
+                    guild_id: {
+                        key: character.to_dict()
+                        for key, character
+                        in items.items()
+                    }
+                    for guild_id, items
+                    in self.characters.items()
+                },
+                "selected": self.selected,
+            }
 
-        temporary = (
-            self.path.with_suffix(
+            self.path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            temporary = self.path.with_suffix(
                 self.path.suffix + ".tmp"
             )
-        )
-
-        async with self._lock:
 
             def write_file() -> None:
 
@@ -367,6 +391,11 @@ class CharacterManager:
         key = self._key(
             character.name
         )
+
+        if not key:
+            raise ValueError(
+                "Character name cannot be empty."
+            )
 
         if key in items:
             raise ValueError(
@@ -592,6 +621,7 @@ class CharacterManager:
                     and selected.lower()
                     == old_name.lower()
                 ):
+
                     self.selected[
                         str(guild_id)
                     ] = character.name
@@ -612,18 +642,31 @@ class CharacterManager:
             character.voice = normalized
 
         if speed is not None:
+
             character.speed = normalize_speech_speed(
                 speed
             )
 
         if personality is not None:
-            character.personality = personality.strip()
+
+            character.personality = (
+                personality.strip()
+                or DEFAULT_CHARACTER_PERSONALITY
+            )
 
         if style is not None:
-            character.style = style.strip()
+
+            character.style = (
+                style.strip()
+                or DEFAULT_CHARACTER_STYLE
+            )
 
         if instructions is not None:
-            character.instructions = instructions.strip()
+
+            character.instructions = (
+                instructions.strip()
+                or DEFAULT_CHARACTER_INSTRUCTIONS
+            )
 
         await self._save()
 
@@ -663,7 +706,6 @@ class CloudVoiceBot(
         )
 
         self.ready_once = False
-
         self.synced = False
 
     # ========================================================
@@ -711,6 +753,7 @@ class CloudVoiceBot(
             )
 
         except Exception:
+
             logger.exception(
                 "Failed to sync commands"
             )
@@ -731,17 +774,20 @@ class CloudVoiceBot(
         )
 
         if activity_type == "watching":
+
             activity = discord.Activity(
                 type=discord.ActivityType.watching,
                 name=DISCORD_STATUS,
             )
 
         elif activity_type == "playing":
+
             activity = discord.Game(
                 name=DISCORD_STATUS
             )
 
         else:
+
             activity = discord.Activity(
                 type=discord.ActivityType.listening,
                 name=DISCORD_STATUS,
@@ -778,6 +824,35 @@ class CloudVoiceBot(
 
 
 bot = CloudVoiceBot()
+
+
+# ============================================================
+# VOICE AUTOCOMPLETE
+# ============================================================
+
+async def voice_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+
+    current = current.strip().lower()
+
+    matches = [
+        voice
+        for voice in GEMINI_VOICES
+        if (
+            not current
+            or current in voice.lower()
+        )
+    ]
+
+    return [
+        app_commands.Choice(
+            name=voice,
+            value=voice,
+        )
+        for voice in matches[:25]
+    ]
 
 
 # ============================================================
@@ -818,33 +893,25 @@ async def botinfo(
 
     embed.add_field(
         name="Version",
-        value=str(
-            config["version"]
-        ),
+        value=str(config["version"]),
         inline=True,
     )
 
     embed.add_field(
         name="Chat",
-        value=str(
-            config["chat_model"]
-        ),
+        value=str(config["chat_model"]),
         inline=True,
     )
 
     embed.add_field(
         name="TTS",
-        value=str(
-            config["tts_model"]
-        ),
+        value=str(config["tts_model"]),
         inline=True,
     )
 
     embed.add_field(
         name="Voices",
-        value=str(
-            config["voice_count"]
-        ),
+        value=str(config["voice_count"]),
         inline=True,
     )
 
@@ -955,10 +1022,12 @@ async def join(
 ) -> None:
 
     if interaction.guild is None:
+
         await interaction.response.send_message(
             "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
+
         return
 
     member = interaction.user
@@ -972,6 +1041,16 @@ async def join(
             "❌ تعذر معرفة الروم الصوتي.",
             ephemeral=True,
         )
+
+        return
+
+    if member.voice is None:
+
+        await interaction.response.send_message(
+            "❌ ادخل روم صوتي أولًا.",
+            ephemeral=True,
+        )
+
         return
 
     channel = member.voice.channel
@@ -1059,9 +1138,11 @@ async def leave(
     )
 
     await interaction.response.send_message(
-        "👋 طلعت من الروم الصوتي."
-        if success
-        else "ℹ️ البوت غير موجود في روم صوتي."
+        (
+            "👋 طلعت من الروم الصوتي."
+            if success
+            else "ℹ️ البوت غير موجود في روم صوتي."
+        )
     )
 
 
@@ -1113,18 +1194,12 @@ async def voice(
 @app_commands.describe(
     voice="اسم صوت Gemini",
 )
-@app_commands.choices(
-    voice=[
-        app_commands.Choice(
-            name=voice,
-            value=voice,
-        )
-        for voice in GEMINI_VOICES
-    ]
+@app_commands.autocomplete(
+    voice=voice_autocomplete
 )
 async def setvoice(
     interaction: discord.Interaction,
-    voice: app_commands.Choice[str],
+    voice: str,
 ) -> None:
 
     if interaction.guild is None:
@@ -1161,11 +1236,9 @@ async def setvoice(
     try:
 
         selected_voice = session.set_voice(
-            voice.value
+            voice
         )
 
-        # Persist the selected voice if a character
-        # is currently active.
         selected_character = (
             session.character
         )
@@ -1208,14 +1281,14 @@ async def voices(
     description=COMMAND_DESCRIPTIONS["speed"],
 )
 @app_commands.describe(
-    speed="سرعة الكلام من 0.5x إلى 2.0x",
+    speed="سرعة الكلام",
 )
 async def speed(
     interaction: discord.Interaction,
     speed: app_commands.Range[
         float,
-        0.5,
-        2.0,
+        MIN_SPEECH_SPEED,
+        MAX_SPEECH_SPEED,
     ],
 ) -> None:
 
@@ -1257,11 +1330,13 @@ async def speed(
         )
 
     await interaction.response.send_message(
-        f"⚡ سرعة الكلام الآن **{new_speed:.2f}x**."
-        + (
-            f"\n🤖 تم حفظها للشخصية **{character.name}**."
-            if character
-            else ""
+        (
+            f"⚡ سرعة الكلام الآن **{new_speed:.2f}x**."
+            + (
+                f"\n🤖 تم حفظها للشخصية **{character.name}**."
+                if character
+                else ""
+            )
         )
     )
 
@@ -1288,19 +1363,13 @@ character_group = app_commands.Group(
     style="أسلوب الكلام",
     instructions="تعليمات إضافية للشخصية",
 )
-@app_commands.choices(
-    voice=[
-        app_commands.Choice(
-            name=voice,
-            value=voice,
-        )
-        for voice in GEMINI_VOICES
-    ]
+@app_commands.autocomplete(
+    voice=voice_autocomplete
 )
 async def character_create(
     interaction: discord.Interaction,
     name: app_commands.Range[str, 1, 50],
-    voice: app_commands.Choice[str],
+    voice: str,
     speed: app_commands.Range[float, 0.5, 2.0],
     personality: app_commands.Range[str, 1, 500],
     style: app_commands.Range[str, 1, 500],
@@ -1326,7 +1395,7 @@ async def character_create(
         return
 
     normalized_voice = normalize_voice_name(
-        voice.value
+        voice
     )
 
     if not is_valid_voice(
@@ -1387,25 +1456,32 @@ async def character_create(
     style="أسلوب الكلام الجديد",
     instructions="التعليمات الجديدة",
 )
-@app_commands.choices(
-    voice=[
-        app_commands.Choice(
-            name=voice,
-            value=voice,
-        )
-        for voice in GEMINI_VOICES
-    ]
+@app_commands.autocomplete(
+    voice=voice_autocomplete
 )
 async def character_edit(
     interaction: discord.Interaction,
     character: str,
     new_name: str | None = None,
-    voice: app_commands.Choice[str] | None = None,
-    speed: app_commands.Range[float, 0.5, 2.0] | None = None,
+    voice: str | None = None,
+    speed: app_commands.Range[
+        float,
+        0.5,
+        2.0,
+    ] | None = None,
     personality: str | None = None,
     style: str | None = None,
     instructions: str | None = None,
 ) -> None:
+
+    if not CHARACTERS_ENABLED:
+
+        await interaction.response.send_message(
+            "❌ نظام الشخصيات معطل.",
+            ephemeral=True,
+        )
+
+        return
 
     if interaction.guild is None:
 
@@ -1441,11 +1517,7 @@ async def character_edit(
             interaction.guild.id,
             character,
             name=new_name,
-            voice=(
-                voice.value
-                if voice
-                else None
-            ),
+            voice=voice,
             speed=(
                 float(speed)
                 if speed is not None
@@ -1494,6 +1566,15 @@ async def character_select(
     interaction: discord.Interaction,
     character: str,
 ) -> None:
+
+    if not CHARACTERS_ENABLED:
+
+        await interaction.response.send_message(
+            "❌ نظام الشخصيات معطل.",
+            ephemeral=True,
+        )
+
+        return
 
     if interaction.guild is None:
 
@@ -1544,6 +1625,15 @@ async def character_select(
 async def character_list(
     interaction: discord.Interaction,
 ) -> None:
+
+    if not CHARACTERS_ENABLED:
+
+        await interaction.response.send_message(
+            "❌ نظام الشخصيات معطل.",
+            ephemeral=True,
+        )
+
+        return
 
     if interaction.guild is None:
 
@@ -1612,6 +1702,15 @@ async def character_view(
     interaction: discord.Interaction,
     character: str,
 ) -> None:
+
+    if not CHARACTERS_ENABLED:
+
+        await interaction.response.send_message(
+            "❌ نظام الشخصيات معطل.",
+            ephemeral=True,
+        )
+
+        return
 
     if interaction.guild is None:
 
@@ -1687,6 +1786,15 @@ async def character_delete(
     interaction: discord.Interaction,
     character: str,
 ) -> None:
+
+    if not CHARACTERS_ENABLED:
+
+        await interaction.response.send_message(
+            "❌ نظام الشخصيات معطل.",
+            ephemeral=True,
+        )
+
+        return
 
     if interaction.guild is None:
 
@@ -1771,8 +1879,7 @@ async def memory(
 
     await interaction.response.send_message(
         (
-            f"🧠 الذاكرة: "
-            f"`{stats['memory_size']}` رسالة\n"
+            f"🧠 الذاكرة: `{stats['memory_size']}` رسالة\n"
             f"📦 الحالة: "
             f"`{'Enabled' if stats['memory_enabled'] else 'Disabled'}`"
         )
@@ -1921,25 +2028,19 @@ async def stats(
 
     embed.add_field(
         name="🧠 Memory",
-        value=str(
-            data["memory_size"]
-        ),
+        value=str(data["memory_size"]),
         inline=True,
     )
 
     embed.add_field(
         name="✅ Processed",
-        value=str(
-            data["processed_requests"]
-        ),
+        value=str(data["processed_requests"]),
         inline=True,
     )
 
     embed.add_field(
         name="❌ Failed",
-        value=str(
-            data["failed_requests"]
-        ),
+        value=str(data["failed_requests"]),
         inline=True,
     )
 
@@ -1965,18 +2066,22 @@ def is_server_owner(
     )
 
 
-def moderation_allowed(
-    interaction: discord.Interaction,
+def bot_has_permission(
+    guild: discord.Guild,
+    permission: str,
 ) -> bool:
 
-    if not MODERATION_AI_ENABLED:
+    me = guild.me
+
+    if me is None:
         return False
 
-    if not MODERATION_OWNER_ONLY:
-        return True
-
-    return is_server_owner(
-        interaction
+    return bool(
+        getattr(
+            me.guild_permissions,
+            permission,
+            False,
+        )
     )
 
 
@@ -2015,27 +2120,6 @@ async def require_moderation_owner(
         return False
 
     return True
-
-
-def bot_has_permission(
-    guild: discord.Guild,
-    permission: str,
-) -> bool:
-
-    me = guild.me
-
-    if me is None:
-        return False
-
-    permissions = me.guild_permissions
-
-    return bool(
-        getattr(
-            permissions,
-            permission,
-            False,
-        )
-    )
 
 
 # ============================================================
@@ -2184,13 +2268,6 @@ async def mod_request(
         )
 
         return
-
-    # This command deliberately does NOT allow
-    # arbitrary natural-language execution.
-    #
-    # It gives the owner a safe list of supported
-    # actions instead of allowing an AI response to
-    # execute arbitrary Discord API operations.
 
     supported = (
         "clear messages\n"
@@ -2513,9 +2590,11 @@ async def on_voice_state_update(
                 )
 
         except asyncio.CancelledError:
+
             return
 
         except Exception:
+
             logger.exception(
                 "Auto leave failed"
             )
@@ -2548,6 +2627,7 @@ async def on_app_command_error(
         error,
         app_commands.CommandOnCooldown,
     ):
+
         message = (
             "⏳ الأمر عليه انتظار، حاول بعد قليل."
         )
@@ -2596,13 +2676,13 @@ async def on_error(
 def main() -> None:
 
     if not DISCORD_TOKEN:
+
         raise RuntimeError(
             "DISCORD_TOKEN is missing."
         )
 
     logger.info(
-        "Starting %s...",
-        "Cloud Voice AI",
+        "Starting Cloud Voice AI..."
     )
 
     bot.run(
