@@ -60,12 +60,6 @@ def pcm_stereo_48k_to_mono_16k(
     if not pcm:
         return b""
 
-    # Discord:
-    # 48kHz / stereo / 16-bit
-    #
-    # Gemini:
-    # 16kHz / mono / 16-bit
-
     mono, _ = audioop.tomono(
         pcm,
         DISCORD_SAMPLE_WIDTH,
@@ -98,26 +92,11 @@ def pcm_to_wav(
 
     buffer = io.BytesIO()
 
-    with wave.open(
-        buffer,
-        "wb",
-    ) as wav:
-
-        wav.setnchannels(
-            int(channels)
-        )
-
-        wav.setsampwidth(
-            int(sample_width)
-        )
-
-        wav.setframerate(
-            int(sample_rate)
-        )
-
-        wav.writeframes(
-            pcm
-        )
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(int(channels))
+        wav.setsampwidth(int(sample_width))
+        wav.setframerate(int(sample_rate))
+        wav.writeframes(pcm)
 
     return buffer.getvalue()
 
@@ -130,7 +109,6 @@ def calculate_rms(
         return 0.0
 
     try:
-
         count = len(pcm) // 2
 
         if count <= 0:
@@ -162,7 +140,6 @@ def calculate_peak(
         return 0
 
     try:
-
         count = len(pcm) // 2
 
         if count <= 0:
@@ -216,9 +193,7 @@ def adjust_pcm_speed(
     if not pcm:
         return b""
 
-    speed = normalize_speech_speed(
-        speed
-    )
+    speed = normalize_speech_speed(speed)
 
     if abs(speed - 1.0) < 0.001:
         return pcm
@@ -243,7 +218,7 @@ def adjust_pcm_speed(
 
 
 # ============================================================
-# VOICE SINK
+# VOICE RECEIVE IMPORT
 # ============================================================
 
 try:
@@ -256,9 +231,11 @@ except ImportError:
         pass
 
 
-class VoiceAISink(
-    AudioSink
-):
+# ============================================================
+# VOICE SINK
+# ============================================================
+
+class VoiceAISink(AudioSink):
 
     def __init__(
         self,
@@ -289,6 +266,19 @@ class VoiceAISink(
         ] = set()
 
         self.closed = False
+
+    # ========================================================
+    # OPUS / PCM MODE
+    # ========================================================
+
+    def wants_opus(
+        self,
+    ) -> bool:
+        """
+        False = receive decoded PCM instead of Opus packets.
+        """
+
+        return False
 
     # ========================================================
     # AUDIO RECEIVE
@@ -328,10 +318,7 @@ class VoiceAISink(
                 pcm,
                 bytes,
             ):
-
-                pcm = bytes(
-                    pcm
-                )
+                pcm = bytes(pcm)
 
             if not pcm:
                 return
@@ -365,9 +352,7 @@ class VoiceAISink(
                 bytearray(),
             )
 
-            self.user_names[
-                user_id
-            ] = username
+            self.user_names[user_id] = username
 
             if (
                 len(buffer)
@@ -388,13 +373,11 @@ class VoiceAISink(
 
                 return
 
-            buffer.extend(
-                pcm
-            )
+            buffer.extend(pcm)
 
-            self.last_audio_time[
-                user_id
-            ] = time.monotonic()
+            self.last_audio_time[user_id] = (
+                time.monotonic()
+            )
 
             duration = pcm_duration_seconds(
                 bytes(buffer)
@@ -426,9 +409,7 @@ class VoiceAISink(
         if user_id in self.processing:
             return
 
-        self.processing.add(
-            user_id
-        )
+        self.processing.add(user_id)
 
         try:
 
@@ -445,9 +426,7 @@ class VoiceAISink(
             if not buffer:
                 return
 
-            pcm = bytes(
-                buffer
-            )
+            pcm = bytes(buffer)
 
             duration = pcm_duration_seconds(
                 pcm
@@ -463,13 +442,8 @@ class VoiceAISink(
 
                 return
 
-            rms = calculate_rms(
-                pcm
-            )
-
-            peak = calculate_peak(
-                pcm
-            )
+            rms = calculate_rms(pcm)
+            peak = calculate_peak(pcm)
 
             logger.info(
                 (
@@ -529,9 +503,7 @@ class VoiceAISink(
 
         finally:
 
-            self.processing.discard(
-                user_id
-            )
+            self.processing.discard(user_id)
 
     # ========================================================
     # CLEANUP
@@ -575,39 +547,29 @@ class VoiceSession:
         self.channel = channel
         self.voice_client = voice_client
 
-        self.voice = normalize_voice_name(
-            voice
-        )
+        self.voice = normalize_voice_name(voice)
 
-        self.speed = normalize_speech_speed(
-            speed
-        )
+        self.speed = normalize_speech_speed(speed)
 
         self.character = character
 
         self.engine = GeminiEngine()
 
-        self.engine.set_voice(
-            self.voice
-        )
+        self.engine.set_voice(self.voice)
 
         self.sink: VoiceAISink | None = None
 
         self.play_lock = asyncio.Lock()
 
-        self.processing_semaphore = (
-            asyncio.Semaphore(
-                MAX_CONCURRENT_AI_REQUESTS
-            )
+        self.processing_semaphore = asyncio.Semaphore(
+            MAX_CONCURRENT_AI_REQUESTS
         )
 
         self.closed = False
 
         self.started_at = time.monotonic()
 
-        self.last_activity = (
-            self.started_at
-        )
+        self.last_activity = self.started_at
 
     # ========================================================
     # START RECEIVE
@@ -623,9 +585,7 @@ class VoiceSession:
         if self.sink is not None:
             return
 
-        self.sink = VoiceAISink(
-            self
-        )
+        self.sink = VoiceAISink(self)
 
         try:
 
@@ -676,9 +636,7 @@ class VoiceSession:
 
         async with self.processing_semaphore:
 
-            self.last_activity = (
-                time.monotonic()
-            )
+            self.last_activity = time.monotonic()
 
             try:
 
@@ -780,9 +738,7 @@ class VoiceSession:
             loop = asyncio.get_running_loop()
 
             source = discord.PCMAudio(
-                io.BytesIO(
-                    pcm
-                )
+                io.BytesIO(pcm)
             )
 
             finished = asyncio.Event()
@@ -832,13 +788,9 @@ class VoiceSession:
                 "Voice changing is disabled."
             )
 
-        normalized = normalize_voice_name(
-            voice
-        )
+        normalized = normalize_voice_name(voice)
 
-        if not is_valid_voice(
-            normalized
-        ):
+        if not is_valid_voice(normalized):
 
             raise ValueError(
                 f"Invalid voice: {voice}"
@@ -846,9 +798,7 @@ class VoiceSession:
 
         self.voice = normalized
 
-        self.engine.set_voice(
-            normalized
-        )
+        self.engine.set_voice(normalized)
 
         if self.character is not None:
 
@@ -870,9 +820,7 @@ class VoiceSession:
         update_character: bool = True,
     ) -> float:
 
-        normalized = normalize_speech_speed(
-            speed
-        )
+        normalized = normalize_speech_speed(speed)
 
         self.speed = normalized
 
@@ -912,9 +860,7 @@ class VoiceSession:
                 character.speed
             )
 
-            self.engine.set_voice(
-                self.voice
-            )
+            self.engine.set_voice(self.voice)
 
         except Exception:
 
@@ -936,9 +882,7 @@ class VoiceSession:
             DEFAULT_SPEECH_SPEED
         )
 
-        self.engine.set_voice(
-            self.voice
-        )
+        self.engine.set_voice(self.voice)
 
     # ========================================================
     # RESET
@@ -960,9 +904,7 @@ class VoiceSession:
 
         self.character = None
 
-        self.engine.set_voice(
-            self.voice
-        )
+        self.engine.set_voice(self.voice)
 
     # ========================================================
     # CLOSE
@@ -989,7 +931,6 @@ class VoiceSession:
         try:
 
             if self.voice_client.is_recording():
-
                 self.voice_client.stop_recording()
 
         except Exception:
@@ -998,7 +939,6 @@ class VoiceSession:
         try:
 
             if self.voice_client.is_playing():
-
                 self.voice_client.stop()
 
         except Exception:
@@ -1045,9 +985,7 @@ class VoiceSessionManager:
         guild_id: int,
     ) -> VoiceSession | None:
 
-        return self.sessions.get(
-            guild_id
-        )
+        return self.sessions.get(guild_id)
 
     # ========================================================
     # JOIN
@@ -1065,16 +1003,11 @@ class VoiceSessionManager:
 
         async with self.lock:
 
-            existing = self.sessions.get(
-                guild.id
-            )
+            existing = self.sessions.get(guild.id)
 
             if existing:
 
-                if (
-                    existing.channel.id
-                    != channel.id
-                ):
+                if existing.channel.id != channel.id:
 
                     try:
 
@@ -1093,19 +1026,13 @@ class VoiceSessionManager:
                             None,
                         )
 
-                existing.set_voice(
-                    voice
-                )
+                existing.set_voice(voice)
 
-                existing.set_speed(
-                    speed
-                )
+                existing.set_speed(speed)
 
                 if character is not None:
 
-                    existing.set_character(
-                        character
-                    )
+                    existing.set_character(character)
 
                 return existing
 
@@ -1122,9 +1049,7 @@ class VoiceSessionManager:
                 voice
             )
 
-            if not is_valid_voice(
-                normalized_voice
-            ):
+            if not is_valid_voice(normalized_voice):
 
                 raise ValueError(
                     f"Invalid voice: {voice}"
@@ -1138,22 +1063,30 @@ class VoiceSessionManager:
 
             if voice_client is None:
 
-                voice_client = await channel.connect(
-                    self_deaf=False,
-                    self_mute=False,
-                )
+                # The DAVE voice-receive extension requires
+                # its VoiceRecvClient to be used.
+                try:
+                    from discord.ext import voice_recv
+
+                    voice_client = await channel.connect(
+                        cls=voice_recv.VoiceRecvClient,
+                        self_deaf=False,
+                        self_mute=False,
+                    )
+                except ImportError:
+                    voice_client = await channel.connect(
+                        self_deaf=False,
+                        self_mute=False,
+                    )
 
             else:
 
                 if (
                     voice_client.channel is None
-                    or voice_client.channel.id
-                    != channel.id
+                    or voice_client.channel.id != channel.id
                 ):
 
-                    await voice_client.move_to(
-                        channel
-                    )
+                    await voice_client.move_to(channel)
 
             session = VoiceSession(
                 guild=guild,
@@ -1164,9 +1097,7 @@ class VoiceSessionManager:
                 character=character,
             )
 
-            self.sessions[
-                guild.id
-            ] = session
+            self.sessions[guild.id] = session
 
             try:
 
@@ -1265,9 +1196,7 @@ async def send_voice_list(
     interaction: discord.Interaction,
 ) -> None:
 
-    voices = list(
-        GEMINI_VOICES
-    )
+    voices = list(GEMINI_VOICES)
 
     chunks = []
 
@@ -1278,9 +1207,7 @@ async def send_voice_list(
     ):
 
         chunks.append(
-            voices[
-                index:index + 10
-            ]
+            voices[index:index + 10]
         )
 
     embed = discord.Embed(
@@ -1308,4 +1235,4 @@ async def send_voice_list(
 
     await interaction.response.send_message(
         embed=embed
-    )
+        )
