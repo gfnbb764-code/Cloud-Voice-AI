@@ -19,8 +19,6 @@ import discord
 
 from config import (
     ALLOW_VOICE_CHANGE,
-    AUTO_LEAVE_DELAY_SECONDS,
-    AUTO_LEAVE_EMPTY_CHANNEL,
     DEFAULT_AUDIO_MIME_TYPE,
     DEFAULT_GEMINI_VOICE,
     DEFAULT_SPEECH_SPEED,
@@ -30,14 +28,12 @@ from config import (
     GEMINI_INPUT_CHANNELS,
     GEMINI_INPUT_SAMPLE_RATE,
     GEMINI_TTS_CHANNELS,
-    GEMINI_TTS_SAMPLE_RATE,
     GEMINI_VOICES,
     MAX_AUDIO_BUFFER_BYTES,
     MAX_CONCURRENT_AI_REQUESTS,
     MAX_GUILD_VOICE_SESSIONS,
     MAX_RECORDING_SECONDS,
     MIN_AUDIO_SECONDS,
-    SILENCE_TIMEOUT_SECONDS,
     is_valid_voice,
     normalize_speech_speed,
     normalize_voice_name,
@@ -59,6 +55,12 @@ def pcm_stereo_48k_to_mono_16k(
 
     if not pcm:
         return b""
+
+    # Discord:
+    # 48kHz / stereo / 16-bit
+    #
+    # Gemini:
+    # 16kHz / mono / 16-bit
 
     mono, _ = audioop.tomono(
         pcm,
@@ -180,55 +182,23 @@ def pcm_duration_seconds(
 
 
 # ============================================================
-# SPEED HELPERS
-# ============================================================
-
-def adjust_pcm_speed(
-    pcm: bytes,
-    *,
-    speed: float,
-    sample_rate: int,
-) -> bytes:
-
-    if not pcm:
-        return b""
-
-    speed = normalize_speech_speed(speed)
-
-    if abs(speed - 1.0) < 0.001:
-        return pcm
-
-    effective_rate = int(
-        sample_rate * speed
-    )
-
-    if effective_rate <= 0:
-        return pcm
-
-    adjusted, _ = audioop.ratecv(
-        pcm,
-        2,
-        GEMINI_TTS_CHANNELS,
-        sample_rate,
-        effective_rate,
-        None,
-    )
-
-    return adjusted
-
-
-# ============================================================
-# VOICE RECEIVE IMPORT
+# VOICE SINK IMPORT
 # ============================================================
 
 try:
-    from discord.ext.voice_recv import (
-        AudioSink,
-    )
+    from discord.ext import voice_recv
+
+    AudioSink = voice_recv.AudioSink
+    VoiceRecvClient = voice_recv.VoiceRecvClient
+
 except ImportError:
+
+    voice_recv = None
 
     class AudioSink:
         pass
+
+    VoiceRecvClient = None
 
 
 # ============================================================
@@ -268,14 +238,14 @@ class VoiceAISink(AudioSink):
         self.closed = False
 
     # ========================================================
-    # OPUS / PCM MODE
+    # OPUS MODE
     # ========================================================
 
     def wants_opus(
         self,
     ) -> bool:
         """
-        False = receive decoded PCM instead of Opus packets.
+        False means the sink wants decoded PCM.
         """
 
         return False
@@ -462,12 +432,6 @@ class VoiceAISink(AudioSink):
             )
 
             if peak <= 0:
-
-                logger.debug(
-                    "Empty audio signal | user=%s",
-                    username,
-                )
-
                 return
 
             normalized = (
@@ -503,7 +467,9 @@ class VoiceAISink(AudioSink):
 
         finally:
 
-            self.processing.discard(user_id)
+            self.processing.discard(
+                user_id
+            )
 
     # ========================================================
     # CLEANUP
@@ -547,29 +513,39 @@ class VoiceSession:
         self.channel = channel
         self.voice_client = voice_client
 
-        self.voice = normalize_voice_name(voice)
+        self.voice = normalize_voice_name(
+            voice
+        )
 
-        self.speed = normalize_speech_speed(speed)
+        self.speed = normalize_speech_speed(
+            speed
+        )
 
         self.character = character
 
         self.engine = GeminiEngine()
 
-        self.engine.set_voice(self.voice)
+        self.engine.set_voice(
+            self.voice
+        )
 
         self.sink: VoiceAISink | None = None
 
         self.play_lock = asyncio.Lock()
 
-        self.processing_semaphore = asyncio.Semaphore(
-            MAX_CONCURRENT_AI_REQUESTS
+        self.processing_semaphore = (
+            asyncio.Semaphore(
+                MAX_CONCURRENT_AI_REQUESTS
+            )
         )
 
         self.closed = False
 
         self.started_at = time.monotonic()
 
-        self.last_activity = self.started_at
+        self.last_activity = (
+            self.started_at
+        )
 
     # ========================================================
     # START RECEIVE
@@ -585,13 +561,27 @@ class VoiceSession:
         if self.sink is not None:
             return
 
-        self.sink = VoiceAISink(self)
+        if voice_recv is None:
+            raise RuntimeError(
+                "discord-ext-voice-recv-dave is not installed."
+            )
+
+        if not isinstance(
+            self.voice_client,
+            VoiceRecvClient,
+        ):
+            raise RuntimeError(
+                "VoiceRecvClient is required for voice receive."
+            )
+
+        self.sink = VoiceAISink(
+            self
+        )
 
         try:
 
-            self.voice_client.start_recording(
-                self.sink,
-                self._recording_finished,
+            self.voice_client.listen(
+                self.sink
             )
 
             logger.info(
@@ -612,13 +602,6 @@ class VoiceSession:
 
             raise
 
-    async def _recording_finished(
-        self,
-        sink: Any,
-    ) -> None:
-
-        return
-
     # ========================================================
     # PROCESS VOICE
     # ========================================================
@@ -636,7 +619,9 @@ class VoiceSession:
 
         async with self.processing_semaphore:
 
-            self.last_activity = time.monotonic()
+            self.last_activity = (
+                time.monotonic()
+            )
 
             try:
 
@@ -788,9 +773,13 @@ class VoiceSession:
                 "Voice changing is disabled."
             )
 
-        normalized = normalize_voice_name(voice)
+        normalized = normalize_voice_name(
+            voice
+        )
 
-        if not is_valid_voice(normalized):
+        if not is_valid_voice(
+            normalized
+        ):
 
             raise ValueError(
                 f"Invalid voice: {voice}"
@@ -798,7 +787,9 @@ class VoiceSession:
 
         self.voice = normalized
 
-        self.engine.set_voice(normalized)
+        self.engine.set_voice(
+            normalized
+        )
 
         if self.character is not None:
 
@@ -820,7 +811,9 @@ class VoiceSession:
         update_character: bool = True,
     ) -> float:
 
-        normalized = normalize_speech_speed(speed)
+        normalized = normalize_speech_speed(
+            speed
+        )
 
         self.speed = normalized
 
@@ -860,7 +853,9 @@ class VoiceSession:
                 character.speed
             )
 
-            self.engine.set_voice(self.voice)
+            self.engine.set_voice(
+                self.voice
+            )
 
         except Exception:
 
@@ -882,7 +877,9 @@ class VoiceSession:
             DEFAULT_SPEECH_SPEED
         )
 
-        self.engine.set_voice(self.voice)
+        self.engine.set_voice(
+            self.voice
+        )
 
     # ========================================================
     # RESET
@@ -904,7 +901,9 @@ class VoiceSession:
 
         self.character = None
 
-        self.engine.set_voice(self.voice)
+        self.engine.set_voice(
+            self.voice
+        )
 
     # ========================================================
     # CLOSE
@@ -930,11 +929,21 @@ class VoiceSession:
 
         try:
 
-            if self.voice_client.is_recording():
-                self.voice_client.stop_recording()
+            if (
+                hasattr(
+                    self.voice_client,
+                    "is_listening",
+                )
+                and self.voice_client.is_listening()
+            ):
+
+                self.voice_client.stop_listening()
 
         except Exception:
-            pass
+
+            logger.exception(
+                "Failed to stop voice listening"
+            )
 
         try:
 
@@ -985,7 +994,9 @@ class VoiceSessionManager:
         guild_id: int,
     ) -> VoiceSession | None:
 
-        return self.sessions.get(guild_id)
+        return self.sessions.get(
+            guild_id
+        )
 
     # ========================================================
     # JOIN
@@ -1003,11 +1014,16 @@ class VoiceSessionManager:
 
         async with self.lock:
 
-            existing = self.sessions.get(guild.id)
+            existing = self.sessions.get(
+                guild.id
+            )
 
             if existing:
 
-                if existing.channel.id != channel.id:
+                if (
+                    existing.channel.id
+                    != channel.id
+                ):
 
                     try:
 
@@ -1026,13 +1042,19 @@ class VoiceSessionManager:
                             None,
                         )
 
-                existing.set_voice(voice)
+                existing.set_voice(
+                    voice
+                )
 
-                existing.set_speed(speed)
+                existing.set_speed(
+                    speed
+                )
 
                 if character is not None:
 
-                    existing.set_character(character)
+                    existing.set_character(
+                        character
+                    )
 
                 return existing
 
@@ -1049,7 +1071,9 @@ class VoiceSessionManager:
                 voice
             )
 
-            if not is_valid_voice(normalized_voice):
+            if not is_valid_voice(
+                normalized_voice
+            ):
 
                 raise ValueError(
                     f"Invalid voice: {voice}"
@@ -1059,34 +1083,53 @@ class VoiceSessionManager:
                 speed
             )
 
+            if VoiceRecvClient is None:
+                raise RuntimeError(
+                    "VoiceRecvClient is unavailable. "
+                    "Check discord-ext-voice-recv-dave installation."
+                )
+
             voice_client = guild.voice_client
 
             if voice_client is None:
 
-                # The DAVE voice-receive extension requires
-                # its VoiceRecvClient to be used.
-                try:
-                    from discord.ext import voice_recv
-
-                    voice_client = await channel.connect(
-                        cls=voice_recv.VoiceRecvClient,
-                        self_deaf=False,
-                        self_mute=False,
-                    )
-                except ImportError:
-                    voice_client = await channel.connect(
-                        self_deaf=False,
-                        self_mute=False,
-                    )
+                voice_client = await channel.connect(
+                    cls=VoiceRecvClient,
+                    self_deaf=False,
+                    self_mute=False,
+                )
 
             else:
 
-                if (
-                    voice_client.channel is None
-                    or voice_client.channel.id != channel.id
+                if not isinstance(
+                    voice_client,
+                    VoiceRecvClient,
                 ):
 
-                    await voice_client.move_to(channel)
+                    try:
+
+                        await voice_client.disconnect(
+                            force=True
+                        )
+
+                    except Exception:
+                        pass
+
+                    voice_client = await channel.connect(
+                        cls=VoiceRecvClient,
+                        self_deaf=False,
+                        self_mute=False,
+                    )
+
+                elif (
+                    voice_client.channel is None
+                    or voice_client.channel.id
+                    != channel.id
+                ):
+
+                    await voice_client.move_to(
+                        channel
+                    )
 
             session = VoiceSession(
                 guild=guild,
@@ -1097,7 +1140,9 @@ class VoiceSessionManager:
                 character=character,
             )
 
-            self.sessions[guild.id] = session
+            self.sessions[
+                guild.id
+            ] = session
 
             try:
 
@@ -1196,7 +1241,9 @@ async def send_voice_list(
     interaction: discord.Interaction,
 ) -> None:
 
-    voices = list(GEMINI_VOICES)
+    voices = list(
+        GEMINI_VOICES
+    )
 
     chunks = []
 
@@ -1207,7 +1254,9 @@ async def send_voice_list(
     ):
 
         chunks.append(
-            voices[index:index + 10]
+            voices[
+                index:index + 10
+            ]
         )
 
     embed = discord.Embed(
@@ -1235,4 +1284,4 @@ async def send_voice_list(
 
     await interaction.response.send_message(
         embed=embed
-        )
+            )
