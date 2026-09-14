@@ -5,11 +5,11 @@
 # Pipeline:
 # Discord PCM
 #     ↓
-# Gemini 2.5 Flash-Lite STT
+# Gemini STT
 #     ↓
-# Gemini 2.5 Flash-Lite AI
+# Gemini Flash-Lite AI
 #     ↓
-# Gemini 2.5 Flash TTS
+# Gemini TTS
 #     ↓
 # Discord PCM
 #
@@ -40,6 +40,7 @@ from config import (
     API_RETRIES,
     API_RETRY_DELAY_SECONDS,
     API_TIMEOUT_SECONDS,
+    CHAT_MODEL,
     DEFAULT_GEMINI_VOICE,
     GEMINI_API_KEY,
     GEMINI_MAX_OUTPUT_TOKENS,
@@ -48,6 +49,8 @@ from config import (
     GEMINI_VOICES,
     MEMORY_ENABLED,
     MAX_MEMORY_MESSAGES,
+    TRANSCRIBE_MODEL,
+    TTS_MODEL,
     normalize_speech_speed,
     normalize_voice_name,
 )
@@ -59,23 +62,16 @@ logger = logging.getLogger(__name__)
 # MODELS
 # ============================================================
 #
-# Intentionally hardcoded here so an old config.py cannot
-# accidentally switch the voice system back to the exhausted
-# gemini-3.5-transcribe model.
+# Models are loaded from config.py -> .env.
 #
-# Google currently lists:
-#   gemini-2.5-flash-lite
-#   gemini-2.5-flash-preview-tts
+# This prevents old hardcoded Gemini 2.5 models from
+# overriding the models selected in the environment.
 #
-# Flash-Lite is used for both:
-#   1. Speech understanding / transcription
-#   2. AI response
-#
-# TTS uses the dedicated Google Gemini TTS model.
+# Recommended:
+#   CHAT_MODEL=gemini-3.5-flash-lite
+#   TRANSCRIBE_MODEL=gemini-3.5-transcribe
+#   TTS_MODEL=gemini-3.1-flash-tts-preview
 # ============================================================
-
-LIGHT_MODEL = "gemini-2.5-flash-lite"
-TTS_MODEL = "gemini-2.5-flash-preview-tts"
 
 
 # ============================================================
@@ -104,7 +100,10 @@ DEFAULT_SPEECH_SPEED = 1.0
 # TEXT HELPERS
 # ============================================================
 
-def _clean_text(value: Any) -> str:
+def _clean_text(
+    value: Any,
+) -> str:
+
     if value is None:
         return ""
 
@@ -121,7 +120,9 @@ def _limit_text(
     maximum: int,
 ) -> str:
 
-    text = _clean_text(text)
+    text = _clean_text(
+        text
+    )
 
     if len(text) <= maximum:
         return text
@@ -133,7 +134,9 @@ def _safe_username(
     username: str,
 ) -> str:
 
-    username = _clean_text(username)
+    username = _clean_text(
+        username
+    )
 
     if not username:
         return "User"
@@ -420,7 +423,9 @@ def _is_retryable_error(
     request caused several pointless requests.
     """
 
-    if _is_quota_error(error):
+    if _is_quota_error(
+        error
+    ):
         return False
 
     text = _error_text(
@@ -625,20 +630,17 @@ class GeminiEngine:
             )
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Force the lightweight models here.
-        # Old config.py model values cannot accidentally
-        # bring back gemini-3.5-transcribe.
+        # Models come from config.py / .env.
         # ----------------------------------------------------
 
         self.chat_model = (
             chat_model
-            or LIGHT_MODEL
+            or CHAT_MODEL
         )
 
         self.transcribe_model = (
             transcribe_model
-            or LIGHT_MODEL
+            or TRANSCRIBE_MODEL
         )
 
         self.tts_model = (
@@ -830,12 +832,7 @@ class GeminiEngine:
             return ""
 
         # ----------------------------------------------------
-        # Use the lightweight multimodal Flash-Lite model.
-        #
-        # We are NOT using gemini-3.5-transcribe anymore.
-        #
-        # The model receives the actual audio and is explicitly
-        # instructed to return only the spoken transcript.
+        # Use the model selected in .env / config.py.
         # ----------------------------------------------------
 
         async def operation():
