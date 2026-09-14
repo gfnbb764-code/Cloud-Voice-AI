@@ -8,7 +8,9 @@
 #     ↓
 # WAV 16kHz mono
 #     ↓
-# Groq Whisper Large V3 Turbo (Arabic forced)
+# Groq Whisper Large V3 (Arabic forced)
+#     ↓
+# Strong Arabic STT validation/filter
 #     ↓
 # Groq GPT-OSS 20B
 #     ↓
@@ -28,6 +30,7 @@ import asyncio
 import audioop
 import logging
 import os
+import re
 import tempfile
 import wave
 from collections import deque
@@ -67,10 +70,11 @@ GROQ_API_KEY = (
 # MODELS
 # ============================================================
 
+# Higher-quality Arabic transcription.
 GROQ_STT_MODEL = os.getenv(
     "GROQ_STT_MODEL",
-    "whisper-large-v3-turbo",
-).strip() or "whisper-large-v3-turbo"
+    "whisper-large-v3",
+).strip() or "whisper-large-v3"
 
 
 GROQ_CHAT_MODEL = os.getenv(
@@ -88,9 +92,6 @@ GROQ_TTS_MODEL = os.getenv(
 # ============================================================
 # GROQ ARABIC TTS VOICES
 # ============================================================
-
-# Your old Gemini-style voice names are kept for compatibility.
-# They are mapped to Groq's Saudi Arabic voices.
 
 GROQ_TTS_VOICE_MAP: dict[str, str] = {
     "Kore": "fahad",
@@ -126,7 +127,6 @@ VALID_GROQ_TTS_VOICES = {
 
 DEFAULT_AUDIO_MIME_TYPE = "audio/wav"
 
-# voice.py expects mono PCM at 24 kHz.
 TTS_OUTPUT_SAMPLE_RATE = 24000
 TTS_OUTPUT_CHANNELS = 1
 TTS_OUTPUT_SAMPLE_WIDTH = 2
@@ -134,8 +134,7 @@ TTS_OUTPUT_SAMPLE_WIDTH = 2
 MAX_TRANSCRIPT_LENGTH = 2500
 MAX_RESPONSE_LENGTH = 1800
 
-# Orpheus Arabic Saudi currently accepts max 200 characters
-# per TTS request.
+# Groq Orpheus Arabic Saudi request limit.
 MAX_TTS_CHARS = 200
 
 VOICE_MEMORY_LIMIT = min(
@@ -144,6 +143,287 @@ VOICE_MEMORY_LIMIT = min(
 )
 
 DEFAULT_SPEECH_SPEED = 1.0
+
+
+# ============================================================
+# STRONG ARABIC STT FILTER
+# ============================================================
+
+_ARABIC_RE = re.compile(
+    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
+)
+
+_LATIN_RE = re.compile(
+    r"[A-Za-zÀ-ÖØ-öø-ÿ]"
+)
+
+_BAD_FOREIGN_CHARS_RE = re.compile(
+    r"[ðþæœÐÞÆŒ]"
+)
+
+_WORD_RE = re.compile(
+    r"\S+"
+)
+
+_REPEAT_PHRASE_RE = re.compile(
+    r"\b(.{1,24})\s+\1\s+\1\b",
+    re.IGNORECASE,
+)
+
+_NOISE_WORDS = {
+    "uh",
+    "um",
+    "umm",
+    "hmm",
+    "hm",
+    "er",
+    "eh",
+    "mmm",
+    "mhm",
+}
+
+_KNOWN_HALLUCINATIONS = (
+    "thank you for watching",
+    "thanks for watching",
+    "subscribe",
+    "subtitles by",
+    "subtitle by",
+    "amara",
+    "copyright",
+    "please subscribe",
+)
+
+
+def _normalize_transcript(
+    text: str,
+) -> str:
+    text = _clean_text(text)
+
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\u200b",
+        "",
+    )
+
+    text = text.replace(
+        "\u200c",
+        "",
+    )
+
+    text = text.replace(
+        "\u200d",
+        "",
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def _arabic_ratio(
+    text: str,
+) -> float:
+
+    letters = re.findall(
+        r"[^\W\d_]",
+        text,
+        re.UNICODE,
+    )
+
+    if not letters:
+        return 0.0
+
+    arabic_count = len(
+        _ARABIC_RE.findall(text)
+    )
+
+    return (
+        arabic_count
+        / max(len(letters), 1)
+    )
+
+
+def _latin_ratio(
+    text: str,
+) -> float:
+
+    letters = re.findall(
+        r"[^\W\d_]",
+        text,
+        re.UNICODE,
+    )
+
+    if not letters:
+        return 0.0
+
+    latin_count = len(
+        _LATIN_RE.findall(text)
+    )
+
+    return (
+        latin_count
+        / max(len(letters), 1)
+    )
+
+
+def _looks_like_bad_transcript(
+    text: str,
+) -> bool:
+
+    text = _normalize_transcript(
+        text
+    )
+
+    if not text:
+        return True
+
+    lowered = text.lower()
+
+    # --------------------------------------------
+    # Noise / filler only
+    # --------------------------------------------
+
+    if lowered in _NOISE_WORDS:
+        return True
+
+    # --------------------------------------------
+    # Known Whisper hallucination patterns
+    # --------------------------------------------
+
+    if any(
+        pattern in lowered
+        for pattern in _KNOWN_HALLUCINATIONS
+    ):
+        return True
+
+    # --------------------------------------------
+    # Suspicious foreign characters
+    # --------------------------------------------
+
+    if _BAD_FOREIGN_CHARS_RE.search(
+        text
+    ):
+        return True
+
+    # --------------------------------------------
+    # Require actual Arabic letters
+    # --------------------------------------------
+
+    arabic_chars = len(
+        _ARABIC_RE.findall(text)
+    )
+
+    if arabic_chars < 2:
+        return True
+
+    # --------------------------------------------
+    # Arabic / Latin balance
+    # --------------------------------------------
+
+    arabic_ratio = _arabic_ratio(
+        text
+    )
+
+    latin_ratio = _latin_ratio(
+        text
+    )
+
+    # Strong rejection of mostly-Latin output.
+    if (
+        arabic_ratio < 0.45
+        and latin_ratio > 0.35
+    ):
+        return True
+
+    # --------------------------------------------
+    # Repeated phrase
+    # --------------------------------------------
+
+    if _REPEAT_PHRASE_RE.search(
+        text
+    ):
+        return True
+
+    # --------------------------------------------
+    # Repeated word abuse
+    # --------------------------------------------
+
+    words = _WORD_RE.findall(
+        text
+    )
+
+    if len(words) >= 5:
+
+        counts: dict[str, int] = {}
+
+        for word in words:
+
+            key = word.strip(
+                "،؛,.!?؟:()[]{}\"'`"
+            )
+
+            if not key:
+                continue
+
+            counts[key] = (
+                counts.get(key, 0)
+                + 1
+            )
+
+        highest = max(
+            counts.values(),
+            default=0,
+        )
+
+        if (
+            highest >= 4
+            and highest / len(words) >= 0.60
+        ):
+            return True
+
+    return False
+
+
+def _filter_transcript(
+    text: str,
+) -> str:
+
+    text = _normalize_transcript(
+        text
+    )
+
+    if _looks_like_bad_transcript(
+        text
+    ):
+
+        logger.warning(
+            "STT rejected by strong filter | transcript=%r",
+            text,
+        )
+
+        return ""
+
+    # Remove repeated whitespace.
+    text = re.sub(
+        r"\s{2,}",
+        " ",
+        text,
+    )
+
+    # Clean duplicated punctuation.
+    text = re.sub(
+        r"([،؛,.!?؟])\1+",
+        r"\1",
+        text,
+    )
+
+    return text.strip()
 
 
 # ============================================================
@@ -382,11 +662,6 @@ def _split_tts_text(
     text: str,
     maximum: int = MAX_TTS_CHARS,
 ) -> list[str]:
-    """
-    Split text into chunks that fit Groq Orpheus' input limit.
-
-    Prefers punctuation and spaces so sentences sound natural.
-    """
 
     text = _clean_text(
         text
@@ -419,26 +694,34 @@ def _split_tts_text(
         split_at = -1
 
         for marker in punctuation:
-            position = window.rfind(marker)
+
+            position = window.rfind(
+                marker
+            )
 
             if position > split_at:
                 split_at = position
 
-        # Avoid tiny chunks.
         if split_at < 80:
-            split_at = window.rfind(" ")
+            split_at = window.rfind(
+                " "
+            )
 
         if split_at < 40:
             split_at = maximum
 
-        chunk = remaining[:split_at].strip()
+        chunk = remaining[
+            :split_at
+        ].strip()
 
         if chunk:
             chunks.append(
                 chunk
             )
 
-        remaining = remaining[split_at:].strip()
+        remaining = remaining[
+            split_at:
+        ].strip()
 
     if remaining:
         chunks.append(
@@ -454,11 +737,10 @@ def _split_tts_text(
 
 class GeminiEngine:
     """
-    Kept under the old class name so main.py and voice.py
-    do not need to be rewritten.
+    Compatibility name retained for main.py / voice.py.
 
     STT:
-        Groq Whisper Large V3 Turbo
+        Groq Whisper Large V3
 
     Chat:
         Groq GPT-OSS 20B
@@ -496,7 +778,6 @@ class GeminiEngine:
             or GROQ_STT_MODEL
         )
 
-        # Actual TTS is Groq Orpheus.
         self.tts_model = (
             tts_model
             or GROQ_TTS_MODEL
@@ -546,7 +827,9 @@ class GeminiEngine:
 
         return normalized
 
-    def _get_tts_voice(self) -> str:
+    def _get_tts_voice(
+        self,
+    ) -> str:
 
         mapped = GROQ_TTS_VOICE_MAP.get(
             self.current_voice
@@ -728,11 +1011,30 @@ class GeminiEngine:
                 audio,
             ),
             model=self.transcribe_model,
-            response_format="json",
-            temperature=0.0,
 
             # Force Arabic.
             language="ar",
+
+            # Deterministic transcription.
+            temperature=0.0,
+
+            # Strong Arabic contextual hint.
+            prompt=(
+                "تفريغ كلام عربي باللهجة السعودية "
+                "والعربية العامية. "
+                "اكتب الكلام كما نُطق بالعربية. "
+                "لا تترجم الكلام. "
+                "لا تكتب العربية بأحرف لاتينية. "
+                "لا تخمن كلامًا غير مسموع. "
+                "إذا كان الصوت غير واضح فلا تضف كلامًا من عندك."
+            ),
+
+            # Needed for confidence/no-speech data.
+            response_format="verbose_json",
+
+            timestamp_granularities=[
+                "segment",
+            ],
         )
 
     async def transcribe(
@@ -752,7 +1054,7 @@ class GeminiEngine:
             operation_name="Groq STT",
         )
 
-        transcript = _clean_text(
+        raw_text = _normalize_transcript(
             getattr(
                 response,
                 "text",
@@ -760,27 +1062,125 @@ class GeminiEngine:
             )
         )
 
-        transcript = _limit_text(
-            transcript,
-            MAX_TRANSCRIPT_LENGTH,
-        )
-
-        if transcript:
-
-            logger.info(
-                "STT successful | model=%s | "
-                "language=ar | transcript=%s",
-                self.transcribe_model,
-                transcript,
-            )
-
-        else:
+        if not raw_text:
 
             logger.warning(
                 "STT returned no transcript"
             )
 
-        return transcript
+            return ""
+
+        # ====================================================
+        # SEGMENT QUALITY FILTER
+        # ====================================================
+
+        segments = getattr(
+            response,
+            "segments",
+            None,
+        ) or []
+
+        valid_segments: list[str] = []
+
+        for segment in segments:
+
+            no_speech_prob = float(
+                getattr(
+                    segment,
+                    "no_speech_prob",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            avg_logprob = float(
+                getattr(
+                    segment,
+                    "avg_logprob",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            segment_text = _normalize_transcript(
+                getattr(
+                    segment,
+                    "text",
+                    "",
+                )
+            )
+
+            if not segment_text:
+                continue
+
+            # Strong silence rejection.
+            if no_speech_prob >= 0.75:
+
+                logger.warning(
+                    "Rejected STT segment | "
+                    "no_speech_prob=%.2f | text=%r",
+                    no_speech_prob,
+                    segment_text,
+                )
+
+                continue
+
+            # Very low-confidence recognition.
+            if avg_logprob < -1.8:
+
+                logger.warning(
+                    "Rejected weak STT segment | "
+                    "avg_logprob=%.2f | text=%r",
+                    avg_logprob,
+                    segment_text,
+                )
+
+                continue
+
+            valid_segments.append(
+                segment_text
+            )
+
+        if valid_segments:
+
+            candidate_text = " ".join(
+                valid_segments
+            )
+
+        else:
+
+            candidate_text = raw_text
+
+        # ====================================================
+        # STRONG ARABIC FILTER
+        # ====================================================
+
+        filtered_text = _filter_transcript(
+            candidate_text
+        )
+
+        filtered_text = _limit_text(
+            filtered_text,
+            MAX_TRANSCRIPT_LENGTH,
+        )
+
+        if not filtered_text:
+
+            logger.warning(
+                "STT rejected completely | raw=%r",
+                raw_text,
+            )
+
+            return ""
+
+        logger.info(
+            "STT successful | model=%s | "
+            "language=ar | filtered=true | transcript=%s",
+            self.transcribe_model,
+            filtered_text,
+        )
+
+        return filtered_text
 
     # ========================================================
     # MEMORY
@@ -969,12 +1369,7 @@ class GeminiEngine:
         return self.client.chat.completions.create(
             model=self.chat_model,
             messages=final_messages,
-
-            # GPT-OSS reasoning is disabled for
-            # fast voice responses and to ensure
-            # the final answer is returned in content.
             include_reasoning=False,
-
             temperature=min(
                 float(
                     os.getenv(
@@ -984,8 +1379,6 @@ class GeminiEngine:
                 ),
                 0.8,
             ),
-
-            # Use completion tokens for GPT-OSS.
             max_completion_tokens=min(
                 int(
                     os.getenv(
@@ -1127,10 +1520,6 @@ class GeminiEngine:
         voice: str,
         speed: float,
     ) -> bytes:
-        """
-        Calls Groq Orpheus Arabic Saudi and returns
-        the response as 24kHz mono PCM16.
-        """
 
         text = _clean_text(
             text
@@ -1139,8 +1528,9 @@ class GeminiEngine:
         if not text:
             return b""
 
-        # Orpheus supports text input up to 200 chars.
-        text = text[:MAX_TTS_CHARS]
+        text = text[
+            :MAX_TTS_CHARS
+        ]
 
         response = self.client.audio.speech.create(
             model=self.tts_model,
@@ -1169,10 +1559,21 @@ class GeminiEngine:
                 "rb",
             ) as wav_file:
 
-                channels = wav_file.getnchannels()
-                sample_width = wav_file.getsampwidth()
-                sample_rate = wav_file.getframerate()
-                frame_count = wav_file.getnframes()
+                channels = (
+                    wav_file.getnchannels()
+                )
+
+                sample_width = (
+                    wav_file.getsampwidth()
+                )
+
+                sample_rate = (
+                    wav_file.getframerate()
+                )
+
+                frame_count = (
+                    wav_file.getnframes()
+                )
 
                 if frame_count <= 0:
                     return b""
@@ -1181,7 +1582,6 @@ class GeminiEngine:
                     frame_count
                 )
 
-            # Convert to 16-bit PCM if needed.
             if sample_width != 2:
 
                 pcm = audioop.lin2lin(
@@ -1192,7 +1592,6 @@ class GeminiEngine:
 
                 sample_width = 2
 
-            # Convert stereo/multi-channel to mono.
             if channels > 1:
 
                 if channels == 2:
@@ -1206,8 +1605,6 @@ class GeminiEngine:
 
                 else:
 
-                    # For uncommon channel counts,
-                    # keep the first channel.
                     pcm = audioop.tomono(
                         pcm,
                         2,
@@ -1217,8 +1614,10 @@ class GeminiEngine:
 
                 channels = 1
 
-            # Resample to the format voice.py expects.
-            if sample_rate != TTS_OUTPUT_SAMPLE_RATE:
+            if (
+                sample_rate
+                != TTS_OUTPUT_SAMPLE_RATE
+            ):
 
                 pcm, _ = audioop.ratecv(
                     pcm,
@@ -1236,6 +1635,7 @@ class GeminiEngine:
             if temp_path:
 
                 try:
+
                     Path(
                         temp_path
                     ).unlink(
@@ -1272,32 +1672,22 @@ class GeminiEngine:
             else self.voice
         )
 
-        selected_speed = normalize_speech_speed(
-            speed
+        selected_speed = (
+            normalize_speech_speed(
+                speed
+            )
         )
 
         groq_voice = self._get_tts_voice()
 
         logger.info(
-            "Groq TTS | model=%s | mapped_voice=%s | "
-            "voice=%s | speed=%.2f",
+            "Groq TTS | model=%s | "
+            "mapped_voice=%s | voice=%s | speed=%.2f",
             self.tts_model,
             selected_voice,
             groq_voice,
             selected_speed,
         )
-
-        # Speed support varies by Groq TTS model/API version.
-        # We keep the public speed setting for compatibility,
-        # but the Saudi Orpheus model currently does not expose
-        # a speed parameter in the documented endpoint.
-        if selected_speed != 1.0:
-
-            logger.info(
-                "TTS speed=%.2f requested; "
-                "Groq Orpheus Saudi endpoint will use native speed.",
-                selected_speed,
-            )
 
         chunks = _split_tts_text(
             text,
@@ -1307,7 +1697,9 @@ class GeminiEngine:
         if not chunks:
             return b""
 
-        output_parts: list[bytes] = []
+        output_parts: list[
+            bytes
+        ] = []
 
         started = (
             asyncio.get_running_loop().time()
@@ -1326,13 +1718,15 @@ class GeminiEngine:
             )
 
             audio = await self._with_retry(
-                lambda chunk=chunk: self._generate_tts_chunk_sync(
-                    chunk,
-                    groq_voice,
-                    selected_speed,
-                ),
+                lambda chunk=chunk:
+                    self._generate_tts_chunk_sync(
+                        chunk,
+                        groq_voice,
+                        selected_speed,
+                    ),
                 operation_name=(
-                    f"Groq TTS chunk {index}/{len(chunks)}"
+                    f"Groq TTS chunk "
+                    f"{index}/{len(chunks)}"
                 ),
             )
 
@@ -1352,7 +1746,8 @@ class GeminiEngine:
 
         logger.info(
             "Groq TTS generated | model=%s | "
-            "voice=%s | chunks=%d | bytes=%d | %.2fs",
+            "voice=%s | chunks=%d | "
+            "bytes=%d | %.2fs",
             self.tts_model,
             groq_voice,
             len(chunks),
@@ -1427,7 +1822,11 @@ class GeminiEngine:
             if not transcript:
 
                 result["error"] = (
-                    "No speech detected."
+                    "Speech rejected by STT filter."
+                )
+
+                logger.warning(
+                    "Voice input rejected by strong STT filter."
                 )
 
                 return result
@@ -1588,6 +1987,7 @@ class GeminiEngine:
                 self.transcribe_model
             ),
             "stt_language": "ar",
+            "stt_filter": "strong",
             "tts_model": self.tts_model,
             "tts_local": False,
             "tts_voice": self._get_tts_voice(),
