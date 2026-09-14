@@ -16,12 +16,13 @@
 # Designed for:
 # - Low Gemini API consumption
 # - NO Gemini TTS quota usage
-# - Local/offline speech synthesis after voice download
+# - Local/offline speech synthesis
 # - Arabic speech
 # - Short voice responses
 # - Per-character personality/style/instructions
 # - Conversation memory
 # - No pointless 429 retries
+# - Non-blocking local TTS
 # ============================================================
 
 from __future__ import annotations
@@ -40,14 +41,13 @@ from google.genai import types
 
 try:
     from piper import PiperVoice
-    from piper.download_voices import download_voice
     from piper.config import SynthesisConfig
+    from piper.download_voices import download_voice
 except ImportError as exc:
     raise RuntimeError(
         "Piper TTS is not installed. "
         "Install piper-tts==1.8.0 from requirements.txt."
     ) from exc
-
 
 from config import (
     AI_SYSTEM_PROMPT,
@@ -74,15 +74,8 @@ logger = logging.getLogger(__name__)
 # LOCAL PIPER SETTINGS
 # ============================================================
 
-# Piper Arabic voice.
-#
-# Piper provides Arabic ar_JO voices. The medium Kareem voice
-# is used here as the default local Arabic TTS model.
-#
-# Piper voice files are downloaded once and then loaded locally.
 PIPER_VOICE_MODEL = "ar_JO-kareem-medium"
 
-# Keep models in a predictable project-local cache directory.
 PIPER_MODEL_DIR = (
     Path(__file__).resolve().parent
     / "piper_models"
@@ -93,24 +86,19 @@ PIPER_MODEL_PATH = (
     / f"{PIPER_VOICE_MODEL}.onnx"
 )
 
-# Prevent multiple concurrent startup/download operations.
-_PIPER_LOAD_LOCK = asyncio.Lock()
-
-# Shared loaded Piper model.
+# One shared Piper model for the whole process.
 _PIPER_VOICE: PiperVoice | None = None
+_PIPER_LOAD_LOCK: asyncio.Lock | None = None
 
-# Piper generates at the model's own sample rate.
-# voice.py expects Gemini-like TTS audio at 24kHz, so we
-# resample Piper output to 24kHz before returning it.
+# Piper's voice is normally 22050Hz for this model.
+# voice.py expects the old TTS interface at 24kHz mono PCM.
 TTS_OUTPUT_SAMPLE_RATE = 24000
 TTS_OUTPUT_CHANNELS = 1
 TTS_OUTPUT_SAMPLE_WIDTH = 2
 
-# Maximum useful voice text.
 MAX_TRANSCRIPT_LENGTH = 2500
 MAX_RESPONSE_LENGTH = 1800
 
-# Keep memory deliberately small.
 VOICE_MEMORY_LIMIT = min(
     max(int(MAX_MEMORY_MESSAGES), 0),
     8,
@@ -118,7 +106,6 @@ VOICE_MEMORY_LIMIT = min(
 
 DEFAULT_SPEECH_SPEED = 1.0
 
-# Local Piper should be represented clearly in logs/stats.
 LOCAL_TTS_NAME = f"piper/{PIPER_VOICE_MODEL}"
 
 
@@ -176,7 +163,7 @@ def _character_value(
     default: Any = None,
 ) -> Any:
     """
-    Supports both Character objects and dictionaries.
+    Supports both Character objects and dicts.
     """
 
     if character is None:
@@ -200,15 +187,14 @@ def _character_value(
     except Exception:
         return default
 
-    return (
-        default
-        if value is None
-        else value
-    )
+    if value is None:
+        return default
+
+    return value
 
 
 # ============================================================
-# RESPONSE TEXT EXTRACTION
+# RESPONSE EXTRACTION
 # ============================================================
 
 def _extract_response_text(
@@ -216,8 +202,6 @@ def _extract_response_text(
 ) -> str:
     """
     Extract normal Gemini text.
-
-    Also supports audio transcription metadata.
     """
 
     results: list[str] = []
@@ -371,12 +355,14 @@ def _is_retryable_error(
     error: Exception,
 ) -> bool:
     """
-    Retry only temporary infrastructure problems.
+    Retry only temporary infrastructure errors.
 
-    429 quota/rate-limit errors are NEVER retried.
+    Never retry quota / rate-limit errors.
     """
 
-    if _is_quota_error(error):
+    if _is_quota_error(
+        error
+    ):
         return False
 
     text = _error_text(
@@ -560,11 +546,7 @@ def _build_character_prompt(
 
 def _ensure_piper_model_sync() -> PiperVoice:
     """
-    Ensure the Arabic Piper voice exists, downloading it once
-    if necessary, then load it.
-
-    This function is intentionally synchronous and is always
-    executed inside asyncio.to_thread().
+    Download the Piper voice once if necessary, then load it.
     """
 
     global _PIPER_VOICE
@@ -577,9 +559,7 @@ def _ensure_piper_model_sync() -> PiperVoice:
         exist_ok=True,
     )
 
-    model_path = PIPER_MODEL_PATH
-
-    if not model_path.exists():
+    if not PIPER_MODEL_PATH.exists():
 
         logger.info(
             "Downloading Piper voice model: %s",
@@ -591,10 +571,10 @@ def _ensure_piper_model_sync() -> PiperVoice:
             PIPER_MODEL_DIR,
         )
 
-    if not model_path.exists():
+    if not PIPER_MODEL_PATH.exists():
         raise RuntimeError(
-            "Piper voice model was not found after download: "
-            f"{model_path}"
+            "Piper model download completed but "
+            f"the model file was not found: {PIPER_MODEL_PATH}"
         )
 
     logger.info(
@@ -603,7 +583,7 @@ def _ensure_piper_model_sync() -> PiperVoice:
     )
 
     _PIPER_VOICE = PiperVoice.load(
-        str(model_path)
+        str(PIPER_MODEL_PATH)
     )
 
     logger.info(
@@ -616,10 +596,15 @@ def _ensure_piper_model_sync() -> PiperVoice:
 
 
 async def _get_piper_voice() -> PiperVoice:
-    global _PIPER_VOICE
+
+    global _PIPER_LOAD_LOCK
 
     if _PIPER_VOICE is not None:
         return _PIPER_VOICE
+
+    # Create the asyncio lock only after an event loop exists.
+    if _PIPER_LOAD_LOCK is None:
+        _PIPER_LOAD_LOCK = asyncio.Lock()
 
     async with _PIPER_LOAD_LOCK:
 
@@ -641,24 +626,25 @@ def _synthesize_piper_sync(
     speed: float,
 ) -> tuple[bytes, int]:
     """
-    Generate a WAV in memory and return:
-        raw PCM bytes
+    Generate WAV in memory and return:
+        raw PCM
         source sample rate
     """
 
     output = io.BytesIO()
 
-    # Piper's length_scale:
-    #   > 1.0 = slower
-    #   < 1.0 = faster
-    #
-    # Speech speed:
-    #   1.0 = normal
-    #
-    length_scale = 1.0 / max(
+    normalized_speed = max(
         0.5,
-        min(2.0, float(speed)),
+        min(
+            2.0,
+            float(speed),
+        ),
     )
+
+    # Piper:
+    #   lower length_scale = faster
+    #   higher length_scale = slower
+    length_scale = 1.0 / normalized_speed
 
     synthesis_config = SynthesisConfig(
         length_scale=length_scale,
@@ -689,18 +675,21 @@ def _synthesize_piper_sync(
         channels = wav_file.getnchannels()
         sample_width = wav_file.getsampwidth()
         sample_rate = wav_file.getframerate()
+
         pcm = wav_file.readframes(
             wav_file.getnframes()
         )
 
     if channels != 1:
         raise RuntimeError(
-            f"Unexpected Piper channel count: {channels}"
+            "Piper returned unexpected channel count: "
+            f"{channels}"
         )
 
     if sample_width != 2:
         raise RuntimeError(
-            f"Unexpected Piper sample width: {sample_width}"
+            "Piper returned unexpected sample width: "
+            f"{sample_width}"
         )
 
     if not pcm:
@@ -769,15 +758,13 @@ class GeminiEngine:
             )
 
         # ----------------------------------------------------
-        # Gemini models:
+        # Gemini:
         #
         # STT  -> TRANSCRIBE_MODEL
         # CHAT -> CHAT_MODEL
         #
-        # TTS is LOCAL Piper.
-        #
-        # tts_model is accepted for compatibility with older
-        # code, but it is intentionally not used for synthesis.
+        # TTS:
+        # LOCAL Piper only.
         # ----------------------------------------------------
 
         self.chat_model = (
@@ -796,17 +783,14 @@ class GeminiEngine:
             api_key=self.api_key
         )
 
-        # ----------------------------------------------------
-        # Voice
-        # ----------------------------------------------------
-
+        # Gemini voice name remains part of the existing
+        # character/UI system.
+        #
+        # Piper currently synthesizes using its local
+        # Kareem Arabic model regardless of Gemini voice name.
         self.current_voice = normalize_voice_name(
             DEFAULT_GEMINI_VOICE
         )
-
-        # ----------------------------------------------------
-        # Small memory
-        # ----------------------------------------------------
 
         self._memory: deque[
             dict[str, str]
@@ -814,13 +798,17 @@ class GeminiEngine:
             maxlen=VOICE_MEMORY_LIMIT
         )
 
-        self._lock = asyncio.Lock()
+        # Memory protection only.
+        #
+        # IMPORTANT:
+        # This lock is NOT held during STT, AI or Piper TTS.
+        # That prevents local TTS from blocking other requests.
+        self._memory_lock = asyncio.Lock()
 
         self.processed_requests = 0
         self.failed_requests = 0
 
         self.quota_exhausted = False
-
 
     # ========================================================
     # VOICE
@@ -831,7 +819,6 @@ class GeminiEngine:
         self,
     ) -> str:
         return self.current_voice
-
 
     def set_voice(
         self,
@@ -851,7 +838,6 @@ class GeminiEngine:
 
         return normalized
 
-
     # ========================================================
     # RETRY
     # ========================================================
@@ -863,9 +849,9 @@ class GeminiEngine:
         operation_name: str = "Gemini request",
     ):
         """
-        Execute a Gemini request.
+        Execute Gemini request.
 
-        429 quota errors are never retried.
+        Quota / 429 errors are never retried.
         """
 
         last_error: Exception | None = None
@@ -881,12 +867,10 @@ class GeminiEngine:
 
             try:
 
-                result = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     operation(),
                     timeout=API_TIMEOUT_SECONDS,
                 )
-
-                return result
 
             except Exception as error:
 
@@ -942,7 +926,6 @@ class GeminiEngine:
         raise RuntimeError(
             f"{operation_name} failed."
         )
-
 
     # ========================================================
     # SPEECH TO TEXT
@@ -1014,7 +997,6 @@ class GeminiEngine:
 
         return transcript
 
-
     # ========================================================
     # MEMORY
     # ========================================================
@@ -1052,6 +1034,17 @@ class GeminiEngine:
             }
         )
 
+    async def _add_memory_async(
+        self,
+        role: str,
+        content: str,
+    ) -> None:
+
+        async with self._memory_lock:
+            self.add_memory(
+                role,
+                content,
+            )
 
     def add_user_message(
         self,
@@ -1063,7 +1056,6 @@ class GeminiEngine:
             content,
         )
 
-
     def add_assistant_message(
         self,
         content: str,
@@ -1074,20 +1066,17 @@ class GeminiEngine:
             content,
         )
 
-
     def clear_memory(
         self,
     ) -> None:
 
         self._memory.clear()
 
-
     def reset_memory(
         self,
     ) -> None:
 
         self.clear_memory()
-
 
     def get_memory(
         self,
@@ -1098,14 +1087,12 @@ class GeminiEngine:
             for item in self._memory
         ]
 
-
     @property
     def memory(
         self,
     ) -> list[dict[str, str]]:
 
         return self.get_memory()
-
 
     def memory_size(
         self,
@@ -1115,6 +1102,12 @@ class GeminiEngine:
             self._memory
         )
 
+    async def _get_memory_snapshot(
+        self,
+    ) -> list[dict[str, str]]:
+
+        async with self._memory_lock:
+            return self.get_memory()
 
     # ========================================================
     # CHAT CONTENT
@@ -1197,7 +1190,6 @@ class GeminiEngine:
 
         return contents
 
-
     # ========================================================
     # AI RESPONSE
     # ========================================================
@@ -1244,6 +1236,9 @@ class GeminiEngine:
             "Do not use code blocks.\n"
             "Do not write long explanations unless explicitly asked."
         )
+
+        if memory is None:
+            memory = await self._get_memory_snapshot()
 
         contents = self._build_chat_contents(
             text,
@@ -1301,9 +1296,8 @@ class GeminiEngine:
 
         return answer
 
-
     # ========================================================
-    # TEXT TO SPEECH — LOCAL PIPER
+    # LOCAL PIPER TTS
     # ========================================================
 
     async def generate_speech(
@@ -1333,8 +1327,6 @@ class GeminiEngine:
             speed
         )
 
-        # The Gemini voice name remains useful to the rest of
-        # the bot/UI, but synthesis itself uses local Piper.
         logger.info(
             "Local Piper TTS | "
             "model=%s | "
@@ -1345,55 +1337,43 @@ class GeminiEngine:
             selected_speed,
         )
 
-        try:
+        piper_voice = await _get_piper_voice()
 
-            piper_voice = await _get_piper_voice()
+        # The CPU-heavy local synthesis runs outside
+        # the asyncio event loop.
+        pcm, source_rate = await asyncio.to_thread(
+            _synthesize_piper_sync,
+            piper_voice,
+            text,
+            selected_speed,
+        )
 
-            pcm, source_rate = await asyncio.to_thread(
-                _synthesize_piper_sync,
-                piper_voice,
-                text,
-                selected_speed,
+        output_pcm = _resample_piper_audio(
+            pcm,
+            source_rate,
+            TTS_OUTPUT_SAMPLE_RATE,
+        )
+
+        if not output_pcm:
+            raise RuntimeError(
+                "Piper returned empty audio."
             )
 
-            output_pcm = _resample_piper_audio(
-                pcm,
-                source_rate,
-                TTS_OUTPUT_SAMPLE_RATE,
-            )
+        logger.info(
+            "Piper TTS generated | "
+            "source_rate=%s | "
+            "output_rate=%s | "
+            "voice=%s | "
+            "speed=%.2f | "
+            "bytes=%s",
+            source_rate,
+            TTS_OUTPUT_SAMPLE_RATE,
+            selected_voice,
+            selected_speed,
+            len(output_pcm),
+        )
 
-            if not output_pcm:
-                raise RuntimeError(
-                    "Piper returned empty audio."
-                )
-
-            logger.info(
-                "Piper TTS generated | "
-                "source_rate=%s | "
-                "output_rate=%s | "
-                "voice=%s | "
-                "speed=%.2f | "
-                "bytes=%s",
-                source_rate,
-                TTS_OUTPUT_SAMPLE_RATE,
-                selected_voice,
-                selected_speed,
-                len(output_pcm),
-            )
-
-            return output_pcm
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-
-            logger.exception(
-                "Local Piper TTS failed"
-            )
-
-            raise
-
+        return output_pcm
 
     # ========================================================
     # COMPLETE VOICE PIPELINE
@@ -1445,142 +1425,148 @@ class GeminiEngine:
 
             return result
 
-        async with self._lock:
+        try:
 
-            try:
+            # ================================================
+            # STT
+            # ================================================
 
-                # ============================================
-                # STT
-                # ============================================
+            transcript = await self.transcribe(
+                audio,
+                mime_type=mime_type,
+            )
 
-                transcript = await self.transcribe(
-                    audio,
-                    mime_type=mime_type,
-                )
+            if not transcript:
 
-                if not transcript:
-
-                    result["error"] = (
-                        "No speech detected."
-                    )
-
-                    return result
-
-                result["transcript"] = transcript
-
-                # ============================================
-                # MEMORY — USER
-                # ============================================
-
-                self.add_user_message(
-                    f"{_safe_username(username)}: "
-                    f"{transcript}"
-                )
-
-                # ============================================
-                # AI
-                # ============================================
-
-                response = await self.generate_response(
-                    transcript,
-                    username=username,
-                    memory=memory,
-                    character=character,
-                    system_prompt=system_prompt,
-                )
-
-                if not response:
-
-                    result["error"] = (
-                        "AI returned an empty response."
-                    )
-
-                    return result
-
-                result["response"] = response
-
-                # ============================================
-                # MEMORY — ASSISTANT
-                # ============================================
-
-                self.add_assistant_message(
-                    response
-                )
-
-                # ============================================
-                # LOCAL PIPER TTS
-                # ============================================
-
-                selected_voice = (
-                    self.set_voice(
-                        voice
-                    )
-                    if voice
-                    else self.voice
-                )
-
-                result["voice"] = selected_voice
-
-                speech = await self.generate_speech(
-                    response,
-                    voice=selected_voice,
-                    speed=speed,
-                )
-
-                result["audio"] = speech
-
-                result["success"] = True
-
-                self.processed_requests += 1
-
-                logger.info(
-                    "Voice pipeline completed | "
-                    "user=%s | "
-                    "stt=%s | "
-                    "chat=%s | "
-                    "tts=%s | "
-                    "voice=%s | "
-                    "speed=%.2f",
-                    username,
-                    self.transcribe_model,
-                    self.chat_model,
-                    LOCAL_TTS_NAME,
-                    selected_voice,
-                    normalize_speech_speed(
-                        speed
-                    ),
+                result["error"] = (
+                    "No speech detected."
                 )
 
                 return result
 
-            except asyncio.CancelledError:
-                raise
+            result["transcript"] = transcript
 
-            except Exception as error:
+            # ================================================
+            # MEMORY SNAPSHOT
+            # ================================================
 
-                self.failed_requests += 1
+            if memory is None:
+                memory = await self._get_memory_snapshot()
 
-                result["error"] = str(
-                    error
+            # ================================================
+            # MEMORY — USER
+            # ================================================
+
+            await self._add_memory_async(
+                "user",
+                f"{_safe_username(username)}: "
+                f"{transcript}",
+            )
+
+            # ================================================
+            # AI
+            # ================================================
+
+            response = await self.generate_response(
+                transcript,
+                username=username,
+                memory=memory,
+                character=character,
+                system_prompt=system_prompt,
+            )
+
+            if not response:
+
+                result["error"] = (
+                    "AI returned an empty response."
                 )
-
-                if _is_quota_error(
-                    error
-                ):
-
-                    logger.error(
-                        "Voice AI stopped because "
-                        "Gemini quota is exhausted."
-                    )
-
-                else:
-
-                    logger.exception(
-                        "Voice pipeline failed"
-                    )
 
                 return result
 
+            result["response"] = response
+
+            # ================================================
+            # MEMORY — ASSISTANT
+            # ================================================
+
+            await self._add_memory_async(
+                "assistant",
+                response,
+            )
+
+            # ================================================
+            # LOCAL PIPER TTS
+            # ================================================
+
+            selected_voice = (
+                self.set_voice(
+                    voice
+                )
+                if voice
+                else self.voice
+            )
+
+            result["voice"] = selected_voice
+
+            speech = await self.generate_speech(
+                response,
+                voice=selected_voice,
+                speed=speed,
+            )
+
+            result["audio"] = speech
+
+            result["success"] = True
+
+            self.processed_requests += 1
+
+            logger.info(
+                "Voice pipeline completed | "
+                "user=%s | "
+                "stt=%s | "
+                "chat=%s | "
+                "tts=%s | "
+                "voice=%s | "
+                "speed=%.2f",
+                username,
+                self.transcribe_model,
+                self.chat_model,
+                LOCAL_TTS_NAME,
+                selected_voice,
+                normalize_speech_speed(
+                    speed
+                ),
+            )
+
+            return result
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+
+            self.failed_requests += 1
+
+            result["error"] = str(
+                error
+            )
+
+            if _is_quota_error(
+                error
+            ):
+
+                logger.error(
+                    "Voice AI stopped because "
+                    "Gemini quota is exhausted."
+                )
+
+            else:
+
+                logger.exception(
+                    "Voice pipeline failed"
+                )
+
+            return result
 
     # ========================================================
     # STATS
@@ -1609,8 +1595,9 @@ class GeminiEngine:
                 self.transcribe_model
             ),
             "tts_model": LOCAL_TTS_NAME,
+            "tts_local": True,
+            "piper_voice": PIPER_VOICE_MODEL,
         }
-
 
     # ========================================================
     # CLOSE
