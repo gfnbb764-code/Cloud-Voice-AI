@@ -1,4 +1,3 @@
-```python
 # main.py
 # ============================================================
 # Cloud Voice AI — Main Discord Bot
@@ -2915,4 +2914,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
