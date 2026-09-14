@@ -310,11 +310,9 @@ class CharacterManager:
                 "characters": {
                     guild_id: {
                         key: character.to_dict()
-                        for key, character
-                        in items.items()
+                        for key, character in items.items()
                     }
-                    for guild_id, items
-                    in self.characters.items()
+                    for guild_id, items in self.characters.items()
                 },
                 "selected": self.selected,
             }
@@ -686,8 +684,6 @@ class CloudVoiceBot(commands.Bot):
             intents=intents,
         )
 
-        # IMPORTANT:
-        # VoiceSessionManager now requires the bot instance.
         self.voice_manager = VoiceSessionManager(
             self
         )
@@ -809,7 +805,6 @@ class CloudVoiceBot(commands.Bot):
             "Shutting down Cloud Voice AI..."
         )
 
-        # voice.py exposes close_all(), not disconnect_all().
         await self.voice_manager.close_all()
 
         await super().close()
@@ -845,6 +840,60 @@ async def voice_autocomplete(
         )
         for voice in matches[:25]
     ]
+
+
+# ============================================================
+# CHARACTER AUTOCOMPLETE
+# ============================================================
+
+async def character_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+
+    if interaction.guild is None:
+        return []
+
+    current = current.strip().lower()
+
+    characters = bot.character_manager.list(
+        interaction.guild.id
+    )
+
+    selected = bot.character_manager.get_selected(
+        interaction.guild.id
+    )
+
+    matches: list[app_commands.Choice[str]] = []
+
+    for character in characters:
+
+        if (
+            current
+            and current not in character.name.lower()
+        ):
+            continue
+
+        marker = (
+            "🟢 "
+            if (
+                selected
+                and selected.name.lower()
+                == character.name.lower()
+            )
+            else ""
+        )
+
+        matches.append(
+            app_commands.Choice(
+                name=(
+                    f"{marker}{character.name}"
+                )[:100],
+                value=character.name,
+            )
+        )
+
+    return matches[:25]
 
 
 # ============================================================
@@ -1305,7 +1354,6 @@ async def speed(
             speed=new_speed,
         )
 
-        # Keep the live character synchronized.
         session.set_character(
             bot.character_manager.get(
                 interaction.guild.id,
@@ -1438,7 +1486,8 @@ async def character_create(
     instructions="التعليمات الجديدة",
 )
 @app_commands.autocomplete(
-    voice=voice_autocomplete
+    voice=voice_autocomplete,
+    character=character_autocomplete,
 )
 async def character_edit(
     interaction: discord.Interaction,
@@ -1523,8 +1572,6 @@ async def character_edit(
                 live_character
             )
 
-            # If the edited character is currently active,
-            # immediately apply voice/speed too.
             if live_character:
 
                 session.voice_name = (
@@ -1552,7 +1599,10 @@ async def character_edit(
     description=COMMAND_DESCRIPTIONS["character_select"],
 )
 @app_commands.describe(
-    character="اسم الشخصية",
+    character="اختر الشخصية",
+)
+@app_commands.autocomplete(
+    character=character_autocomplete,
 )
 async def character_select(
     interaction: discord.Interaction,
@@ -1575,11 +1625,28 @@ async def character_select(
         )
         return
 
+    # ========================================================
+    # Verify the character belongs to this guild.
+    # ========================================================
+
+    selected_character = bot.character_manager.get(
+        interaction.guild.id,
+        character,
+    )
+
+    if selected_character is None:
+
+        await interaction.response.send_message(
+            "❌ اختر شخصية موجودة في هذا السيرفر من القائمة.",
+            ephemeral=True,
+        )
+        return
+
     try:
 
         selected = await bot.character_manager.select(
             interaction.guild.id,
-            character,
+            selected_character.name,
         )
 
         session = bot.voice_manager.get(
@@ -1592,12 +1659,17 @@ async def character_select(
                 selected
             )
 
-            session.voice_name = selected.voice
-            session.speech_speed = selected.speed
+            session.voice_name = (
+                selected.voice
+            )
+
+            session.speech_speed = (
+                selected.speed
+            )
 
         await interaction.response.send_message(
             (
-                f"🤖 تم اختيار **{selected.name}**.\n"
+                f"🤖 تم اختيار الشخصية **{selected.name}**!\n"
                 f"🔊 الصوت: **{selected.voice}**\n"
                 f"⚡ السرعة: **{selected.speed:.2f}x**"
             )
@@ -1605,8 +1677,12 @@ async def character_select(
 
     except Exception as error:
 
+        logger.exception(
+            "Character selection failed"
+        )
+
         await interaction.response.send_message(
-            f"❌ {error}",
+            f"❌ فشل اختيار الشخصية: `{error}`",
             ephemeral=True,
         )
 
@@ -1687,6 +1763,9 @@ async def character_list(
 )
 @app_commands.describe(
     character="اسم الشخصية",
+)
+@app_commands.autocomplete(
+    character=character_autocomplete,
 )
 async def character_view(
     interaction: discord.Interaction,
@@ -1769,6 +1848,9 @@ async def character_view(
 @app_commands.describe(
     character="اسم الشخصية",
 )
+@app_commands.autocomplete(
+    character=character_autocomplete,
+)
 async def character_delete(
     interaction: discord.Interaction,
     character: str,
@@ -1812,7 +1894,6 @@ async def character_delete(
                 None
             )
 
-            # Return live session to default settings.
             session.voice_name = (
                 DEFAULT_GEMINI_VOICE
             )
