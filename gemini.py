@@ -1,6 +1,6 @@
 # gemini.py
 # ============================================================
-# Cloud Voice AI — Groq STT + Groq Chat + Groq Saudi TTS
+# Cloud Voice AI — Groq STT + Anthropic Claude + Groq Saudi TTS
 #
 # Pipeline:
 #
@@ -8,11 +8,11 @@
 #     ↓
 # WAV 16kHz mono
 #     ↓
-# Groq Whisper Large V3 (Arabic forced)
+# Groq Whisper Large V3
 #     ↓
 # Strong Arabic STT validation/filter
 #     ↓
-# Groq GPT-OSS 20B
+# Anthropic Claude Haiku 4.5
 #     ↓
 # Groq Orpheus Arabic Saudi TTS
 #     ↓
@@ -22,6 +22,7 @@
 #
 # Gemini is no longer used by this file.
 # Piper is completely removed.
+# GPT-OSS is completely removed.
 # ============================================================
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
+import anthropic
 from groq import Groq
 
 from config import (
@@ -65,24 +67,31 @@ GROQ_API_KEY = (
     or ""
 ).strip()
 
+ANTHROPIC_API_KEY = (
+    os.getenv("ANTHROPIC_API_KEY", "")
+    or ""
+).strip()
+
 
 # ============================================================
 # MODELS
 # ============================================================
 
-# Higher-quality Arabic transcription.
+# Speech-to-text
 GROQ_STT_MODEL = os.getenv(
     "GROQ_STT_MODEL",
     "whisper-large-v3",
 ).strip() or "whisper-large-v3"
 
 
-GROQ_CHAT_MODEL = os.getenv(
-    "GROQ_CHAT_MODEL",
-    "openai/gpt-oss-20b",
-).strip() or "openai/gpt-oss-20b"
+# Claude
+ANTHROPIC_CHAT_MODEL = os.getenv(
+    "ANTHROPIC_CHAT_MODEL",
+    "claude-haiku-4-5-20251001",
+).strip() or "claude-haiku-4-5-20251001"
 
 
+# Saudi Arabic TTS
 GROQ_TTS_MODEL = os.getenv(
     "GROQ_TTS_MODEL",
     "canopylabs/orpheus-arabic-saudi",
@@ -92,6 +101,9 @@ GROQ_TTS_MODEL = os.getenv(
 # ============================================================
 # GROQ ARABIC TTS VOICES
 # ============================================================
+
+# Old Gemini-style names are retained for compatibility
+# with the existing UI and character system.
 
 GROQ_TTS_VOICE_MAP: dict[str, str] = {
     "Kore": "fahad",
@@ -127,6 +139,7 @@ VALID_GROQ_TTS_VOICES = {
 
 DEFAULT_AUDIO_MIME_TYPE = "audio/wav"
 
+# voice.py expects mono PCM at 24 kHz.
 TTS_OUTPUT_SAMPLE_RATE = 24000
 TTS_OUTPUT_CHANNELS = 1
 TTS_OUTPUT_SAMPLE_WIDTH = 2
@@ -194,38 +207,6 @@ _KNOWN_HALLUCINATIONS = (
 )
 
 
-def _normalize_transcript(
-    text: str,
-) -> str:
-    text = _clean_text(text)
-
-    if not text:
-        return ""
-
-    text = text.replace(
-        "\u200b",
-        "",
-    )
-
-    text = text.replace(
-        "\u200c",
-        "",
-    )
-
-    text = text.replace(
-        "\u200d",
-        "",
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
-    return text.strip()
-
-
 def _arabic_ratio(
     text: str,
 ) -> float:
@@ -272,6 +253,41 @@ def _latin_ratio(
     )
 
 
+def _normalize_transcript(
+    text: str,
+) -> str:
+
+    text = _clean_text(
+        text
+    )
+
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\u200b",
+        "",
+    )
+
+    text = text.replace(
+        "\u200c",
+        "",
+    )
+
+    text = text.replace(
+        "\u200d",
+        "",
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
 def _looks_like_bad_transcript(
     text: str,
 ) -> bool:
@@ -285,46 +301,30 @@ def _looks_like_bad_transcript(
 
     lowered = text.lower()
 
-    # --------------------------------------------
-    # Noise / filler only
-    # --------------------------------------------
-
+    # Pure noise/fillers.
     if lowered in _NOISE_WORDS:
         return True
 
-    # --------------------------------------------
-    # Known Whisper hallucination patterns
-    # --------------------------------------------
-
+    # Common Whisper hallucination phrases.
     if any(
         pattern in lowered
         for pattern in _KNOWN_HALLUCINATIONS
     ):
         return True
 
-    # --------------------------------------------
-    # Suspicious foreign characters
-    # --------------------------------------------
-
+    # Suspicious foreign characters.
     if _BAD_FOREIGN_CHARS_RE.search(
         text
     ):
         return True
 
-    # --------------------------------------------
-    # Require actual Arabic letters
-    # --------------------------------------------
-
+    # Require real Arabic content.
     arabic_chars = len(
         _ARABIC_RE.findall(text)
     )
 
     if arabic_chars < 2:
         return True
-
-    # --------------------------------------------
-    # Arabic / Latin balance
-    # --------------------------------------------
 
     arabic_ratio = _arabic_ratio(
         text
@@ -334,26 +334,20 @@ def _looks_like_bad_transcript(
         text
     )
 
-    # Strong rejection of mostly-Latin output.
+    # Reject mostly Latin/foreign output.
     if (
         arabic_ratio < 0.45
         and latin_ratio > 0.35
     ):
         return True
 
-    # --------------------------------------------
-    # Repeated phrase
-    # --------------------------------------------
-
+    # Repeated phrase detection.
     if _REPEAT_PHRASE_RE.search(
         text
     ):
         return True
 
-    # --------------------------------------------
-    # Repeated word abuse
-    # --------------------------------------------
-
+    # Excessive repeated word detection.
     words = _WORD_RE.findall(
         text
     )
@@ -409,14 +403,12 @@ def _filter_transcript(
 
         return ""
 
-    # Remove repeated whitespace.
     text = re.sub(
         r"\s{2,}",
         " ",
         text,
     )
 
-    # Clean duplicated punctuation.
     text = re.sub(
         r"([،؛,.!?؟])\1+",
         r"\1",
@@ -597,7 +589,7 @@ def _build_character_prompt(
 
 
 # ============================================================
-# TEXT CLEANUP FOR VOICE
+# VOICE TEXT CLEANUP
 # ============================================================
 
 def _strip_markdown_for_voice(
@@ -732,7 +724,7 @@ def _split_tts_text(
 
 
 # ============================================================
-# GROQ ENGINE
+# ENGINE
 # ============================================================
 
 class GeminiEngine:
@@ -743,7 +735,7 @@ class GeminiEngine:
         Groq Whisper Large V3
 
     Chat:
-        Groq GPT-OSS 20B
+        Anthropic Claude Haiku 4.5
 
     TTS:
         Groq Orpheus Arabic Saudi
@@ -758,19 +750,24 @@ class GeminiEngine:
         tts_model: str | None = None,
     ) -> None:
 
-        self.api_key = (
+        self.groq_api_key = (
             api_key
             or GROQ_API_KEY
         ).strip()
 
-        if not self.api_key:
+        if not self.groq_api_key:
             raise RuntimeError(
                 "GROQ_API_KEY is missing."
             )
 
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is missing."
+            )
+
         self.chat_model = (
             chat_model
-            or GROQ_CHAT_MODEL
+            or ANTHROPIC_CHAT_MODEL
         )
 
         self.transcribe_model = (
@@ -783,8 +780,12 @@ class GeminiEngine:
             or GROQ_TTS_MODEL
         )
 
-        self.client = Groq(
-            api_key=self.api_key
+        self.groq = Groq(
+            api_key=self.groq_api_key
+        )
+
+        self.anthropic = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY
         )
 
         self.current_voice = normalize_voice_name(
@@ -1005,20 +1006,14 @@ class GeminiEngine:
         audio: bytes,
     ):
 
-        return self.client.audio.transcriptions.create(
+        return self.groq.audio.transcriptions.create(
             file=(
                 "discord_audio.wav",
                 audio,
             ),
             model=self.transcribe_model,
-
-            # Force Arabic.
             language="ar",
-
-            # Deterministic transcription.
             temperature=0.0,
-
-            # Strong Arabic contextual hint.
             prompt=(
                 "تفريغ كلام عربي باللهجة السعودية "
                 "والعربية العامية. "
@@ -1028,10 +1023,7 @@ class GeminiEngine:
                 "لا تخمن كلامًا غير مسموع. "
                 "إذا كان الصوت غير واضح فلا تضف كلامًا من عندك."
             ),
-
-            # Needed for confidence/no-speech data.
             response_format="verbose_json",
-
             timestamp_granularities=[
                 "segment",
             ],
@@ -1069,10 +1061,6 @@ class GeminiEngine:
             )
 
             return ""
-
-        # ====================================================
-        # SEGMENT QUALITY FILTER
-        # ====================================================
 
         segments = getattr(
             response,
@@ -1113,7 +1101,6 @@ class GeminiEngine:
             if not segment_text:
                 continue
 
-            # Strong silence rejection.
             if no_speech_prob >= 0.75:
 
                 logger.warning(
@@ -1125,7 +1112,6 @@ class GeminiEngine:
 
                 continue
 
-            # Very low-confidence recognition.
             if avg_logprob < -1.8:
 
                 logger.warning(
@@ -1150,10 +1136,6 @@ class GeminiEngine:
         else:
 
             candidate_text = raw_text
-
-        # ====================================================
-        # STRONG ARABIC FILTER
-        # ====================================================
 
         filtered_text = _filter_transcript(
             candidate_text
@@ -1211,6 +1193,9 @@ class GeminiEngine:
             "model",
         }:
             role = "user"
+
+        if role == "model":
+            role = "assistant"
 
         self._memory.append(
             {
@@ -1276,7 +1261,7 @@ class GeminiEngine:
         )
 
     # ========================================================
-    # CHAT MESSAGES
+    # ANTHROPIC MESSAGES
     # ========================================================
 
     def _build_chat_messages(
@@ -1315,20 +1300,15 @@ class GeminiEngine:
             if not content:
                 continue
 
-            if role in {
+            if role not in {
+                "user",
                 "assistant",
-                "model",
             }:
-
-                sdk_role = "assistant"
-
-            else:
-
-                sdk_role = "user"
+                role = "user"
 
             messages.append(
                 {
-                    "role": sdk_role,
+                    "role": role,
                     "content": _limit_text(
                         content,
                         800,
@@ -1349,7 +1329,7 @@ class GeminiEngine:
         return messages
 
     # ========================================================
-    # CHAT
+    # CLAUDE CHAT
     # ========================================================
 
     def _generate_response_sync(
@@ -1358,36 +1338,19 @@ class GeminiEngine:
         system_prompt: str,
     ):
 
-        final_messages = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            *messages,
-        ]
-
-        return self.client.chat.completions.create(
+        return self.anthropic.messages.create(
             model=self.chat_model,
-            messages=final_messages,
-            include_reasoning=False,
-            temperature=min(
-                float(
-                    os.getenv(
-                        "GEMINI_TEMPERATURE",
-                        "0.75",
-                    )
-                ),
-                0.8,
-            ),
-            max_completion_tokens=min(
+            max_tokens=min(
                 int(
                     os.getenv(
-                        "GEMINI_MAX_OUTPUT_TOKENS",
-                        "700",
+                        "ANTHROPIC_MAX_OUTPUT_TOKENS",
+                        "500",
                     )
                 ),
-                512,
+                700,
             ),
+            system=system_prompt,
+            messages=messages,
         )
 
     async def generate_response(
@@ -1430,9 +1393,12 @@ class GeminiEngine:
             "Usually answer in 1-3 short sentences.\n"
             "Match the user's language.\n"
             "If the user speaks Arabic, respond in Arabic.\n"
+            "Use Saudi/Gulf Arabic naturally when appropriate.\n"
             "Do not use markdown.\n"
             "Do not use code blocks.\n"
-            "Do not write long explanations unless explicitly asked."
+            "Do not write long explanations unless explicitly asked.\n"
+            "Return only the final answer intended for the user.\n"
+            "Do not output analysis, reasoning, or hidden thoughts."
         )
 
         messages = self._build_chat_messages(
@@ -1446,43 +1412,52 @@ class GeminiEngine:
                 messages,
                 final_system_prompt,
             ),
-            operation_name="Groq AI",
+            operation_name="Anthropic Claude",
         )
 
-        answer = ""
+        answer_parts: list[str] = []
 
         try:
 
-            choices = (
+            content_blocks = (
                 getattr(
                     response,
-                    "choices",
+                    "content",
                     None,
                 )
                 or []
             )
 
-            if choices:
+            for block in content_blocks:
 
-                message = getattr(
-                    choices[0],
-                    "message",
-                    None,
-                )
+                if getattr(
+                    block,
+                    "type",
+                    "",
+                ) == "text":
 
-                answer = _clean_text(
-                    getattr(
-                        message,
-                        "content",
-                        "",
+                    block_text = _clean_text(
+                        getattr(
+                            block,
+                            "text",
+                            "",
+                        )
                     )
-                )
+
+                    if block_text:
+                        answer_parts.append(
+                            block_text
+                        )
 
         except Exception:
 
             logger.exception(
-                "Failed to extract Groq response"
+                "Failed to extract Claude response"
             )
+
+        answer = " ".join(
+            answer_parts
+        ).strip()
 
         answer = _limit_text(
             answer,
@@ -1504,7 +1479,7 @@ class GeminiEngine:
         else:
 
             logger.warning(
-                "AI returned an empty response | model=%s",
+                "Claude returned an empty response | model=%s",
                 self.chat_model,
             )
 
@@ -1532,7 +1507,7 @@ class GeminiEngine:
             :MAX_TTS_CHARS
         ]
 
-        response = self.client.audio.speech.create(
+        response = self.groq.audio.speech.create(
             model=self.tts_model,
             voice=voice,
             input=text,
@@ -1590,8 +1565,6 @@ class GeminiEngine:
                     2,
                 )
 
-                sample_width = 2
-
             if channels > 1:
 
                 if channels == 2:
@@ -1611,8 +1584,6 @@ class GeminiEngine:
                         1.0,
                         0.0,
                     )
-
-                channels = 1
 
             if (
                 sample_rate
@@ -1845,7 +1816,7 @@ class GeminiEngine:
             )
 
             # ==================================================
-            # AI
+            # CLAUDE
             # ==================================================
 
             response = (
@@ -1861,7 +1832,7 @@ class GeminiEngine:
             if not response:
 
                 result["error"] = (
-                    "AI returned an empty response."
+                    "Claude returned an empty response."
                 )
 
                 return result
@@ -1949,7 +1920,7 @@ class GeminiEngine:
                 self.quota_exhausted = True
 
                 logger.error(
-                    "Groq rate limit/quota reached."
+                    "API rate limit/quota reached."
                 )
 
             else:
@@ -1982,12 +1953,15 @@ class GeminiEngine:
             "quota_exhausted": (
                 self.quota_exhausted
             ),
+            "chat_provider": "Anthropic",
             "chat_model": self.chat_model,
+            "transcribe_provider": "Groq",
             "transcribe_model": (
                 self.transcribe_model
             ),
             "stt_language": "ar",
             "stt_filter": "strong",
+            "tts_provider": "Groq",
             "tts_model": self.tts_model,
             "tts_local": False,
             "tts_voice": self._get_tts_voice(),
@@ -2001,7 +1975,8 @@ class GeminiEngine:
         self,
     ) -> None:
 
-        self.client = None
+        self.groq = None
+        self.anthropic = None
 
 
 # ============================================================
