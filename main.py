@@ -1,7 +1,7 @@
-# ============================================================
 # main.py
-# Cloud Voice AI — Gemini Discord AI Voice Bot
-# FINAL SLASH COMMAND VERSION
+# ============================================================
+# Cloud Voice AI — Discord Bot
+# Main Application
 # ============================================================
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict, deque
 from typing import Optional
 
 import discord
@@ -19,124 +18,31 @@ from discord.ext import commands
 from config import (
     PROJECT_NAME,
     PROJECT_VERSION,
-
+    PROJECT_DESCRIPTION,
+    PROJECT_AUTHOR,
     DISCORD_TOKEN,
+    DISCORD_PREFIX,
+    DISCORD_OWNER_ID,
+    DISCORD_GUILD_ID,
     DISCORD_STATUS,
-
+    DISCORD_ACTIVITY_TYPE,
+    DISCORD_SHARD_COUNT,
     DEFAULT_GEMINI_VOICE,
     GEMINI_VOICES,
-
-    MAX_MEMORY_MESSAGES,
     MEMORY_ENABLED,
-
+    MAX_MEMORY_MESSAGES,
+    COMMAND_DESCRIPTIONS,
     DEBUG,
     LOG_LEVEL,
-
     normalize_voice_name,
     is_valid_voice,
 )
 
-
-# ============================================================
-# CONFIG COMPATIBILITY
-# ============================================================
-
-# بعض الإصدارات القديمة من config.py كانت تستخدم DEFAULT_VOICE.
-# النسخة الحالية تستخدم DEFAULT_GEMINI_VOICE.
-DEFAULT_VOICE = DEFAULT_GEMINI_VOICE
-
-# حد الجلسات على مستوى السيرفر.
-# يمكن تغييره من .env.
-def _get_positive_int_env(
-    name: str,
-    default: int,
-) -> int:
-    import os
-
-    raw = os.getenv(name)
-
-    if raw is None:
-        return default
-
-    try:
-        return max(1, int(raw.strip()))
-    except (TypeError, ValueError):
-        return default
-
-
-def _get_bool_env(
-    name: str,
-    default: bool,
-) -> bool:
-    import os
-
-    raw = os.getenv(name)
-
-    if raw is None:
-        return default
-
-    return raw.strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-        "enabled",
-    }
-
-
-MAX_GUILD_SESSIONS = _get_positive_int_env(
-    "MAX_GUILD_SESSIONS",
-    25,
+from voice import (
+    VoiceSession,
+    VoiceSessionManager,
+    send_voice_list,
 )
-
-ALLOW_VOICE_CHANGE = _get_bool_env(
-    "ALLOW_VOICE_CHANGE",
-    True,
-)
-
-
-# ============================================================
-# CONFIG VALIDATION
-# ============================================================
-
-def validate_startup_config() -> None:
-    """
-    Validate only what main.py requires.
-
-    config.py already validates required environment variables
-    when imported. This function adds compatibility checks
-    without assuming a particular return type from config.py.
-    """
-
-    if not DISCORD_TOKEN:
-        raise RuntimeError(
-            "DISCORD_TOKEN is missing."
-        )
-
-    if not DEFAULT_VOICE:
-        raise RuntimeError(
-            "DEFAULT_VOICE is missing."
-        )
-
-    if not is_valid_voice(
-        DEFAULT_VOICE
-    ):
-        raise RuntimeError(
-            f"Invalid default Gemini voice: {DEFAULT_VOICE}"
-        )
-
-    if MAX_GUILD_SESSIONS < 1:
-        raise RuntimeError(
-            "MAX_GUILD_SESSIONS must be at least 1."
-        )
-
-
-# ============================================================
-# VOICE IMPORT
-# ============================================================
-
-from voice import VoiceSession
 
 
 # ============================================================
@@ -157,112 +63,230 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(
-    "CloudVoiceAI"
-)
+logger = logging.getLogger("cloud_voice_ai")
+
+
+if DEBUG:
+    logger.setLevel(logging.DEBUG)
 
 
 # ============================================================
-# INTENTS
+# CONSTANTS
 # ============================================================
 
-intents = discord.Intents.default()
+BOT_START_TIME = time.time()
 
-intents.guilds = True
-intents.voice_states = True
-intents.messages = True
-intents.message_content = False
+MAX_DISCORD_MESSAGE_LENGTH = 1900
+
+VOICE_ACTIVITY_TYPES = {
+    "playing": discord.ActivityType.playing,
+    "streaming": discord.ActivityType.streaming,
+    "listening": discord.ActivityType.listening,
+    "watching": discord.ActivityType.watching,
+    "custom": discord.ActivityType.custom,
+    "competing": discord.ActivityType.competing,
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def format_uptime(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+
+    parts: list[str] = []
+
+    if days:
+        parts.append(f"{days}d")
+
+    if hours:
+        parts.append(f"{hours}h")
+
+    if minutes:
+        parts.append(f"{minutes}m")
+
+    parts.append(f"{seconds}s")
+
+    return " ".join(parts)
+
+
+def truncate_text(
+    text: str,
+    limit: int = MAX_DISCORD_MESSAGE_LENGTH,
+) -> str:
+
+    if len(text) <= limit:
+        return text
+
+    return text[: limit - 3] + "..."
+
+
+def get_user_voice_channel(
+    interaction: discord.Interaction,
+) -> Optional[discord.VoiceChannel]:
+
+    if not interaction.guild:
+        return None
+
+    member = interaction.guild.get_member(
+        interaction.user.id
+    )
+
+    if member is None:
+        return None
+
+    channel = member.voice.channel if member.voice else None
+
+    if isinstance(channel, discord.VoiceChannel):
+        return channel
+
+    return None
+
+
+def make_activity() -> discord.Activity:
+    activity_type = DISCORD_ACTIVITY_TYPE.lower().strip()
+
+    if activity_type == "streaming":
+        return discord.Streaming(
+            name=DISCORD_STATUS,
+            url="https://www.twitch.tv/",
+        )
+
+    activity_enum = VOICE_ACTIVITY_TYPES.get(
+        activity_type,
+        discord.ActivityType.listening,
+    )
+
+    return discord.Activity(
+        type=activity_enum,
+        name=DISCORD_STATUS,
+    )
+
+
+def is_owner(
+    interaction: discord.Interaction,
+) -> bool:
+
+    if not DISCORD_OWNER_ID:
+        return False
+
+    return interaction.user.id == DISCORD_OWNER_ID
+
+
+def is_guild_command(
+    interaction: discord.Interaction,
+) -> bool:
+
+    return interaction.guild is not None
 
 
 # ============================================================
 # BOT
 # ============================================================
 
-class GeminiBot(commands.Bot):
+class CloudVoiceBot(commands.Bot):
+    """Main Discord bot for Cloud Voice AI."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+
+        intents = discord.Intents.none()
+
+        intents.guilds = True
+        intents.voice_states = True
+        intents.messages = True
+        intents.message_content = False
 
         super().__init__(
-            command_prefix=commands.when_mentioned,
+            command_prefix=DISCORD_PREFIX,
             intents=intents,
+            shard_count=DISCORD_SHARD_COUNT,
             help_command=None,
         )
 
-        # ----------------------------------------------------
-        # Voice sessions
-        # ----------------------------------------------------
+        self.started_at: float = BOT_START_TIME
 
-        self.voice_sessions: dict[
-            int,
-            VoiceSession,
-        ] = {}
+        self.voice_manager = VoiceSessionManager()
 
-        # ----------------------------------------------------
-        # Per-user cooldown history
-        # ----------------------------------------------------
+        self.ready_once = False
+        self.sync_completed = False
 
-        self.cooldowns: dict[
-            int,
-            deque[float],
-        ] = defaultdict(
-            lambda: deque(maxlen=20)
-        )
+        self.total_commands = 0
+        self.total_errors = 0
+        self.total_joins = 0
+        self.total_leaves = 0
 
-        # ----------------------------------------------------
-        # Statistics
-        # ----------------------------------------------------
-
-        self.started_at = time.monotonic()
-
-        self.stats = {
-            "commands": 0,
-            "voice_joins": 0,
-            "voice_leaves": 0,
-            "voice_messages": 0,
-            "ai_requests": 0,
-            "errors": 0,
-        }
-
-        # ----------------------------------------------------
-        # Locks
-        # ----------------------------------------------------
-
-        self.session_lock = asyncio.Lock()
-
-        # ----------------------------------------------------
-        # Shutdown state
-        # ----------------------------------------------------
-
-        self.shutting_down = False
+        self._shutdown_lock = asyncio.Lock()
 
     # ========================================================
-    # SETUP HOOK
+    # SETUP
     # ========================================================
 
-    async def setup_hook(self):
+    async def setup_hook(self) -> None:
 
         logger.info(
-            "Loading %s...",
+            "Starting %s v%s...",
             PROJECT_NAME,
+            PROJECT_VERSION,
         )
 
-        # ----------------------------------------------------
-        # Sync slash commands
-        # ----------------------------------------------------
+        logger.info(
+            "Loading Discord application commands..."
+        )
+
+        await self._sync_commands()
+
+        logger.info(
+            "Application commands loaded."
+        )
+
+    # ========================================================
+    # COMMAND SYNC
+    # ========================================================
+
+    async def _sync_commands(self) -> None:
 
         try:
 
-            synced = await self.tree.sync()
+            if DISCORD_GUILD_ID:
 
-            logger.info(
-                "Synced %s global slash commands.",
-                len(synced),
-            )
+                guild = discord.Object(
+                    id=DISCORD_GUILD_ID
+                )
+
+                self.tree.copy_global_to(
+                    guild=guild
+                )
+
+                synced = await self.tree.sync(
+                    guild=guild
+                )
+
+                logger.info(
+                    "Synced %d commands to guild %s.",
+                    len(synced),
+                    DISCORD_GUILD_ID,
+                )
+
+            else:
+
+                synced = await self.tree.sync()
+
+                logger.info(
+                    "Synced %d global commands.",
+                    len(synced),
+                )
+
+            self.sync_completed = True
 
         except Exception:
 
             logger.exception(
-                "Failed to sync slash commands."
+                "Failed to synchronize application commands."
             )
 
             raise
@@ -271,85 +295,95 @@ class GeminiBot(commands.Bot):
     # READY
     # ========================================================
 
-    async def on_ready(self):
+    async def on_ready(self) -> None:
 
-        logger.info(
-            "=========================================="
-        )
-
-        logger.info(
-            "%s v%s",
-            PROJECT_NAME,
-            PROJECT_VERSION,
-        )
+        if self.user is None:
+            return
 
         logger.info(
             "Logged in as %s (%s)",
             self.user,
-            self.user.id
-            if self.user
-            else "unknown",
+            self.user.id,
         )
 
         logger.info(
-            "Guilds: %s",
+            "Connected to %d guild(s).",
             len(self.guilds),
         )
 
-        logger.info(
-            "Default voice: %s",
-            DEFAULT_VOICE,
-        )
+        if not self.ready_once:
 
-        logger.info(
-            "Max guild sessions: %s",
-            MAX_GUILD_SESSIONS,
-        )
+            self.ready_once = True
 
-        logger.info(
-            "=========================================="
-        )
-
-        activity = discord.Activity(
-            type=discord.ActivityType.listening,
-            name=DISCORD_STATUS,
-        )
+            logger.info(
+                "Cloud Voice AI is ready."
+            )
 
         try:
 
             await self.change_presence(
                 status=discord.Status.online,
-                activity=activity,
+                activity=make_activity(),
             )
 
         except Exception:
 
             logger.exception(
-                "Failed to update presence."
+                "Failed to update bot presence."
             )
 
     # ========================================================
-    # DISCONNECT
+    # COMMAND TRACKING
     # ========================================================
 
-    async def on_disconnect(self):
+    async def on_app_command_completion(
+        self,
+        interaction: discord.Interaction,
+        command: app_commands.Command,
+    ) -> None:
 
-        logger.warning(
-            "Discord connection lost."
+        self.total_commands += 1
+
+        logger.debug(
+            "Command completed: /%s by %s (%s)",
+            command.name,
+            interaction.user,
+            interaction.user.id,
         )
 
     # ========================================================
-    # RESUMED
+    # VOICE STATE
     # ========================================================
 
-    async def on_resumed(self):
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
 
-        logger.info(
-            "Discord connection resumed."
-        )
+        if self.user is None:
+            return
+
+        if member.id != self.user.id:
+            return
+
+        if before.channel is None and after.channel is not None:
+
+            logger.info(
+                "Joined voice channel: %s",
+                after.channel,
+            )
+
+        elif before.channel is not None and after.channel is None:
+
+            logger.info(
+                "Left voice channel: %s",
+                before.channel,
+            )
 
     # ========================================================
-    # ERROR HANDLER
+    # ERROR HANDLING
     # ========================================================
 
     async def on_error(
@@ -357,366 +391,66 @@ class GeminiBot(commands.Bot):
         event_method: str,
         *args,
         **kwargs,
-    ):
+    ) -> None:
 
-        self.stats["errors"] += 1
+        self.total_errors += 1
 
         logger.exception(
             "Unhandled Discord event error: %s",
             event_method,
         )
 
-    # ========================================================
-    # SESSION
-    # ========================================================
-
-    async def get_or_create_session(
+    async def on_command_error(
         self,
-        guild: discord.Guild,
-    ) -> VoiceSession:
+        ctx: commands.Context,
+        error: Exception,
+    ) -> None:
 
-        guild_id = guild.id
-
-        async with self.session_lock:
-
-            existing = self.voice_sessions.get(
-                guild_id
-            )
-
-            if existing:
-                return existing
-
-            if (
-                len(self.voice_sessions)
-                >= MAX_GUILD_SESSIONS
-            ):
-                raise RuntimeError(
-                    "Maximum guild sessions reached."
-                )
-
-            session = VoiceSession(
-                bot=self,
-                guild=guild,
-                default_voice=DEFAULT_VOICE,
-            )
-
-            self.voice_sessions[
-                guild_id
-            ] = session
-
-            return session
-
-    # ========================================================
-    # GET SESSION
-    # ========================================================
-
-    def get_session(
-        self,
-        guild_id: int,
-    ) -> Optional[VoiceSession]:
-
-        return self.voice_sessions.get(
-            guild_id
-        )
-
-    # ========================================================
-    # REMOVE SESSION
-    # ========================================================
-
-    async def remove_session(
-        self,
-        guild_id: int,
-    ):
-
-        async with self.session_lock:
-
-            session = self.voice_sessions.pop(
-                guild_id,
-                None,
-            )
-
-        if session:
-
-            try:
-
-                await session.close()
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to close voice session."
-                )
-
-    # ========================================================
-    # CLOSE ALL SESSIONS
-    # ========================================================
-
-    async def close_all_sessions(self):
-
-        sessions = list(
-            self.voice_sessions.items()
-        )
-
-        self.voice_sessions.clear()
-
-        for guild_id, session in sessions:
-
-            try:
-
-                await session.close()
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to close session for guild %s.",
-                    guild_id,
-                )
-
-    # ========================================================
-    # COOLDOWN
-    # ========================================================
-
-    def check_cooldown(
-        self,
-        user_id: int,
-        cooldown: float = 1.0,
-    ) -> float:
-
-        now = time.monotonic()
-
-        history = self.cooldowns[
-            user_id
-        ]
-
-        while history and (
-            now - history[0] > 60
+        if isinstance(
+            error,
+            commands.CommandNotFound,
         ):
-
-            history.popleft()
-
-        if history:
-
-            remaining = cooldown - (
-                now - history[-1]
-            )
-
-            if remaining > 0:
-
-                return remaining
-
-        history.append(now)
-
-        return 0.0
-
-    # ========================================================
-    # UPTIME
-    # ========================================================
-
-    def uptime_seconds(self) -> int:
-
-        return int(
-            time.monotonic()
-            - self.started_at
-        )
-
-    # ========================================================
-    # FORMAT UPTIME
-    # ========================================================
-
-    @staticmethod
-    def format_uptime(
-        seconds: int,
-    ) -> str:
-
-        days, remainder = divmod(
-            seconds,
-            86400,
-        )
-
-        hours, remainder = divmod(
-            remainder,
-            3600,
-        )
-
-        minutes, seconds = divmod(
-            remainder,
-            60,
-        )
-
-        parts = []
-
-        if days:
-            parts.append(
-                f"{days}d"
-            )
-
-        if hours:
-            parts.append(
-                f"{hours}h"
-            )
-
-        if minutes:
-            parts.append(
-                f"{minutes}m"
-            )
-
-        parts.append(
-            f"{seconds}s"
-        )
-
-        return " ".join(parts)
-
-    # ========================================================
-    # CLOSE
-    # ========================================================
-
-    async def close(self):
-
-        if self.shutting_down:
             return
 
-        self.shutting_down = True
+        self.total_errors += 1
 
-        logger.info(
-            "Shutting down voice sessions..."
+        logger.exception(
+            "Command error: %s",
+            error,
         )
 
-        try:
-            await self.close_all_sessions()
+    # ========================================================
+    # SHUTDOWN
+    # ========================================================
 
-        except Exception:
+    async def shutdown(self) -> None:
 
-            logger.exception(
-                "Error while closing voice sessions."
+        async with self._shutdown_lock:
+
+            logger.info(
+                "Shutting down Cloud Voice AI..."
             )
 
-        await super().close()
+            try:
+                await self.voice_manager.disconnect_all()
+            except Exception:
+                logger.exception(
+                    "Failed to disconnect voice sessions."
+                )
+
+            try:
+                await self.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close Discord client."
+                )
 
 
 # ============================================================
-# CREATE BOT
+# BOT INSTANCE
 # ============================================================
 
-bot = GeminiBot()
-
-
-# ============================================================
-# EMBED HELPERS
-# ============================================================
-
-def success_embed(
-    title: str,
-    description: str,
-) -> discord.Embed:
-
-    return discord.Embed(
-        title=f"✅ {title}",
-        description=description,
-        color=discord.Color.green(),
-    )
-
-
-def error_embed(
-    title: str,
-    description: str,
-) -> discord.Embed:
-
-    return discord.Embed(
-        title=f"❌ {title}",
-        description=description,
-        color=discord.Color.red(),
-    )
-
-
-def info_embed(
-    title: str,
-    description: str,
-) -> discord.Embed:
-
-    return discord.Embed(
-        title=f"ℹ️ {title}",
-        description=description,
-        color=discord.Color.blurple(),
-    )
-
-
-# ============================================================
-# VOICE DATA HELPERS
-# ============================================================
-
-def get_voice_items() -> list[tuple[str, str]]:
-    """
-    Supports both:
-      - dict[str, str]
-      - tuple/list[str]
-      - set[str]
-    """
-
-    if isinstance(
-        GEMINI_VOICES,
-        dict,
-    ):
-
-        return list(
-            GEMINI_VOICES.items()
-        )
-
-    result = []
-
-    for name in GEMINI_VOICES:
-
-        result.append(
-            (
-                str(name),
-                "Gemini voice",
-            )
-        )
-
-    return result
-
-
-def get_voice_style(
-    voice_name: str,
-) -> str:
-
-    normalized = normalize_voice_name(
-        voice_name
-    )
-
-    if isinstance(
-        GEMINI_VOICES,
-        dict,
-    ):
-
-        return GEMINI_VOICES.get(
-            normalized,
-            "Gemini voice",
-        )
-
-    return "Gemini voice"
-
-
-def voice_exists(
-    voice_name: str,
-) -> bool:
-
-    try:
-
-        return is_valid_voice(
-            voice_name
-        )
-
-    except Exception:
-
-        normalized = normalize_voice_name(
-            voice_name
-        )
-
-        return any(
-            normalized.lower()
-            == str(name).lower()
-            for name, _ in get_voice_items()
-        )
+bot = CloudVoiceBot()
 
 
 # ============================================================
@@ -725,23 +459,17 @@ def voice_exists(
 
 @bot.tree.command(
     name="ping",
-    description="فحص سرعة واستجابة البوت",
+    description=COMMAND_DESCRIPTIONS["ping"],
 )
 async def ping(
     interaction: discord.Interaction,
-):
+) -> None:
 
-    bot.stats["commands"] += 1
-
-    latency = round(
-        bot.latency * 1000
-    )
+    latency = round(bot.latency * 1000)
 
     await interaction.response.send_message(
-        embed=info_embed(
-            "Pong!",
-            f"🏓 Discord Latency: **{latency}ms**",
-        ),
+        f"🏓 Pong!\n"
+        f"⚡ Latency: `{latency}ms`",
         ephemeral=True,
     )
 
@@ -752,29 +480,27 @@ async def ping(
 
 @bot.tree.command(
     name="botinfo",
-    description="عرض معلومات البوت والنظام",
+    description=COMMAND_DESCRIPTIONS["botinfo"],
 )
 async def botinfo(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
-
-    uptime = bot.format_uptime(
-        bot.uptime_seconds()
-    )
+) -> None:
 
     embed = discord.Embed(
-        title="🤖 Cloud Voice AI",
-        description=(
-            "بوت ذكاء اصطناعي صوتي يعمل داخل Discord."
-        ),
+        title=f"🎙️ {PROJECT_NAME}",
+        description=PROJECT_DESCRIPTION,
         color=discord.Color.blurple(),
     )
 
     embed.add_field(
         name="📦 Version",
         value=f"`{PROJECT_VERSION}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="👨‍💻 Author",
+        value=PROJECT_AUTHOR,
         inline=True,
     )
 
@@ -786,35 +512,34 @@ async def botinfo(
 
     embed.add_field(
         name="🎙️ Voice Sessions",
-        value=f"`{len(bot.voice_sessions)}`",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="⏱️ Uptime",
-        value=f"`{uptime}`",
+        value=f"`{bot.voice_manager.count}`",
         inline=True,
     )
 
     embed.add_field(
         name="🧠 Memory",
         value=(
-            f"`{MAX_MEMORY_MESSAGES} messages`"
+            "Enabled"
             if MEMORY_ENABLED
-            else "`Disabled`"
+            else "Disabled"
         ),
         inline=True,
     )
 
     embed.add_field(
         name="🎤 Default Voice",
-        value=f"`{DEFAULT_VOICE}`",
+        value=f"`{DEFAULT_GEMINI_VOICE}`",
         inline=True,
     )
 
+    embed.add_field(
+        name="⏱️ Uptime",
+        value=f"`{format_uptime(time.time() - bot.started_at)}`",
+        inline=False,
+    )
+
     await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
+        embed=embed
     )
 
 
@@ -824,54 +549,42 @@ async def botinfo(
 
 @bot.tree.command(
     name="help",
-    description="عرض جميع أوامر البوت",
+    description=COMMAND_DESCRIPTIONS["help"],
 )
 async def help_command(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     embed = discord.Embed(
-        title="📚 أوامر Cloud Voice AI",
+        title="🎙️ Cloud Voice AI — Help",
         description=(
-            "هذه جميع أوامر البوت المتاحة:"
+            "أوامر البوت الأساسية:"
         ),
         color=discord.Color.blurple(),
     )
 
-    embed.add_field(
-        name="🎙️ الصوت",
-        value=(
-            "`/join` — دخول الروم الصوتي\n"
-            "`/leave` — الخروج من الروم\n"
-            "`/voices` — عرض الأصوات\n"
-            "`/setvoice` — تغيير الصوت\n"
-            "`/voice` — الصوت الحالي\n"
-            "`/voiceinfo` — معلومات صوت"
-        ),
-        inline=False,
-    )
+    commands_list = [
+        ("🏓 `/ping`", "اختبار الاستجابة."),
+        ("ℹ️ `/botinfo`", "معلومات البوت."),
+        ("🎙️ `/join`", "دخول الروم الصوتي."),
+        ("👋 `/leave`", "الخروج من الروم الصوتي."),
+        ("🎤 `/voice`", "عرض الصوت الحالي."),
+        ("🔊 `/setvoice`", "تغيير الصوت."),
+        ("🎚️ `/voices`", "عرض جميع الأصوات."),
+        ("🔎 `/voiceinfo`", "معلومات صوت معين."),
+        ("🧠 `/memory`", "عرض حالة الذاكرة."),
+        ("🧹 `/clear`", "مسح الذاكرة."),
+        ("🔄 `/reset`", "إعادة ضبط الجلسة."),
+        ("📊 `/stats`", "إحصائيات جلسة الصوت."),
+    ]
 
-    embed.add_field(
-        name="🧠 الذكاء الاصطناعي",
-        value=(
-            "`/memory` — حالة الذاكرة\n"
-            "`/clear` — مسح الذاكرة\n"
-            "`/reset` — إعادة ضبط الجلسة"
-        ),
-        inline=False,
-    )
+    for name, description in commands_list:
 
-    embed.add_field(
-        name="⚙️ النظام",
-        value=(
-            "`/ping` — فحص السرعة\n"
-            "`/botinfo` — معلومات البوت\n"
-            "`/stats` — الإحصائيات"
-        ),
-        inline=False,
-    )
+        embed.add_field(
+            name=name,
+            value=description,
+            inline=False,
+        )
 
     await interaction.response.send_message(
         embed=embed,
@@ -885,113 +598,63 @@ async def help_command(
 
 @bot.tree.command(
     name="join",
-    description="إدخال البوت إلى الروم الصوتي",
+    description=COMMAND_DESCRIPTIONS["join"],
 )
 async def join(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
         return
 
-    member = interaction.user
-
-    if not isinstance(
-        member,
-        discord.Member,
-    ):
-
-        await interaction.response.send_message(
-            embed=error_embed(
-                "خطأ",
-                "تعذر تحديد عضويتك في السيرفر.",
-            ),
-            ephemeral=True,
-        )
-
-        return
-
-    voice_state = member.voice
-
-    if (
-        not voice_state
-        or not voice_state.channel
-    ):
-
-        await interaction.response.send_message(
-            embed=error_embed(
-                "أنت لست في روم صوتي",
-                "ادخل روم صوتي أولاً ثم استخدم `/join`.",
-            ),
-            ephemeral=True,
-        )
-
-        return
-
-    channel = voice_state.channel
-
-    await interaction.response.defer(
-        ephemeral=True
+    channel = get_user_voice_channel(
+        interaction
     )
+
+    if channel is None:
+
+        await interaction.response.send_message(
+            "🎙️ ادخل روم صوتي أولًا ثم استخدم `/join`.",
+            ephemeral=True,
+        )
+
+        return
+
+    await interaction.response.defer()
 
     try:
 
-        session = (
-            await bot.get_or_create_session(
-                interaction.guild
-            )
+        session = await bot.voice_manager.join(
+            guild=interaction.guild,
+            channel=channel,
+            voice=DEFAULT_GEMINI_VOICE,
         )
 
-        await session.join(
-            channel
-        )
-
-        bot.stats[
-            "voice_joins"
-        ] += 1
+        bot.total_joins += 1
 
         await interaction.followup.send(
-            embed=success_embed(
-                "تم الدخول 🎙️",
-                (
-                    f"دخلت إلى **{channel.name}**.\n\n"
-                    f"🎤 الصوت الحالي: **{session.get_voice()}**\n"
-                    "🧠 الذكاء الاصطناعي جاهز للاستماع والرد."
-                ),
-            ),
-            ephemeral=True,
+            f"🎙️ دخلت **{channel.name}**!\n"
+            f"🗣️ الصوت: `{session.voice}`\n"
+            f"🧠 الاستماع والرد الصوتي جاهز.",
         )
 
     except Exception as exc:
 
+        bot.total_errors += 1
+
         logger.exception(
-            "Join failed."
+            "Failed to join voice channel."
         )
 
-        bot.stats[
-            "errors"
-        ] += 1
-
         await interaction.followup.send(
-            embed=error_embed(
-                "تعذر الدخول",
-                (
-                    "حدث خطأ أثناء دخول الروم الصوتي.\n"
-                    f"`{type(exc).__name__}`"
-                ),
-            ),
-            ephemeral=True,
+            f"❌ ما قدرت أدخل الروم الصوتي.\n"
+            f"```{truncate_text(str(exc), 1200)}```"
         )
 
 
@@ -1001,21 +664,16 @@ async def join(
 
 @bot.tree.command(
     name="leave",
-    description="إخراج البوت من الروم الصوتي",
+    description=COMMAND_DESCRIPTIONS["leave"],
 )
 async def leave(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
@@ -1025,56 +683,37 @@ async def leave(
         ephemeral=True
     )
 
-    session = bot.get_session(
-        interaction.guild.id
-    )
-
-    if not session:
-
-        await interaction.followup.send(
-            embed=info_embed(
-                "البوت غير موجود",
-                "البوت ليس لديه جلسة صوتية في هذا السيرفر.",
-            ),
-            ephemeral=True,
-        )
-
-        return
-
     try:
 
-        await bot.remove_session(
+        disconnected = await bot.voice_manager.leave(
             interaction.guild.id
         )
 
-        bot.stats[
-            "voice_leaves"
-        ] += 1
+        if disconnected:
 
-        await interaction.followup.send(
-            embed=success_embed(
-                "تم الخروج 👋",
-                "خرجت من الروم الصوتي.",
-            ),
-            ephemeral=True,
-        )
+            bot.total_leaves += 1
+
+            await interaction.followup.send(
+                "👋 طلعت من الروم الصوتي."
+            )
+
+        else:
+
+            await interaction.followup.send(
+                "ℹ️ أنا مو داخل روم صوتي حاليًا."
+            )
 
     except Exception as exc:
 
+        bot.total_errors += 1
+
         logger.exception(
-            "Leave failed."
+            "Failed to leave voice channel."
         )
 
-        bot.stats[
-            "errors"
-        ] += 1
-
         await interaction.followup.send(
-            embed=error_embed(
-                "تعذر الخروج",
-                f"`{type(exc).__name__}`",
-            ),
-            ephemeral=True,
+            f"❌ حصل خطأ أثناء الخروج.\n"
+            f"```{truncate_text(str(exc), 1200)}```"
         )
 
 
@@ -1084,56 +723,38 @@ async def leave(
 
 @bot.tree.command(
     name="voice",
-    description="عرض الصوت المستخدم حالياً",
+    description=COMMAND_DESCRIPTIONS["voice"],
 )
 async def voice(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
         return
 
-    session = bot.get_session(
+    session = bot.voice_manager.get(
         interaction.guild.id
     )
 
-    current_voice = DEFAULT_VOICE
+    if session is None:
 
-    if session:
+        await interaction.response.send_message(
+            f"🎤 الصوت الافتراضي: `{DEFAULT_GEMINI_VOICE}`\n"
+            "ℹ️ لا توجد جلسة صوتية نشطة حاليًا.",
+            ephemeral=True,
+        )
 
-        try:
-
-            current_voice = session.get_voice()
-
-        except Exception:
-
-            pass
-
-    style = get_voice_style(
-        current_voice
-    )
-
-    description = (
-        f"🎙️ الصوت الحالي: **{current_voice}**\n"
-        f"✨ الطابع: **{style}**"
-    )
+        return
 
     await interaction.response.send_message(
-        embed=info_embed(
-            "الصوت الحالي",
-            description,
-        ),
+        f"🎤 الصوت الحالي: `{session.voice}`\n"
+        f"🎙️ القناة: `{session.channel.name}`",
         ephemeral=True,
     )
 
@@ -1145,42 +766,23 @@ async def voice(
 async def voice_autocomplete(
     interaction: discord.Interaction,
     current: str,
-):
+) -> list[app_commands.Choice[str]]:
 
-    current = (
-        current
-        .lower()
-        .strip()
-    )
+    current = current.lower().strip()
 
-    choices = []
+    matches = [
+        voice
+        for voice in GEMINI_VOICES
+        if current in voice.lower()
+    ]
 
-    for name, style in get_voice_items():
-
-        name_text = str(name)
-        style_text = str(style)
-
-        if (
-            not current
-            or current in name_text.lower()
-            or current in style_text.lower()
-        ):
-
-            display = (
-                f"{name_text} — {style_text}"
-            )
-
-            if len(display) > 100:
-                display = display[:97] + "..."
-
-            choices.append(
-                app_commands.Choice(
-                    name=display,
-                    value=name_text,
-                )
-            )
-
-    return choices[:25]
+    return [
+        app_commands.Choice(
+            name=voice,
+            value=voice,
+        )
+        for voice in matches[:25]
+    ]
 
 
 # ============================================================
@@ -1189,118 +791,79 @@ async def voice_autocomplete(
 
 @bot.tree.command(
     name="setvoice",
-    description="تغيير صوت الذكاء الاصطناعي",
+    description=COMMAND_DESCRIPTIONS["setvoice"],
 )
 @app_commands.describe(
-    voice_name="اختر صوت Gemini الذي تريد استخدامه"
+    voice="اختر صوت Gemini."
 )
 @app_commands.autocomplete(
-    voice_name=voice_autocomplete
+    voice=voice_autocomplete
 )
 async def setvoice(
     interaction: discord.Interaction,
-    voice_name: str,
-):
-
-    bot.stats["commands"] += 1
-
-    if not ALLOW_VOICE_CHANGE:
-
-        await interaction.response.send_message(
-            embed=error_embed(
-                "تغيير الصوت معطل",
-                "تم تعطيل تغيير الأصوات من إعدادات البوت.",
-            ),
-            ephemeral=True,
-        )
-
-        return
+    voice: str,
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
         return
 
-    normalized = normalize_voice_name(
-        voice_name
-    )
-
-    if not voice_exists(
-        normalized
-    ):
+    if not is_valid_voice(voice):
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "صوت غير موجود",
-                (
-                    "لم أجد هذا الصوت.\n"
-                    "استخدم `/voices` لرؤية الأصوات المتاحة."
-                ),
-            ),
+            "❌ هذا الصوت غير موجود.\n"
+            "استخدم `/voices` لرؤية الأصوات المتاحة.",
             ephemeral=True,
         )
 
         return
 
-    await interaction.response.defer(
-        ephemeral=True
+    selected_voice = normalize_voice_name(
+        voice
     )
+
+    session = bot.voice_manager.get(
+        interaction.guild.id
+    )
+
+    if session is None:
+
+        await interaction.response.send_message(
+            f"🎤 الصوت الافتراضي الحالي: `{DEFAULT_GEMINI_VOICE}`\n\n"
+            f"💡 ادخل البوت أولًا باستخدام `/join` "
+            f"ثم غيّر الصوت إلى `{selected_voice}`.",
+            ephemeral=True,
+        )
+
+        return
 
     try:
 
-        session = (
-            await bot.get_or_create_session(
-                interaction.guild
-            )
+        session.set_voice(
+            selected_voice
         )
 
-        result = session.set_voice(
-            normalized
-        )
-
-        if result is False:
-
-            raise RuntimeError(
-                "Voice session rejected the voice."
-            )
-
-        style = get_voice_style(
-            normalized
-        )
-
-        await interaction.followup.send(
-            embed=success_embed(
-                "تم تغيير الصوت 🎙️",
-                (
-                    f"الصوت الجديد: **{normalized}**\n"
-                    f"الطابع: **{style}**"
-                ),
-            ),
-            ephemeral=True,
+        await interaction.response.send_message(
+            f"✅ تم تغيير صوت الذكاء الاصطناعي إلى:\n"
+            f"🎙️ **{selected_voice}**",
         )
 
     except Exception as exc:
 
+        bot.total_errors += 1
+
         logger.exception(
-            "Failed to set voice."
+            "Failed to change voice."
         )
 
-        bot.stats[
-            "errors"
-        ] += 1
-
-        await interaction.followup.send(
-            embed=error_embed(
-                "تعذر تغيير الصوت",
-                f"`{type(exc).__name__}`",
-            ),
+        await interaction.response.send_message(
+            f"❌ تعذر تغيير الصوت.\n"
+            f"```{truncate_text(str(exc), 1000)}```",
             ephemeral=True,
         )
 
@@ -1311,59 +874,44 @@ async def setvoice(
 
 @bot.tree.command(
     name="voices",
-    description="عرض جميع أصوات Gemini المتاحة",
+    description=COMMAND_DESCRIPTIONS["voices"],
 )
 async def voices(
     interaction: discord.Interaction,
-):
+) -> None:
 
-    bot.stats["commands"] += 1
-
-    items = get_voice_items()
-
-    lines = []
-
-    for name, style in items:
-
-        lines.append(
-            f"🎙️ **{name}** — {style}"
-        )
-
-    embed = discord.Embed(
-        title="🎙️ أصوات Gemini",
-        description=(
-            "يمكنك تغيير الصوت باستخدام `/setvoice`."
-        ),
-        color=discord.Color.blurple(),
+    await interaction.response.defer(
+        ephemeral=True
     )
 
-    # Discord embed field limits.
-    # نقسم القائمة إلى مجموعات آمنة.
-    chunk_size = 10
+    try:
 
-    for index in range(
-        0,
-        len(lines),
-        chunk_size,
-    ):
+        await send_voice_list(
+            interaction
+        )
 
-        chunk = lines[
-            index:index + chunk_size
+    except Exception:
+
+        logger.exception(
+            "Failed to send voice list."
+        )
+
+        lines = [
+            f"`{index + 1:02d}` — **{voice}**"
+            for index, voice in enumerate(
+                GEMINI_VOICES
+            )
         ]
 
-        start = index + 1
-        end = index + len(chunk)
-
-        embed.add_field(
-            name=f"الأصوات {start}–{end}",
-            value="\n".join(chunk),
-            inline=True,
+        embed = discord.Embed(
+            title="🎙️ Gemini Voices",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
         )
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
-    )
+        await interaction.followup.send(
+            embed=embed
+        )
 
 
 # ============================================================
@@ -1372,70 +920,61 @@ async def voices(
 
 @bot.tree.command(
     name="voiceinfo",
-    description="عرض معلومات صوت Gemini",
+    description=COMMAND_DESCRIPTIONS["voiceinfo"],
 )
 @app_commands.describe(
-    voice_name="اسم الصوت"
+    voice="الصوت الذي تريد معلومات عنه."
 )
 @app_commands.autocomplete(
-    voice_name=voice_autocomplete
+    voice=voice_autocomplete
 )
 async def voiceinfo(
     interaction: discord.Interaction,
-    voice_name: str,
-):
+    voice: str,
+) -> None:
 
-    bot.stats["commands"] += 1
-
-    normalized = normalize_voice_name(
-        voice_name
-    )
-
-    if not voice_exists(
-        normalized
-    ):
+    if not is_valid_voice(voice):
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "الصوت غير موجود",
-                "استخدم `/voices` لرؤية القائمة.",
-            ),
+            "❌ الصوت غير موجود.",
             ephemeral=True,
         )
 
         return
 
-    style = get_voice_style(
-        normalized
+    selected = normalize_voice_name(
+        voice
+    )
+
+    is_default = (
+        selected == normalize_voice_name(
+            DEFAULT_GEMINI_VOICE
+        )
     )
 
     embed = discord.Embed(
-        title=f"🎙️ {normalized}",
+        title=f"🎙️ {selected}",
         description=(
-            f"الطابع الصوتي: **{style}**"
+            "صوت متاح لنظام Gemini TTS في Cloud Voice AI."
         ),
         color=discord.Color.blurple(),
     )
 
     embed.add_field(
-        name="Voice ID",
-        value=f"`{normalized}`",
+        name="🔊 Voice ID",
+        value=f"`{selected}`",
         inline=True,
     )
 
     embed.add_field(
-        name="Style",
-        value=f"`{style}`",
+        name="⭐ Default",
+        value="نعم" if is_default else "لا",
         inline=True,
     )
 
     embed.add_field(
-        name="Default",
-        value=(
-            "🟢 نعم"
-            if normalized == DEFAULT_VOICE
-            else "⚪ لا"
-        ),
+        name="📋 Available",
+        value="نعم",
         inline=True,
     )
 
@@ -1451,109 +990,52 @@ async def voiceinfo(
 
 @bot.tree.command(
     name="memory",
-    description="عرض حالة ذاكرة المحادثة",
+    description=COMMAND_DESCRIPTIONS["memory"],
 )
 async def memory(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
         return
 
-    if not MEMORY_ENABLED:
-
-        await interaction.response.send_message(
-            embed=info_embed(
-                "الذاكرة",
-                "🧠 ذاكرة المحادثة معطلة حالياً.",
-            ),
-            ephemeral=True,
-        )
-
-        return
-
-    session = bot.get_session(
+    session = bot.voice_manager.get(
         interaction.guild.id
     )
 
-    message_count = 0
+    if session is None:
 
-    if session:
+        await interaction.response.send_message(
+            "ℹ️ لا توجد جلسة صوتية نشطة.",
+            ephemeral=True,
+        )
 
-        try:
+        return
 
-            if hasattr(
-                session,
-                "memory",
-            ):
+    try:
 
-                memory_obj = session.memory
+        count = session.memory_count
 
-                if hasattr(
-                    memory_obj,
-                    "__len__",
-                ):
+    except AttributeError:
 
-                    message_count = len(
-                        memory_obj
-                    )
+        count = 0
 
-            elif hasattr(
-                session,
-                "get_memory_length",
-            ):
-
-                result = (
-                    session.get_memory_length()
-                )
-
-                if asyncio.iscoroutine(result):
-                    result = await result
-
-                message_count = int(
-                    result or 0
-                )
-
-        except Exception:
-
-            message_count = 0
-
-    embed = discord.Embed(
-        title="🧠 ذاكرة المحادثة",
-        color=discord.Color.blurple(),
-    )
-
-    embed.add_field(
-        name="الحالة",
-        value="🟢 مفعلة",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="الحد الأقصى",
-        value=f"`{MAX_MEMORY_MESSAGES}`",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="الرسائل الحالية",
-        value=f"`{message_count}`",
-        inline=True,
+    status = (
+        "مفعلة"
+        if MEMORY_ENABLED
+        else "معطلة"
     )
 
     await interaction.response.send_message(
-        embed=embed,
+        f"🧠 **Memory**\n\n"
+        f"الحالة: `{status}`\n"
+        f"الرسائل: `{count}/{MAX_MEMORY_MESSAGES}`",
         ephemeral=True,
     )
 
@@ -1564,37 +1046,29 @@ async def memory(
 
 @bot.tree.command(
     name="clear",
-    description="مسح ذاكرة المحادثة الحالية",
+    description=COMMAND_DESCRIPTIONS["clear"],
 )
 async def clear(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
         return
 
-    session = bot.get_session(
+    session = bot.voice_manager.get(
         interaction.guild.id
     )
 
-    if not session:
+    if session is None:
 
         await interaction.response.send_message(
-            embed=info_embed(
-                "لا توجد جلسة",
-                "لا توجد جلسة AI نشطة حالياً.",
-            ),
+            "ℹ️ لا توجد جلسة صوتية نشطة.",
             ephemeral=True,
         )
 
@@ -1602,77 +1076,24 @@ async def clear(
 
     try:
 
-        cleared = False
+        session.clear_memory()
 
-        if hasattr(
-            session,
-            "clear_memory",
-        ):
-
-            result = session.clear_memory()
-
-            if asyncio.iscoroutine(
-                result
-            ):
-
-                await result
-
-            cleared = True
-
-        elif hasattr(
-            session,
-            "memory",
-        ):
-
-            memory_obj = session.memory
-
-            if hasattr(
-                memory_obj,
-                "clear",
-            ):
-
-                memory_obj.clear()
-
-                cleared = True
-
-        if cleared:
-
-            await interaction.response.send_message(
-                embed=success_embed(
-                    "تم مسح الذاكرة 🧹",
-                    "تم حذف سياق المحادثة الحالية.",
-                ),
-                ephemeral=True,
-            )
-
-        else:
-
-            await interaction.response.send_message(
-                embed=error_embed(
-                    "غير مدعوم",
-                    (
-                        "نسخة جلسة الصوت الحالية "
-                        "لا تدعم مسح الذاكرة."
-                    ),
-                ),
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            "🧹 تم مسح ذاكرة المحادثة.",
+            ephemeral=True,
+        )
 
     except Exception as exc:
 
+        bot.total_errors += 1
+
         logger.exception(
-            "Clear memory failed."
+            "Failed to clear memory."
         )
 
-        bot.stats[
-            "errors"
-        ] += 1
-
         await interaction.response.send_message(
-            embed=error_embed(
-                "تعذر المسح",
-                f"`{type(exc).__name__}`",
-            ),
+            f"❌ تعذر مسح الذاكرة.\n"
+            f"```{truncate_text(str(exc), 1000)}```",
             ephemeral=True,
         )
 
@@ -1683,103 +1104,54 @@ async def clear(
 
 @bot.tree.command(
     name="reset",
-    description="إعادة ضبط جلسة الذكاء الاصطناعي",
+    description=COMMAND_DESCRIPTIONS["reset"],
 )
 async def reset(
     interaction: discord.Interaction,
-):
-
-    bot.stats["commands"] += 1
+) -> None:
 
     if not interaction.guild:
 
         await interaction.response.send_message(
-            embed=error_embed(
-                "غير متاح",
-                "هذا الأمر يعمل داخل السيرفرات فقط.",
-            ),
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
             ephemeral=True,
         )
 
         return
 
-    await interaction.response.defer(
-        ephemeral=True
+    session = bot.voice_manager.get(
+        interaction.guild.id
     )
+
+    if session is None:
+
+        await interaction.response.send_message(
+            "ℹ️ لا توجد جلسة صوتية نشطة.",
+            ephemeral=True,
+        )
+
+        return
 
     try:
 
-        old_session = bot.get_session(
-            interaction.guild.id
-        )
+        session.reset()
 
-        current_channel = None
-
-        if old_session:
-
-            try:
-
-                voice_client = getattr(
-                    old_session,
-                    "voice_client",
-                    None,
-                )
-
-                if (
-                    voice_client
-                    and voice_client.channel
-                ):
-
-                    current_channel = (
-                        voice_client.channel
-                    )
-
-            except Exception:
-
-                current_channel = None
-
-        await bot.remove_session(
-            interaction.guild.id
-        )
-
-        if current_channel:
-
-            new_session = (
-                await bot.get_or_create_session(
-                    interaction.guild
-                )
-            )
-
-            await new_session.join(
-                current_channel
-            )
-
-        await interaction.followup.send(
-            embed=success_embed(
-                "تمت إعادة الضبط 🔄",
-                (
-                    "تمت إعادة إنشاء جلسة "
-                    "الذكاء الاصطناعي."
-                ),
-            ),
+        await interaction.response.send_message(
+            "🔄 تم إعادة ضبط جلسة الذكاء الاصطناعي.",
             ephemeral=True,
         )
 
     except Exception as exc:
 
+        bot.total_errors += 1
+
         logger.exception(
-            "Reset failed."
+            "Failed to reset session."
         )
 
-        bot.stats[
-            "errors"
-        ] += 1
-
-        await interaction.followup.send(
-            embed=error_embed(
-                "تعذر إعادة الضبط",
-                f"`{type(exc).__name__}`",
-            ),
+        await interaction.response.send_message(
+            f"❌ تعذر إعادة ضبط الجلسة.\n"
+            f"```{truncate_text(str(exc), 1000)}```",
             ephemeral=True,
         )
 
@@ -1790,74 +1162,87 @@ async def reset(
 
 @bot.tree.command(
     name="stats",
-    description="عرض إحصائيات البوت",
+    description=COMMAND_DESCRIPTIONS["stats"],
 )
 async def stats(
     interaction: discord.Interaction,
-):
+) -> None:
 
-    bot.stats["commands"] += 1
+    if not interaction.guild:
 
-    uptime = bot.format_uptime(
-        bot.uptime_seconds()
+        await interaction.response.send_message(
+            "❌ هذا الأمر يعمل داخل السيرفر فقط.",
+            ephemeral=True,
+        )
+
+        return
+
+    session = bot.voice_manager.get(
+        interaction.guild.id
     )
 
+    if session is None:
+
+        await interaction.response.send_message(
+            "ℹ️ لا توجد جلسة صوتية نشطة.",
+            ephemeral=True,
+        )
+
+        return
+
     embed = discord.Embed(
-        title="📊 إحصائيات البوت",
+        title="📊 Voice AI Statistics",
         color=discord.Color.blurple(),
     )
 
     embed.add_field(
-        name="⏱️ Uptime",
-        value=f"`{uptime}`",
+        name="🎙️ Voice",
+        value=f"`{session.voice}`",
         inline=True,
     )
 
     embed.add_field(
-        name="🏠 Servers",
-        value=f"`{len(bot.guilds)}`",
+        name="👥 Channel",
+        value=f"`{session.channel.name}`",
+        inline=True,
+    )
+
+    try:
+        processed = session.processed_requests
+    except AttributeError:
+        processed = 0
+
+    try:
+        failed = session.failed_requests
+    except AttributeError:
+        failed = 0
+
+    try:
+        memory_count = session.memory_count
+    except AttributeError:
+        memory_count = 0
+
+    embed.add_field(
+        name="🧠 Memory",
+        value=f"`{memory_count}/{MAX_MEMORY_MESSAGES}`",
         inline=True,
     )
 
     embed.add_field(
-        name="🎙️ Sessions",
-        value=f"`{len(bot.voice_sessions)}`",
+        name="💬 Requests",
+        value=f"`{processed}`",
         inline=True,
     )
 
     embed.add_field(
-        name="⚡ Commands",
-        value=f"`{bot.stats['commands']}`",
+        name="❌ Failed",
+        value=f"`{failed}`",
         inline=True,
     )
 
     embed.add_field(
-        name="🧠 AI Requests",
-        value=f"`{bot.stats['ai_requests']}`",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="🎤 Voice Joins",
-        value=f"`{bot.stats['voice_joins']}`",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="👋 Voice Leaves",
-        value=f"`{bot.stats['voice_leaves']}`",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="🎧 Voice Messages",
-        value=f"`{bot.stats['voice_messages']}`",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="❌ Errors",
-        value=f"`{bot.stats['errors']}`",
+        name="🎤 Default",
+        value=f"`{DEFAULT_GEMINI_VOICE}`",
         inline=True,
     )
 
@@ -1868,157 +1253,137 @@ async def stats(
 
 
 # ============================================================
-# APP COMMAND ERROR HANDLER
+# AUTOCOMPLETE ERROR HANDLER
 # ============================================================
 
 @bot.tree.error
-async def on_app_command_error(
+async def on_tree_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
-):
+) -> None:
 
-    bot.stats[
-        "errors"
-    ] += 1
+    bot.total_errors += 1
 
     logger.error(
-        "Slash command error: %s",
+        "Application command error: %s",
         error,
-        exc_info=True,
+        exc_info=(
+            type(error),
+            error,
+            error.__traceback__,
+        ),
     )
 
-    if isinstance(
-        error,
-        app_commands.CommandOnCooldown,
-    ):
+    if interaction.response.is_done():
 
-        message = (
-            "⏳ انتظر قليلاً ثم حاول مرة أخرى."
-        )
+        try:
 
-    elif isinstance(
-        error,
-        app_commands.CheckFailure,
-    ):
+            await interaction.followup.send(
+                "❌ حدث خطأ أثناء تنفيذ الأمر.",
+                ephemeral=True,
+            )
 
-        message = (
-            "🚫 لا تملك صلاحية استخدام هذا الأمر."
-        )
-
-    elif isinstance(
-        error,
-        app_commands.TransformerError,
-    ):
-
-        message = (
-            "⚠️ القيمة المدخلة غير صحيحة."
-        )
+        except Exception:
+            pass
 
     else:
 
-        message = (
-            "حدث خطأ غير متوقع أثناء تنفيذ الأمر."
-        )
-
-    try:
-
-        if interaction.response.is_done():
-
-            await interaction.followup.send(
-                embed=error_embed(
-                    "حدث خطأ",
-                    message,
-                ),
-                ephemeral=True,
-            )
-
-        else:
+        try:
 
             await interaction.response.send_message(
-                embed=error_embed(
-                    "حدث خطأ",
-                    message,
-                ),
+                "❌ حدث خطأ أثناء تنفيذ الأمر.",
                 ephemeral=True,
             )
 
-    except Exception:
-
-        logger.exception(
-            "Failed to send command error."
-        )
+        except Exception:
+            pass
 
 
 # ============================================================
-# SHUTDOWN
+# GLOBAL EXCEPTION HANDLER
 # ============================================================
 
-async def shutdown():
+def handle_unhandled_exception(
+    exception_type,
+    exception,
+    traceback_object,
+) -> None:
 
-    logger.info(
-        "Shutdown requested."
+    logger.critical(
+        "Unhandled Python exception.",
+        exc_info=(
+            exception_type,
+            exception,
+            traceback_object,
+        ),
     )
 
-    try:
-
-        await bot.close()
-
-    except Exception:
-
-        logger.exception(
-            "Error during shutdown."
-        )
-
 
 # ============================================================
-# STARTUP
+# MAIN
 # ============================================================
 
-def main():
+async def main() -> None:
 
-    try:
-
-        validate_startup_config()
-
-    except Exception as exc:
-
-        print()
-        print("=" * 60)
-        print("CONFIGURATION ERROR")
-        print("=" * 60)
-        print(
-            f"❌ {exc}"
+    if not DISCORD_TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing."
         )
-        print("=" * 60)
-        print()
-
-        raise SystemExit(1)
 
     logger.info(
-        "Configuration validated successfully."
+        "============================================================"
     )
 
     logger.info(
-        "Project: %s v%s",
+        "%s v%s",
         PROJECT_NAME,
         PROJECT_VERSION,
     )
 
     logger.info(
-        "Starting Discord bot..."
+        "%s",
+        PROJECT_DESCRIPTION,
+    )
+
+    logger.info(
+        "Starting Discord client..."
+    )
+
+    logger.info(
+        "Default Gemini voice: %s",
+        DEFAULT_GEMINI_VOICE,
+    )
+
+    logger.info(
+        "Memory: %s",
+        "enabled" if MEMORY_ENABLED else "disabled",
+    )
+
+    logger.info(
+        "============================================================"
     )
 
     try:
 
-        bot.run(
-            DISCORD_TOKEN
-        )
+        async with bot:
+
+            await bot.start(
+                DISCORD_TOKEN
+            )
 
     except KeyboardInterrupt:
 
         logger.info(
-            "Bot stopped by user."
+            "Shutdown requested by keyboard."
         )
+
+    except asyncio.CancelledError:
+
+        logger.info(
+            "Main task cancelled."
+        )
+
+        raise
 
     except Exception:
 
@@ -2028,6 +1393,16 @@ def main():
 
         raise
 
+    finally:
+
+        if not bot.is_closed():
+
+            await bot.shutdown()
+
+        logger.info(
+            "Cloud Voice AI stopped."
+        )
+
 
 # ============================================================
 # ENTRY POINT
@@ -2035,4 +1410,22 @@ def main():
 
 if __name__ == "__main__":
 
-    main()
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Cloud Voice AI terminated."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Cloud Voice AI terminated with an error."
+        )
+
+        raise
