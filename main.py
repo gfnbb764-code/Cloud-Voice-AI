@@ -2367,4 +2367,248 @@ async def kick(
             f"👢 تم طرد **{member}**."
         )
 
-    except Exception
+    except Exception as error:
+
+        await interaction.response.send_message(
+            f"❌ فشل الطرد: `{error}`",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="ban",
+    description="حظر عضو — صاحب السيرفر فقط.",
+)
+@app_commands.describe(
+    member="العضو",
+    reason="السبب",
+)
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str | None = None,
+) -> None:
+
+    if not await require_moderation_owner(
+        interaction
+    ):
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "ban_members",
+    ):
+
+        await interaction.response.send_message(
+            "❌ البوت لا يملك Ban Members.",
+            ephemeral=True,
+        )
+
+        return
+
+    me = interaction.guild.me
+
+    if (
+        me
+        and member.top_role >= me.top_role
+    ):
+
+        await interaction.response.send_message(
+            "❌ لا أستطيع حظر عضو رتبته أعلى من رتبتي أو مساوية لها.",
+            ephemeral=True,
+        )
+
+        return
+
+    reason = (
+        reason[:MODERATION_MAX_REASON_LENGTH]
+        if reason
+        else "Cloud Voice AI moderation"
+    )
+
+    try:
+
+        await member.ban(
+            reason=reason,
+            delete_message_seconds=0,
+        )
+
+        await interaction.response.send_message(
+            f"🔨 تم حظر **{member}**."
+        )
+
+    except Exception as error:
+
+        await interaction.response.send_message(
+            f"❌ فشل الحظر: `{error}`",
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# VOICE STATE EVENTS
+# ============================================================
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+
+    if not AUTO_LEAVE_EMPTY_CHANNEL:
+        return
+
+    session = bot.voice_manager.get(
+        member.guild.id
+    )
+
+    if session is None:
+        return
+
+    channel = session.channel
+
+    if channel is None:
+        return
+
+    human_members = [
+        m
+        for m in channel.members
+        if not m.bot
+    ]
+
+    if human_members:
+        return
+
+    async def delayed_leave() -> None:
+
+        try:
+
+            await asyncio.sleep(
+                AUTO_LEAVE_DELAY_SECONDS
+            )
+
+            current = bot.voice_manager.get(
+                member.guild.id
+            )
+
+            if current is None:
+                return
+
+            humans = [
+                m
+                for m in current.channel.members
+                if not m.bot
+            ]
+
+            if not humans:
+
+                await bot.voice_manager.leave(
+                    member.guild.id
+                )
+
+                logger.info(
+                    "Left empty voice channel | guild=%s",
+                    member.guild.id,
+                )
+
+        except asyncio.CancelledError:
+            return
+
+        except Exception:
+            logger.exception(
+                "Auto leave failed"
+            )
+
+    asyncio.create_task(
+        delayed_leave()
+    )
+
+
+# ============================================================
+# APPLICATION COMMAND ERROR
+# ============================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+
+    logger.exception(
+        "Application command error",
+        exc_info=error,
+    )
+
+    message = (
+        "❌ حدث خطأ أثناء تنفيذ الأمر."
+    )
+
+    if isinstance(
+        error,
+        app_commands.CommandOnCooldown,
+    ):
+        message = (
+            "⏳ الأمر عليه انتظار، حاول بعد قليل."
+        )
+
+    try:
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# GLOBAL ERROR
+# ============================================================
+
+@bot.event
+async def on_error(
+    event: str,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+
+    logger.exception(
+        "Discord event error: %s",
+        event,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+
+    if not DISCORD_TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing."
+        )
+
+    logger.info(
+        "Starting %s...",
+        "Cloud Voice AI",
+    )
+
+    bot.run(
+        DISCORD_TOKEN
+    )
+
+
+if __name__ == "__main__":
+    main()
