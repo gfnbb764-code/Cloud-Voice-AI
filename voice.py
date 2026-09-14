@@ -2,7 +2,7 @@
 # ============================================================
 # Cloud Voice AI — Discord Voice Engine
 # Full voice session / receive / Gemini / TTS system
-# Compatible with main.py + config.py
+# Compatible with main.py + config.py + gemini.py
 # ============================================================
 
 from __future__ import annotations
@@ -83,7 +83,10 @@ MAX_BUFFER_BYTES = (
     * int(MAX_BUFFER_SECONDS)
 )
 
-MAX_MEMORY = max(1, int(MAX_MEMORY_MESSAGES))
+MAX_MEMORY = max(
+    1,
+    int(MAX_MEMORY_MESSAGES),
+)
 
 AI_SEMAPHORE_LIMIT = max(
     1,
@@ -110,14 +113,15 @@ def pcm_stereo_48k_to_mono_16k(
         16000 Hz
         mono
         signed 16-bit PCM
-
-    Discord -> Gemini.
     """
 
     if not pcm:
         return b""
 
-    frame_width = DISCORD_WIDTH * DISCORD_CHANNEL_COUNT
+    frame_width = (
+        DISCORD_WIDTH
+        * DISCORD_CHANNEL_COUNT
+    )
 
     if frame_width <= 0:
         return b""
@@ -133,31 +137,44 @@ def pcm_stereo_48k_to_mono_16k(
 
     output = bytearray()
 
-    # Every 3 frames at 48kHz becomes 1 frame at 16kHz.
-    step = 3
+    frame_count = (
+        usable_length // frame_width
+    )
 
-    frame_count = usable_length // frame_width
+    # 48000 -> 16000 = 3:1
+    step = 3
 
     for frame_index in range(
         0,
         frame_count,
         step,
     ):
-        offset = frame_index * frame_width
+        offset = (
+            frame_index
+            * frame_width
+        )
 
         left = int.from_bytes(
-            pcm[offset:offset + 2],
+            pcm[
+                offset:
+                offset + 2
+            ],
             byteorder="little",
             signed=True,
         )
 
         right = int.from_bytes(
-            pcm[offset + 2:offset + 4],
+            pcm[
+                offset + 2:
+                offset + 4
+            ],
             byteorder="little",
             signed=True,
         )
 
-        mono = (left + right) // 2
+        mono = (
+            left + right
+        ) // 2
 
         output.extend(
             int(mono).to_bytes(
@@ -221,9 +238,6 @@ def tts_pcm_to_discord_pcm(
         48000 Hz
         stereo
         16-bit
-
-    This uses simple sample duplication / nearest-neighbor
-    upsampling because 24kHz -> 48kHz is exactly 2x.
     """
 
     if not pcm:
@@ -248,20 +262,20 @@ def tts_pcm_to_discord_pcm(
 
     output = bytearray()
 
+    # 24kHz -> 48kHz = exactly 2x
+    # Mono -> stereo = duplicate sample
     for offset in range(
         0,
         len(pcm),
         2,
     ):
         sample = pcm[
-            offset:offset + 2
+            offset:
+            offset + 2
         ]
 
-        # 24k -> 48k
         output.extend(sample)
         output.extend(sample)
-
-        # Mono -> stereo
         output.extend(sample)
         output.extend(sample)
 
@@ -287,7 +301,10 @@ def pcm_duration_seconds(
     if bytes_per_second <= 0:
         return 0.0
 
-    return len(pcm) / bytes_per_second
+    return (
+        len(pcm)
+        / bytes_per_second
+    )
 
 
 # ============================================================
@@ -302,7 +319,6 @@ class UserAudioState:
 
     user_id: int
     username: str
-
     buffer: bytearray
 
     started_at: float = 0.0
@@ -363,7 +379,9 @@ class UserAudioState:
 
     def take_buffer(self) -> bytes:
 
-        data = bytes(self.buffer)
+        data = bytes(
+            self.buffer
+        )
 
         self.buffer.clear()
 
@@ -386,16 +404,15 @@ class UserAudioState:
 # VOICE AI SINK
 # ============================================================
 
-class VoiceAISink(voice_recv.AudioSink):
+class VoiceAISink(
+    voice_recv.AudioSink
+):
     """
     Discord voice receive sink.
 
-    Important:
-        wants_opus() returns False.
-
-    The DAVE-aware voice-recv fork is responsible for
-    decrypting and decoding Discord voice packets before
-    this sink receives PCM.
+    The DAVE-aware voice-recv fork handles
+    Discord voice packet decryption and Opus
+    decoding before PCM reaches this sink.
     """
 
     def __init__(
@@ -426,7 +443,7 @@ class VoiceAISink(voice_recv.AudioSink):
 
     def wants_opus(self) -> bool:
         """
-        We want decoded PCM, not Opus packets.
+        Request decoded PCM instead of Opus packets.
         """
 
         return False
@@ -437,11 +454,8 @@ class VoiceAISink(voice_recv.AudioSink):
         data,
     ) -> None:
         """
-        Called by discord-ext-voice-recv when PCM
-        audio is received.
-
-        This callback is synchronous, so it schedules
-        async processing on the event loop.
+        Called by discord-ext-voice-recv
+        when decoded PCM audio is available.
         """
 
         if self._closed:
@@ -554,9 +568,12 @@ class VoiceAISink(voice_recv.AudioSink):
 
         try:
             task.result()
+
         except asyncio.CancelledError:
             pass
+
         except Exception:
+
             logger.exception(
                 "Unhandled voice sink task error."
             )
@@ -697,15 +714,19 @@ class VoiceAISink(voice_recv.AudioSink):
                 user_id,
             )
 
-    def start_watchdog(
-        self,
-    ) -> None:
+    # ========================================================
+    # WATCHDOG
+    # ========================================================
+
+    def start_watchdog(self) -> None:
 
         if self._watchdog_task is not None:
             return
 
-        self._watchdog_task = asyncio.create_task(
-            self._watchdog()
+        self._watchdog_task = (
+            asyncio.create_task(
+                self._watchdog()
+            )
         )
 
     async def _watchdog(self) -> None:
@@ -848,18 +869,28 @@ class VoiceSession:
             VoiceAISink
         ] = None
 
-        self.engine = GeminiEngine(
-            voice=self.voice
+        # GeminiEngine does NOT accept voice= in __init__.
+        # The current voice is configured immediately after creation.
+        self.engine = GeminiEngine()
+
+        self.engine.set_voice(
+            self.voice
         )
 
         self._closed = False
 
-        self._processing_lock = asyncio.Lock()
+        self._processing_lock = (
+            asyncio.Lock()
+        )
 
-        self._playback_lock = asyncio.Lock()
+        self._playback_lock = (
+            asyncio.Lock()
+        )
 
-        self._ai_semaphore = asyncio.Semaphore(
-            AI_SEMAPHORE_LIMIT
+        self._ai_semaphore = (
+            asyncio.Semaphore(
+                AI_SEMAPHORE_LIMIT
+            )
         )
 
         self.processed_requests = 0
@@ -884,13 +915,16 @@ class VoiceSession:
 
         try:
 
-            return len(
-                self.engine.memory
-            )
+            return self.engine.memory_size()
 
         except Exception:
 
-            return 0
+            try:
+                return len(
+                    self.engine.memory
+                )
+            except Exception:
+                return 0
 
     # ========================================================
     # CONNECTION
@@ -907,6 +941,7 @@ class VoiceSession:
             )
 
         if self.voice_client is not None:
+
             if self.voice_client.is_connected():
                 return
 
@@ -942,6 +977,11 @@ class VoiceSession:
 
         logger.info(
             "Voice AI listening in guild %s.",
+            self.guild.id,
+        )
+
+        logger.info(
+            "Voice session created for guild %s.",
             self.guild.id,
         )
 
@@ -985,10 +1025,12 @@ class VoiceSession:
 
             try:
 
-                result = await asyncio.to_thread(
-                    self.engine.process_voice,
+                # GeminiEngine.process_voice() is async.
+                # Do NOT run it through asyncio.to_thread().
+                result = await self.engine.process_voice(
                     audio=audio,
                     username=username,
+                    voice=self.voice,
                     mime_type=mime_type,
                 )
 
@@ -1010,7 +1052,12 @@ class VoiceSession:
                     b"",
                 )
 
+                error = result.get(
+                    "error"
+                )
+
                 if transcript:
+
                     logger.info(
                         "STT [%s]: %s",
                         username,
@@ -1018,14 +1065,28 @@ class VoiceSession:
                     )
 
                 if response_text:
+
                     logger.info(
                         "AI [%s]: %s",
                         username,
                         response_text[:300],
                     )
 
+                if error:
+
+                    logger.warning(
+                        "Voice pipeline returned an error for %s: %s",
+                        username,
+                        error,
+                    )
+
                 if not audio_bytes:
-                    self.processed_requests += 1
+
+                    if error:
+                        self.failed_requests += 1
+                    else:
+                        self.processed_requests += 1
+
                     return
 
                 await self.play_tts(
@@ -1168,18 +1229,9 @@ class VoiceSession:
 
         self.voice = selected
 
-        try:
-
-            self.engine.set_voice(
-                selected
-            )
-
-        except AttributeError:
-
-            # Compatibility with GeminiEngine
-            # versions that expose the voice
-            # attribute directly.
-            self.engine.voice = selected
+        self.engine.set_voice(
+            selected
+        )
 
         logger.info(
             "Voice changed to %s in guild %s.",
@@ -1197,23 +1249,18 @@ class VoiceSession:
 
             self.engine.clear_memory()
 
-        except AttributeError:
+        except Exception:
 
-            try:
-
-                self.engine.memory.clear()
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to clear Gemini memory."
-                )
+            logger.exception(
+                "Failed to clear Gemini memory."
+            )
 
     def reset(self) -> None:
 
         self.clear_memory()
 
         self.processed_requests = 0
+
         self.failed_requests = 0
 
         self.last_activity_at = time.time()
@@ -1243,7 +1290,9 @@ class VoiceSession:
 
             try:
                 self.sink.cleanup()
+
             except Exception:
+
                 logger.exception(
                     "Failed to clean voice sink."
                 )
@@ -1273,6 +1322,17 @@ class VoiceSession:
                 )
 
             self.voice_client = None
+
+        try:
+
+            await self.engine.close()
+
+        except Exception:
+
+            logger.debug(
+                "Failed to close Gemini engine.",
+                exc_info=True,
+            )
 
         logger.info(
             "Voice session disconnected for guild %s.",
@@ -1345,15 +1405,19 @@ class VoiceSessionManager:
                     == channel.id
                 ):
 
-                    if (
-                        existing.voice
-                        != normalize_voice_name(
+                    selected = (
+                        normalize_voice_name(
                             voice
                         )
+                    )
+
+                    if (
+                        existing.voice
+                        != selected
                     ):
 
                         existing.set_voice(
-                            voice
+                            selected
                         )
 
                     return existing
@@ -1460,8 +1524,6 @@ async def send_voice_list(
 ) -> None:
     """
     Send the complete Gemini voice list.
-
-    This function is imported directly by main.py.
     """
 
     voices = list(
@@ -1477,11 +1539,10 @@ async def send_voice_list(
 
         return
 
-    # Discord embed description limit is 4096.
-    # Keep enough room for formatting.
     chunks: list[str] = []
 
     current: list[str] = []
+
     current_length = 0
 
     for index, voice in enumerate(
@@ -1506,15 +1567,18 @@ async def send_voice_list(
             )
 
             current = []
+
             current_length = 0
 
         current.append(line)
 
         current_length += (
-            len(line) + 1
+            len(line)
+            + 1
         )
 
     if current:
+
         chunks.append(
             "\n".join(current)
         )
@@ -1529,7 +1593,10 @@ async def send_voice_list(
         title = (
             "🎙️ Gemini Voices"
             if len(chunks) == 1
-            else f"🎙️ Gemini Voices — {chunk_index}/{len(chunks)}"
+            else (
+                "🎙️ Gemini Voices — "
+                f"{chunk_index}/{len(chunks)}"
+            )
         )
 
         embed = discord.Embed(
@@ -1600,4 +1667,4 @@ __all__ = [
     "VoiceAISink",
     "send_voice_list",
     "send_voice_channel_message",
-]
+        ]
