@@ -1,43 +1,37 @@
-# ============================================================
-# AI VOICE BOT
 # gemini.py
 # ============================================================
-#
-# Gemini AI Engine
-#
-# المسؤوليات:
-# - الاتصال بـ Gemini
-# - تحويل الصوت إلى نص STT
-# - إرسال النص إلى Gemini Chat
-# - إنشاء رد AI
-# - تحويل الرد إلى صوت TTS
-# - إدارة الذاكرة
-# - إدارة الأخطاء وإعادة المحاولة
-#
+# Cloud Voice AI — Gemini Engine
+# STT + Chat + TTS + Memory + Retry Handling
 # ============================================================
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
-import os
-import time
-from typing import Any, Awaitable, Callable, Optional
+import re
+from collections import deque
+from typing import Any, Iterable
 
 from google import genai
 from google.genai import types
 
 from config import (
+    AI_SYSTEM_PROMPT,
+    API_MAX_RETRIES,
+    API_TIMEOUT_SECONDS,
+    DEFAULT_GEMINI_VOICE,
     GEMINI_API_KEY,
+    GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_TEMPERATURE,
+    GEMINI_VOICES,
+    MAX_MEMORY_MESSAGES,
+    MEMORY_ENABLED,
+    RETRY_DELAY_SECONDS,
     CHAT_MODEL,
     TRANSCRIBE_MODEL,
     TTS_MODEL,
-    DEFAULT_GEMINI_VOICE,
-    GEMINI_VOICES,
-    AI_SYSTEM_PROMPT,
-    MAX_MEMORY_MESSAGES,
-    GEMINI_TEMPERATURE,
-    GEMINI_MAX_OUTPUT_TOKENS,
+    normalize_voice_name,
 )
 
 
@@ -45,772 +39,116 @@ from config import (
 # LOGGER
 # ============================================================
 
-logger = logging.getLogger(
-    "ai_voice_bot.gemini"
-)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 
-MAX_RETRIES = 3
+MAX_TRANSCRIPT_LENGTH = 4000
+MAX_RESPONSE_LENGTH = 4000
+MAX_TTS_TEXT_LENGTH = 3500
 
-RETRY_BASE_DELAY = 1.5
+DEFAULT_AUDIO_MIME_TYPE = "audio/wav"
 
-REQUEST_TIMEOUT = 45.0
-
-MAX_AUDIO_BYTES = 15 * 1024 * 1024
-
-MAX_TEXT_LENGTH = 12000
+RETRYABLE_ERROR_NAMES = (
+    "TimeoutError",
+    "ConnectError",
+    "ConnectionError",
+    "ServiceUnavailable",
+    "InternalServerError",
+    "TooManyRequests",
+    "ResourceExhausted",
+)
 
 
 # ============================================================
-# GEMINI ENGINE
+# HELPERS
 # ============================================================
 
-class GeminiEngine:
+def _clean_text(
+    value: Any,
+) -> str:
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    text = text.replace("\x00", " ")
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+
+    return text.strip()
+
+
+def _limit_text(
+    text: str,
+    maximum: int,
+) -> str:
+    text = _clean_text(text)
+
+    if len(text) <= maximum:
+        return text
+
+    return text[: maximum - 1].rstrip() + "…"
+
+
+def _safe_username(
+    username: str | None,
+) -> str:
+    username = _clean_text(username)
+
+    if not username:
+        return "User"
+
+    username = username.replace("@", "")
+
+    return _limit_text(
+        username,
+        80,
+    )
+
+
+def _extract_response_text(
+    response: Any,
+) -> str:
     """
-    محرك Gemini الكامل للبوت الصوتي.
-
-    Pipeline:
-
-        Discord Audio
-              ↓
-        STT / Transcription
-              ↓
-        Gemini Chat
-              ↓
-        Text Response
-              ↓
-        Gemini TTS
-              ↓
-        Raw PCM Audio
+    Safely extracts text from a Gemini GenerateContent response.
     """
 
-    def __init__(
-        self,
-    ):
-
-        # ----------------------------------------------------
-        # API KEY
-        # ----------------------------------------------------
-
-        self.api_key = (
-            GEMINI_API_KEY
-            or os.getenv(
-                "GEMINI_API_KEY"
-            )
-        )
-
-        if not self.api_key:
-
-            raise RuntimeError(
-                "GEMINI_API_KEY is missing."
-            )
-
-        # ----------------------------------------------------
-        # Gemini Client
-        # ----------------------------------------------------
-
-        self.client = genai.Client(
-            api_key=self.api_key
-        )
-
-        # ----------------------------------------------------
-        # Models
-        # ----------------------------------------------------
-
-        self.chat_model = (
-            CHAT_MODEL
-        )
-
-        self.transcribe_model = (
-            TRANSCRIBE_MODEL
-        )
-
-        self.tts_model = (
-            TTS_MODEL
-        )
-
-        # ----------------------------------------------------
-        # Memory
-        # ----------------------------------------------------
-
-        self.memory: list[
-            dict[str, Any]
-        ] = []
-
-        # ----------------------------------------------------
-        # Statistics
-        # ----------------------------------------------------
-
-        self.requests = 0
-
-        self.transcriptions = 0
-
-        self.chat_requests = 0
-
-        self.tts_requests = 0
-
-        self.errors = 0
-
-        self.last_request_at = 0.0
-
-        # ----------------------------------------------------
-        # State
-        # ----------------------------------------------------
-
-        self.closed = False
-
-        logger.info(
-            "GeminiEngine initialized | chat=%s | stt=%s | tts=%s",
-            self.chat_model,
-            self.transcribe_model,
-            self.tts_model,
-        )
-
-    # ========================================================
-    # PROCESS VOICE
-    # ========================================================
-
-    async def process_voice(
-        self,
-        audio: bytes,
-        memory: Optional[
-            list[dict[str, Any]]
-        ] = None,
-        username: Optional[str] = None,
-        voice: Optional[str] = None,
-    ) -> Optional[dict[str, Any]]:
-        """
-        يعالج مقطع صوت كامل.
-
-        Returns:
-
-        {
-            "text": "نص المستخدم",
-            "response": "رد Gemini",
-            "audio": b"..."
-        }
-        """
-
-        if self.closed:
-
-            logger.warning(
-                "GeminiEngine is closed."
-            )
-
-            return None
-
-        if not audio:
-
-            return None
-
-        if len(audio) > MAX_AUDIO_BYTES:
-
-            logger.warning(
-                "Audio exceeds maximum size: %s bytes",
-                len(audio),
-            )
-
-            return None
-
-        started_at = time.monotonic()
-
-        try:
-
-            # ------------------------------------------------
-            # STT
-            # ------------------------------------------------
-
-            text = await self.transcribe(
-                audio
-            )
-
-            if not text:
-
-                logger.debug(
-                    "No transcription returned."
-                )
-
-                return None
-
-            text = text.strip()
-
-            if not text:
-
-                return None
-
-            logger.info(
-                "Transcription: %s",
-                text,
-            )
-
-            # ------------------------------------------------
-            # Memory
-            # ------------------------------------------------
-
-            active_memory = (
-                memory
-                if memory is not None
-                else self.memory
-            )
-
-            # ------------------------------------------------
-            # Chat
-            # ------------------------------------------------
-
-            response = await self.generate_response(
-                text=text,
-                memory=active_memory,
-                username=username,
-            )
-
-            if not response:
-
-                return {
-                    "text": text,
-                    "response": "",
-                    "audio": None,
-                }
-
-            # ------------------------------------------------
-            # Voice
-            # ------------------------------------------------
-
-            selected_voice = (
-                voice
-                or DEFAULT_GEMINI_VOICE
-            )
-
-            if (
-                selected_voice
-                not in GEMINI_VOICES
-            ):
-
-                logger.warning(
-                    "Invalid voice '%s'; using '%s'.",
-                    selected_voice,
-                    DEFAULT_GEMINI_VOICE,
-                )
-
-                selected_voice = (
-                    DEFAULT_GEMINI_VOICE
-                )
-
-            # ------------------------------------------------
-            # TTS
-            # ------------------------------------------------
-
-            audio_response = (
-                await self.generate_speech(
-                    text=response,
-                    voice=selected_voice,
-                )
-            )
-
-            elapsed = (
-                time.monotonic()
-                - started_at
-            )
-
-            logger.info(
-                "Voice pipeline completed in %.2fs",
-                elapsed,
-            )
-
-            return {
-                "text": text,
-                "response": response,
-                "audio": audio_response,
-            }
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception:
-
-            self.errors += 1
-
-            logger.exception(
-                "process_voice failed"
-            )
-
-            return None
-
-    # ========================================================
-    # TRANSCRIBE
-    # ========================================================
-
-    async def transcribe(
-        self,
-        audio: bytes,
-    ) -> Optional[str]:
-        """
-        يحول WAV إلى نص باستخدام Gemini.
-        """
-
-        if self.closed:
-
-            return None
-
-        if not audio:
-
-            return None
-
-        if len(audio) > MAX_AUDIO_BYTES:
-
-            raise ValueError(
-                "Audio file is too large."
-            )
-
-        self.transcriptions += 1
-
-        self.requests += 1
-
-        self.last_request_at = (
-            time.monotonic()
-        )
-
-        # ----------------------------------------------------
-        # Gemini API Request
-        # ----------------------------------------------------
-
-        async def request():
-
-            response = (
-                await self.client.aio.models.generate_content(
-                    model=self.transcribe_model,
-                    contents=[
-                        types.Part.from_bytes(
-                            data=audio,
-                            mime_type="audio/wav",
-                        ),
-                        (
-                            "Transcribe exactly what the user says. "
-                            "Return only the spoken text. "
-                            "Preserve the spoken language. "
-                            "Do not translate unless necessary "
-                            "to understand the speech. "
-                            "Do not add explanations, labels, "
-                            "descriptions, or commentary."
-                        ),
-                    ],
-                )
-            )
-
-            return response
-
-        response = await self._with_retry(
-            request
-        )
-
-        if response is None:
-
-            return None
-
+    # Normal SDK shortcut.
+    try:
         text = getattr(
             response,
             "text",
             None,
         )
 
-        if not text:
+        if text:
+            return _clean_text(text)
+    except Exception:
+        pass
 
-            return None
-
-        text = str(
-            text
-        ).strip()
-
-        if not text:
-
-            return None
-
-        if len(text) > MAX_TEXT_LENGTH:
-
-            text = text[
-                :MAX_TEXT_LENGTH
-            ].strip()
-
-        return text
-
-    # ========================================================
-    # GENERATE RESPONSE
-    # ========================================================
-
-    async def generate_response(
-        self,
-        text: str,
-        memory: Optional[
-            list[dict[str, Any]]
-        ] = None,
-        username: Optional[str] = None,
-    ) -> Optional[str]:
-        """
-        يرسل النص إلى Gemini ويولد الرد.
-        """
-
-        if self.closed:
-
-            return None
-
-        if not text:
-
-            return None
-
-        text = text.strip()
-
-        if not text:
-
-            return None
-
-        if len(text) > MAX_TEXT_LENGTH:
-
-            text = text[
-                :MAX_TEXT_LENGTH
-            ].strip()
-
-        self.chat_requests += 1
-
-        self.requests += 1
-
-        self.last_request_at = (
-            time.monotonic()
-        )
-
-        # ----------------------------------------------------
-        # Memory
-        # ----------------------------------------------------
-
-        active_memory = (
-            memory
-            if memory is not None
-            else self.memory
-        )
-
-        memory_text = (
-            self._format_memory(
-                active_memory
-            )
-        )
-
-        # ----------------------------------------------------
-        # Username
-        # ----------------------------------------------------
-
-        user_label = (
-            str(username).strip()
-            if username
-            else "User"
-        )
-
-        if not user_label:
-
-            user_label = "User"
-
-        # ----------------------------------------------------
-        # Prompt
-        # ----------------------------------------------------
-
-        prompt_parts: list[str] = []
-
-        if AI_SYSTEM_PROMPT:
-
-            prompt_parts.append(
-                AI_SYSTEM_PROMPT.strip()
-            )
-
-        prompt_parts.append(
-            "You are currently talking "
-            "inside a Discord voice channel."
-        )
-
-        prompt_parts.append(
-            "Keep your answer natural, concise, "
-            "friendly, and comfortable for spoken conversation."
-        )
-
-        prompt_parts.append(
-            "Answer in the same language as the user "
-            "whenever practical."
-        )
-
-        prompt_parts.append(
-            "Do not use markdown unless necessary."
-        )
-
-        prompt_parts.append(
-            "Do not describe your internal reasoning."
-        )
-
-        prompt_parts.append(
-            f"\nCurrent speaker: {user_label}"
-        )
-
-        if memory_text:
-
-            prompt_parts.append(
-                "\nConversation memory:"
-            )
-
-            prompt_parts.append(
-                memory_text
-            )
-
-        prompt_parts.append(
-            "\nCurrent user message:"
-        )
-
-        prompt_parts.append(
-            text
-        )
-
-        prompt = "\n".join(
-            prompt_parts
-        )
-
-        # ----------------------------------------------------
-        # Gemini Request
-        # ----------------------------------------------------
-
-        async def request():
-
-            config_kwargs = {
-                "temperature": GEMINI_TEMPERATURE,
-                "max_output_tokens": (
-                    GEMINI_MAX_OUTPUT_TOKENS
-                ),
-            }
-
-            response = (
-                await self.client.aio.models.generate_content(
-                    model=self.chat_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        **config_kwargs
-                    ),
-                )
-            )
-
-            return response
-
-        response = await self._with_retry(
-            request
-        )
-
-        if response is None:
-
-            return None
-
-        result = getattr(
+    # Fallback through candidates/parts.
+    try:
+        candidates = getattr(
             response,
-            "text",
+            "candidates",
             None,
         )
 
-        if not result:
-
-            return None
-
-        result = str(
-            result
-        ).strip()
-
-        if not result:
-
-            return None
-
-        if len(result) > MAX_TEXT_LENGTH:
-
-            result = result[
-                :MAX_TEXT_LENGTH
-            ].strip()
-
-        # ----------------------------------------------------
-        # تحديث Memory الداخلية
-        # ----------------------------------------------------
-
-        self._add_internal_memory(
-            role="user",
-            content=text,
-            username=username,
-        )
-
-        self._add_internal_memory(
-            role="assistant",
-            content=result,
-        )
-
-        return result
-
-    # ========================================================
-    # GENERATE SPEECH
-    # ========================================================
-
-    async def generate_speech(
-        self,
-        text: str,
-        voice: Optional[str] = None,
-    ) -> Optional[bytes]:
-        """
-        يحول نص Gemini إلى raw PCM.
-
-        Gemini TTS:
-
-            24000Hz
-            Mono
-            16-bit PCM
-        """
-
-        if self.closed:
-
-            return None
-
-        if not text:
-
-            return None
-
-        text = text.strip()
-
-        if not text:
-
-            return None
-
-        if len(text) > MAX_TEXT_LENGTH:
-
-            text = text[
-                :MAX_TEXT_LENGTH
-            ].strip()
-
-        selected_voice = (
-            voice
-            or DEFAULT_GEMINI_VOICE
-        )
-
-        if (
-            selected_voice
-            not in GEMINI_VOICES
-        ):
-
-            logger.warning(
-                "Invalid TTS voice '%s'; using '%s'.",
-                selected_voice,
-                DEFAULT_GEMINI_VOICE,
-            )
-
-            selected_voice = (
-                DEFAULT_GEMINI_VOICE
-            )
-
-        self.tts_requests += 1
-
-        self.requests += 1
-
-        self.last_request_at = (
-            time.monotonic()
-        )
-
-        # ----------------------------------------------------
-        # TTS Request
-        # ----------------------------------------------------
-
-        async def request():
-
-            response = (
-                await self.client.aio.models.generate_content(
-                    model=self.tts_model,
-                    contents=text,
-                    config=types.GenerateContentConfig(
-                        response_modalities=[
-                            "AUDIO"
-                        ],
-                        speech_config=types.SpeechConfig(
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=(
-                                    types.PrebuiltVoiceConfig(
-                                        voice_name=selected_voice
-                                    )
-                                )
-                            )
-                        ),
-                    ),
-                )
-            )
-
-            return response
-
-        response = await self._with_retry(
-            request
-        )
-
-        if response is None:
-
-            return None
-
-        # ----------------------------------------------------
-        # استخراج الصوت
-        # ----------------------------------------------------
-
-        audio = self._extract_audio(
-            response
-        )
-
-        if not audio:
-
-            logger.warning(
-                "Gemini TTS returned no audio."
-            )
-
-            return None
-
-        logger.debug(
-            "Gemini TTS returned %s bytes.",
-            len(audio),
-        )
-
-        return audio
-
-    # ========================================================
-    # EXTRACT AUDIO
-    # ========================================================
-
-    def _extract_audio(
-        self,
-        response: Any,
-    ) -> Optional[bytes]:
-        """
-        استخراج PCM من استجابة Gemini TTS.
-        """
-
-        if response is None:
-
-            return None
-
-        try:
-
-            candidates = getattr(
-                response,
-                "candidates",
-                None,
-            )
-
-            if not candidates:
-
-                return None
+        if candidates:
+            collected: list[str] = []
 
             for candidate in candidates:
-
                 content = getattr(
                     candidate,
                     "content",
                     None,
                 )
 
-                if not content:
-
+                if content is None:
                     continue
 
                 parts = getattr(
@@ -820,232 +158,337 @@ class GeminiEngine:
                 )
 
                 if not parts:
-
                     continue
 
                 for part in parts:
-
-                    inline_data = getattr(
+                    text = getattr(
                         part,
-                        "inline_data",
+                        "text",
                         None,
                     )
 
-                    if not inline_data:
-
-                        continue
-
-                    data = getattr(
-                        inline_data,
-                        "data",
-                        None,
-                    )
-
-                    if isinstance(
-                        data,
-                        bytes,
-                    ):
-
-                        return data
-
-                    if isinstance(
-                        data,
-                        bytearray,
-                    ):
-
-                        return bytes(
-                            data
+                    if text:
+                        collected.append(
+                            _clean_text(text)
                         )
 
-                    if isinstance(
-                        data,
-                        memoryview,
-                    ):
-
-                        return data.tobytes()
-
-        except Exception:
-
-            logger.exception(
-                "Could not extract TTS audio."
-            )
-
-        return None
-
-    # ========================================================
-    # FORMAT MEMORY
-    # ========================================================
-
-    def _format_memory(
-        self,
-        memory: Optional[
-            list[dict[str, Any]]
-        ],
-    ) -> str:
-        """
-        يحول الذاكرة إلى نص يفهمه Gemini.
-        """
-
-        if not memory:
-
-            return ""
-
-        recent = list(
-            memory[
-                -MAX_MEMORY_MESSAGES:
-            ]
-        )
-
-        lines: list[str] = []
-
-        for item in recent:
-
-            if not isinstance(
-                item,
-                dict,
-            ):
-
-                continue
-
-            role = str(
-                item.get(
-                    "role",
-                    "user",
-                )
-            ).strip()
-
-            content = str(
-                item.get(
-                    "content",
-                    "",
-                )
-            ).strip()
-
-            username = item.get(
-                "username"
-            )
-
-            if not content:
-
-                continue
-
-            if username:
-
-                username = str(
-                    username
+            if collected:
+                return "\n".join(
+                    item
+                    for item in collected
+                    if item
                 ).strip()
 
-            if username:
+    except Exception:
+        pass
 
-                lines.append(
-                    f"{username} ({role}): {content}"
-                )
+    return ""
 
-            else:
 
-                lines.append(
-                    f"{role}: {content}"
-                )
+def _extract_audio_bytes(
+    response: Any,
+) -> bytes:
+    """
+    Extract raw audio bytes from a Gemini TTS response.
+    """
 
-        return "\n".join(
-            lines
+    try:
+        candidates = getattr(
+            response,
+            "candidates",
+            None,
         )
 
-    # ========================================================
-    # INTERNAL MEMORY
-    # ========================================================
+        if not candidates:
+            return b""
 
-    def _add_internal_memory(
-        self,
-        role: str,
-        content: str,
-        username: Optional[str] = None,
-    ) -> None:
-        """
-        يضيف رسالة إلى الذاكرة الداخلية
-        مع الحفاظ على الحد الأقصى.
-        """
-
-        if not content:
-
-            return
-
-        content = str(
-            content
-        ).strip()
-
-        if not content:
-
-            return
-
-        item: dict[str, Any] = {
-            "role": role,
-            "content": content,
-        }
-
-        if username:
-
-            username = str(
-                username
-            ).strip()
-
-            if username:
-
-                item[
-                    "username"
-                ] = username
-
-        self.memory.append(
-            item
-        )
-
-        if (
-            len(self.memory)
-            > MAX_MEMORY_MESSAGES
-        ):
-
-            overflow = (
-                len(self.memory)
-                - MAX_MEMORY_MESSAGES
+        for candidate in candidates:
+            content = getattr(
+                candidate,
+                "content",
+                None,
             )
 
-            del self.memory[
-                0:overflow
-            ]
+            if content is None:
+                continue
 
-    # ========================================================
-    # CLEAR MEMORY
-    # ========================================================
+            parts = getattr(
+                content,
+                "parts",
+                None,
+            )
 
-    def clear_memory(
+            if not parts:
+                continue
+
+            for part in parts:
+                inline_data = getattr(
+                    part,
+                    "inline_data",
+                    None,
+                )
+
+                if inline_data is None:
+                    continue
+
+                data = getattr(
+                    inline_data,
+                    "data",
+                    None,
+                )
+
+                if data is None:
+                    continue
+
+                if isinstance(data, bytes):
+                    return data
+
+                if isinstance(data, bytearray):
+                    return bytes(data)
+
+                if isinstance(data, memoryview):
+                    return data.tobytes()
+
+                if isinstance(data, str):
+                    # Most SDK responses already expose decoded bytes,
+                    # but this fallback handles base64 strings.
+                    try:
+                        return base64.b64decode(
+                            data,
+                            validate=True,
+                        )
+                    except Exception:
+                        return data.encode(
+                            "latin-1",
+                            errors="ignore",
+                        )
+
+    except Exception:
+        logger.exception(
+            "Failed to extract TTS audio."
+        )
+
+    return b""
+
+
+def _is_retryable_error(
+    error: Exception,
+) -> bool:
+    """
+    Determines whether an API exception is worth retrying.
+    """
+
+    error_name = type(error).__name__
+
+    if error_name in RETRYABLE_ERROR_NAMES:
+        return True
+
+    text = str(error).lower()
+
+    retry_markers = (
+        "429",
+        "rate limit",
+        "resource exhausted",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal server error",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "503",
+        "500",
+        "502",
+        "504",
+    )
+
+    return any(
+        marker in text
+        for marker in retry_markers
+    )
+
+
+def _strip_markdown_for_voice(
+    text: str,
+) -> str:
+    """
+    Removes common markdown formatting so TTS sounds natural.
+    """
+
+    text = _clean_text(text)
+
+    if not text:
+        return ""
+
+    # Code blocks.
+    text = re.sub(
+        r"```[\s\S]*?```",
+        "",
+        text,
+    )
+
+    # Inline code.
+    text = re.sub(
+        r"`([^`]*)`",
+        r"\1",
+        text,
+    )
+
+    # Markdown links.
+    text = re.sub(
+        r"\[([^\]]+)\]\([^)]+\)",
+        r"\1",
+        text,
+    )
+
+    # Bold / italic / strike.
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+    text = text.replace("~~", "")
+    text = text.replace("*", "")
+
+    # Headings.
+    text = re.sub(
+        r"(?m)^\s*#{1,6}\s*",
+        "",
+        text,
+    )
+
+    # Bullets.
+    text = re.sub(
+        r"(?m)^\s*[-•]\s+",
+        "",
+        text,
+    )
+
+    # Excessive whitespace.
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return _limit_text(
+        text,
+        MAX_TTS_TEXT_LENGTH,
+    )
+
+
+# ============================================================
+# GEMINI ENGINE
+# ============================================================
+
+class GeminiEngine:
+    """
+    Main Gemini engine used by Cloud Voice AI.
+
+    Responsibilities:
+        - Speech-to-text
+        - Text generation
+        - Text-to-speech
+        - Conversation memory
+        - Retry handling
+        - Voice selection
+    """
+
+    def __init__(
         self,
+        *,
+        api_key: str | None = None,
+        chat_model: str | None = None,
+        transcribe_model: str | None = None,
+        tts_model: str | None = None,
     ) -> None:
-        """
-        يمسح الذاكرة الداخلية بالكامل.
-        """
 
-        self.memory.clear()
+        self.api_key = (
+            api_key
+            or GEMINI_API_KEY
+        )
+
+        if not self.api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is missing."
+            )
+
+        self.chat_model = (
+            chat_model
+            or CHAT_MODEL
+        )
+
+        self.transcribe_model = (
+            transcribe_model
+            or TRANSCRIBE_MODEL
+        )
+
+        self.tts_model = (
+            tts_model
+            or TTS_MODEL
+        )
+
+        self.client = genai.Client(
+            api_key=self.api_key,
+        )
+
+        self._memory: deque[dict[str, str]] = deque(
+            maxlen=MAX_MEMORY_MESSAGES
+        )
+
+        self._lock = asyncio.Lock()
+
+        self.current_voice = normalize_voice_name(
+            DEFAULT_GEMINI_VOICE
+        )
+
+        self.total_transcriptions = 0
+        self.total_responses = 0
+        self.total_speeches = 0
+
+        self.total_errors = 0
 
         logger.info(
-            "Gemini internal memory cleared."
+            "GeminiEngine initialized | chat=%s | stt=%s | tts=%s | voice=%s",
+            self.chat_model,
+            self.transcribe_model,
+            self.tts_model,
+            self.current_voice,
         )
 
     # ========================================================
-    # RESET
+    # VOICE
     # ========================================================
 
-    async def reset(
-        self,
-    ) -> None:
-        """
-        يعيد حالة الذاكرة الداخلية.
-        """
+    @property
+    def voice(self) -> str:
+        return self.current_voice
 
-        self.clear_memory()
+    def set_voice(
+        self,
+        voice: str,
+    ) -> str:
+
+        normalized = normalize_voice_name(
+            voice
+        )
+
+        if normalized not in GEMINI_VOICES:
+            raise ValueError(
+                f"Invalid Gemini voice: {voice}"
+            )
+
+        self.current_voice = normalized
 
         logger.info(
-            "GeminiEngine reset."
+            "Gemini voice changed to %s",
+            normalized,
         )
+
+        return normalized
 
     # ========================================================
     # RETRY
@@ -1053,151 +496,618 @@ class GeminiEngine:
 
     async def _with_retry(
         self,
-        operation: Callable[
-            [],
-            Awaitable[Any]
-        ],
-    ) -> Any:
+        operation,
+        *,
+        operation_name: str = "Gemini request",
+    ):
         """
-        إعادة المحاولة تلقائيًا.
-
-        المحاولات:
-            1
-            2
-            3
+        Executes a Gemini operation with retry handling.
         """
 
-        last_error: Optional[
-            Exception
-        ] = None
+        attempts = max(
+            1,
+            API_MAX_RETRIES + 1,
+        )
+
+        last_error: Exception | None = None
 
         for attempt in range(
             1,
-            MAX_RETRIES + 1,
+            attempts + 1,
         ):
-
-            if self.closed:
-
-                return None
-
             try:
-
-                result = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     operation(),
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=API_TIMEOUT_SECONDS,
                 )
 
-                return result
-
             except asyncio.CancelledError:
-
                 raise
 
             except Exception as error:
-
                 last_error = error
+                self.total_errors += 1
 
-                error_text = str(
+                retryable = _is_retryable_error(
                     error
-                ).lower()
-
-                # --------------------------------------------
-                # أخطاء لا تستحق إعادة المحاولة
-                # --------------------------------------------
-
-                permanent_errors = (
-                    "api key",
-                    "invalid api key",
-                    "permission denied",
-                    "unauthorized",
-                    "authentication",
-                    "invalid argument",
-                    "invalid model",
-                    "model not found",
-                    "not found",
-                    "permission",
                 )
 
-                if any(
-                    item in error_text
-                    for item in permanent_errors
-                ):
-
-                    logger.error(
-                        "Permanent Gemini error: %s",
-                        error,
-                    )
-
-                    break
-
                 logger.warning(
-                    "Gemini request failed "
-                    "(attempt %s/%s): %s",
+                    "%s failed | attempt=%s/%s | retryable=%s | error=%s",
+                    operation_name,
                     attempt,
-                    MAX_RETRIES,
+                    attempts,
+                    retryable,
                     error,
                 )
 
                 if (
-                    attempt
-                    >= MAX_RETRIES
+                    not retryable
+                    or attempt >= attempts
                 ):
+                    raise
 
-                    break
-
-                delay = (
-                    RETRY_BASE_DELAY
-                    * attempt
+                delay = RETRY_DELAY_SECONDS * (
+                    1.5 ** (attempt - 1)
                 )
 
                 await asyncio.sleep(
-                    delay
+                    min(delay, 10.0)
                 )
 
-        self.errors += 1
+        if last_error is not None:
+            raise last_error
 
-        logger.error(
-            "Gemini request failed after %s attempts: %s",
-            MAX_RETRIES,
-            last_error,
+        raise RuntimeError(
+            f"{operation_name} failed."
         )
 
-        return None
+    # ========================================================
+    # TRANSCRIPTION
+    # ========================================================
+
+    async def transcribe(
+        self,
+        audio: bytes,
+        *,
+        mime_type: str = DEFAULT_AUDIO_MIME_TYPE,
+    ) -> str:
+        """
+        Converts Discord PCM/WAV audio into text.
+
+        `voice.py` is expected to provide WAV data.
+        """
+
+        if not audio:
+            return ""
+
+        if not isinstance(audio, bytes):
+            audio = bytes(audio)
+
+        async def request():
+            response = await self.client.aio.models.generate_content(
+                model=self.transcribe_model,
+                contents=[
+                    types.Part.from_bytes(
+                        data=audio,
+                        mime_type=mime_type,
+                    ),
+                    (
+                        "Transcribe exactly what the user said. "
+                        "Automatically detect the spoken language. "
+                        "Return only the transcript, without explanations."
+                    ),
+                ],
+            )
+
+            return response
+
+        response = await self._with_retry(
+            request,
+            operation_name="Speech transcription",
+        )
+
+        text = _extract_response_text(
+            response
+        )
+
+        text = _limit_text(
+            text,
+            MAX_TRANSCRIPT_LENGTH,
+        )
+
+        if text:
+            self.total_transcriptions += 1
+
+        return text
+
+    # ========================================================
+    # MEMORY
+    # ========================================================
+
+    def add_memory(
+        self,
+        role: str,
+        content: str,
+    ) -> None:
+
+        if not MEMORY_ENABLED:
+            return
+
+        content = _clean_text(
+            content
+        )
+
+        if not content:
+            return
+
+        role = _clean_text(
+            role
+        ).lower()
+
+        if role not in {
+            "user",
+            "assistant",
+            "system",
+        }:
+            role = "user"
+
+        self._memory.append(
+            {
+                "role": role,
+                "content": _limit_text(
+                    content,
+                    MAX_RESPONSE_LENGTH,
+                ),
+            }
+        )
+
+    def add_user_message(
+        self,
+        content: str,
+    ) -> None:
+
+        self.add_memory(
+            "user",
+            content,
+        )
+
+    def add_assistant_message(
+        self,
+        content: str,
+    ) -> None:
+
+        self.add_memory(
+            "assistant",
+            content,
+        )
+
+    def clear_memory(self) -> None:
+        self._memory.clear()
+
+    def reset_memory(self) -> None:
+        self.clear_memory()
+
+    def get_memory(
+        self,
+    ) -> list[dict[str, str]]:
+
+        return [
+            dict(item)
+            for item in self._memory
+        ]
+
+    @property
+    def memory(
+        self,
+    ) -> list[dict[str, str]]:
+
+        return self.get_memory()
+
+    def memory_size(self) -> int:
+        return len(self._memory)
+
+    # ========================================================
+    # PROMPT BUILDING
+    # ========================================================
+
+    def _build_chat_contents(
+        self,
+        *,
+        username: str,
+        user_text: str,
+        memory: Iterable[dict[str, str]] | None = None,
+    ) -> list[Any]:
+
+        contents: list[Any] = []
+
+        # System instructions are handled separately through config.
+        # Conversation history is represented as user/model turns.
+        source_memory = (
+            list(memory)
+            if memory is not None
+            else self.get_memory()
+        )
+
+        for item in source_memory:
+            role = item.get(
+                "role",
+                "user",
+            )
+
+            content = _clean_text(
+                item.get(
+                    "content",
+                    "",
+                )
+            )
+
+            if not content:
+                continue
+
+            # Gemini uses "user" and "model".
+            sdk_role = (
+                "model"
+                if role == "assistant"
+                else "user"
+            )
+
+            contents.append(
+                types.Content(
+                    role=sdk_role,
+                    parts=[
+                        types.Part.from_text(
+                            text=content
+                        )
+                    ],
+                )
+            )
+
+        current_username = _safe_username(
+            username
+        )
+
+        current_text = _limit_text(
+            user_text,
+            MAX_TRANSCRIPT_LENGTH,
+        )
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            f"The user speaking in Discord is "
+                            f"{current_username}.\n"
+                            f"User message:\n{current_text}"
+                        )
+                    )
+                ],
+            )
+        )
+
+        return contents
+
+    # ========================================================
+    # CHAT RESPONSE
+    # ========================================================
+
+    async def generate_response(
+        self,
+        text: str,
+        *,
+        username: str = "User",
+        memory: Iterable[dict[str, str]] | None = None,
+    ) -> str:
+
+        text = _clean_text(
+            text
+        )
+
+        if not text:
+            return ""
+
+        contents = self._build_chat_contents(
+            username=username,
+            user_text=text,
+            memory=memory,
+        )
+
+        async def request():
+            config = types.GenerateContentConfig(
+                system_instruction=AI_SYSTEM_PROMPT,
+                temperature=GEMINI_TEMPERATURE,
+                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+            )
+
+            return await self.client.aio.models.generate_content(
+                model=self.chat_model,
+                contents=contents,
+                config=config,
+            )
+
+        response = await self._with_retry(
+            request,
+            operation_name="Chat generation",
+        )
+
+        answer = _extract_response_text(
+            response
+        )
+
+        answer = _limit_text(
+            answer,
+            MAX_RESPONSE_LENGTH,
+        )
+
+        if not answer:
+            answer = (
+                "ما قدرت أطلع رد حاليًا، جرّب مرة ثانية."
+            )
+
+        if MEMORY_ENABLED:
+            self.add_user_message(
+                text
+            )
+
+            self.add_assistant_message(
+                answer
+            )
+
+        self.total_responses += 1
+
+        return answer
+
+    # ========================================================
+    # TEXT TO SPEECH
+    # ========================================================
+
+    async def generate_speech(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> bytes:
+
+        text = _strip_markdown_for_voice(
+            text
+        )
+
+        if not text:
+            return b""
+
+        selected_voice = normalize_voice_name(
+            voice or self.current_voice
+        )
+
+        if selected_voice not in GEMINI_VOICES:
+            selected_voice = self.current_voice
+
+        async def request():
+            speech_config = types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=selected_voice,
+                    )
+                )
+            )
+
+            config = types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=speech_config,
+            )
+
+            return await self.client.aio.models.generate_content(
+                model=self.tts_model,
+                contents=text,
+                config=config,
+            )
+
+        response = await self._with_retry(
+            request,
+            operation_name="Text to speech",
+        )
+
+        audio = _extract_audio_bytes(
+            response
+        )
+
+        if not audio:
+            raise RuntimeError(
+                "Gemini TTS returned no audio data."
+            )
+
+        self.total_speeches += 1
+
+        logger.debug(
+            "TTS generated | voice=%s | bytes=%s",
+            selected_voice,
+            len(audio),
+        )
+
+        return audio
+
+    # ========================================================
+    # FULL VOICE PIPELINE
+    # ========================================================
+
+    async def process_voice(
+        self,
+        audio: bytes,
+        *,
+        username: str = "User",
+        voice: str | None = None,
+        mime_type: str = DEFAULT_AUDIO_MIME_TYPE,
+        memory: Iterable[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Full pipeline:
+
+            Discord audio
+                ↓
+            Gemini STT
+                ↓
+            Gemini Chat
+                ↓
+            Gemini TTS
+                ↓
+            PCM audio bytes
+        """
+
+        if not audio:
+            return {
+                "success": False,
+                "transcript": "",
+                "response": "",
+                "audio": b"",
+                "voice": normalize_voice_name(
+                    voice or self.current_voice
+                ),
+                "error": "No audio received.",
+            }
+
+        async with self._lock:
+            try:
+                transcript = await self.transcribe(
+                    audio,
+                    mime_type=mime_type,
+                )
+
+                if not transcript:
+                    return {
+                        "success": False,
+                        "transcript": "",
+                        "response": "",
+                        "audio": b"",
+                        "voice": normalize_voice_name(
+                            voice or self.current_voice
+                        ),
+                        "error": "No speech detected.",
+                    }
+
+                response_text = await self.generate_response(
+                    transcript,
+                    username=username,
+                    memory=memory,
+                )
+
+                if not response_text:
+                    return {
+                        "success": False,
+                        "transcript": transcript,
+                        "response": "",
+                        "audio": b"",
+                        "voice": normalize_voice_name(
+                            voice or self.current_voice
+                        ),
+                        "error": "Empty AI response.",
+                    }
+
+                speech = await self.generate_speech(
+                    response_text,
+                    voice=voice,
+                )
+
+                return {
+                    "success": True,
+                    "transcript": transcript,
+                    "response": response_text,
+                    "audio": speech,
+                    "voice": normalize_voice_name(
+                        voice or self.current_voice
+                    ),
+                    "error": None,
+                }
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as error:
+                logger.exception(
+                    "Voice pipeline failed."
+                )
+
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "response": "",
+                    "audio": b"",
+                    "voice": normalize_voice_name(
+                        voice or self.current_voice
+                    ),
+                    "error": str(error),
+                }
+
+    # ========================================================
+    # STATS
+    # ========================================================
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "chat_model": self.chat_model,
+            "transcribe_model": self.transcribe_model,
+            "tts_model": self.tts_model,
+            "voice": self.current_voice,
+            "memory_enabled": MEMORY_ENABLED,
+            "memory_messages": self.memory_size(),
+            "max_memory_messages": MAX_MEMORY_MESSAGES,
+            "transcriptions": self.total_transcriptions,
+            "responses": self.total_responses,
+            "speeches": self.total_speeches,
+            "errors": self.total_errors,
+        }
 
     # ========================================================
     # CLOSE
     # ========================================================
 
-    async def close(
-        self,
-    ) -> None:
+    async def close(self) -> None:
         """
-        يغلق محرك Gemini ويحرر حالته.
+        Closes the underlying Gemini client if the installed
+        SDK exposes an async close method.
         """
 
-        if self.closed:
+        try:
+            aio_client = getattr(
+                self.client,
+                "aio",
+                None,
+            )
 
-            return
+            if aio_client is not None:
+                close_method = getattr(
+                    aio_client,
+                    "close",
+                    None,
+                )
 
-        self.closed = True
+                if close_method is not None:
+                    result = close_method()
 
-        self.memory.clear()
+                    if asyncio.iscoroutine(result):
+                        await result
 
-        # ----------------------------------------------------
-        # google-genai client
-        # ----------------------------------------------------
-        #
-        # لا نعتمد على close إجباري هنا حتى تبقى
-        # متوافقة مع نسخة google-genai الموجودة على الهوست.
-        #
-
-        self.client = None
-
-        logger.info(
-            "GeminiEngine closed."
-        )
+        except Exception:
+            logger.debug(
+                "Gemini client close failed.",
+                exc_info=True,
+            )
 
 
 # ============================================================
-# END OF gemini.py
+# FACTORY
 # ============================================================
+
+def create_gemini_engine() -> GeminiEngine:
+    return GeminiEngine()
+
+
+# ============================================================
+# MODULE EXPORTS
+# ============================================================
+
+__all__ = [
+    "GeminiEngine",
+    "create_gemini_engine",
+    ]
