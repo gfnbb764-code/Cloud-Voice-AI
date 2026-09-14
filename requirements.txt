@@ -3,4 +3,3 @@ discord-ext-voice-recv
 google-genai
 python-dotenv
 PyNaCl
-audioop-lts
