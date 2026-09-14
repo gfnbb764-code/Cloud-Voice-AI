@@ -9,9 +9,15 @@
 #     ↓
 # Groq Chat
 #     ↓
-# Local Piper TTS
+# Groq Orpheus Arabic Saudi TTS
 #     ↓
 # Discord playback
+#
+# Important:
+# - Silence is NOT buffered.
+# - Bot audio is ignored.
+# - Voice receive is disabled while TTS is playing.
+# - Buffers are cleared between turns.
 # ============================================================
 
 from __future__ import annotations
@@ -71,7 +77,6 @@ for noisy_logger_name in (
 
 
 # Opus packet-loss warnings are not fatal.
-# Keep them at ERROR to avoid noisy logs during normal UDP loss.
 logging.getLogger(
     "discord.ext.voice_recv.opus"
 ).setLevel(
@@ -156,6 +161,7 @@ def resample_pcm(
             source_channels == 2
             and target_channels == 1
         ):
+
             result = audioop.tomono(
                 result,
                 sample_width,
@@ -167,6 +173,7 @@ def resample_pcm(
             source_channels == 1
             and target_channels == 2
         ):
+
             result = audioop.tostereo(
                 result,
                 sample_width,
@@ -175,6 +182,7 @@ def resample_pcm(
             )
 
         else:
+
             raise ValueError(
                 "Unsupported channel conversion: "
                 f"{source_channels} -> {target_channels}"
@@ -210,6 +218,7 @@ def calculate_rms(
         return 0.0
 
     try:
+
         return float(
             audioop.rms(
                 pcm,
@@ -218,6 +227,7 @@ def calculate_rms(
         )
 
     except Exception:
+
         return 0.0
 
 
@@ -233,6 +243,7 @@ def calculate_peak(
         return 0
 
     try:
+
         return int(
             audioop.max(
                 pcm,
@@ -241,6 +252,7 @@ def calculate_peak(
         )
 
     except Exception:
+
         return 0
 
 
@@ -284,6 +296,7 @@ def _character_value(
         character,
         key,
     ):
+
         return getattr(
             character,
             key,
@@ -294,6 +307,7 @@ def _character_value(
         character,
         Mapping,
     ):
+
         return character.get(
             key,
             default,
@@ -327,6 +341,7 @@ class PCMSource(
         channels: int = 2,
         sample_width: int = 2,
     ):
+
         self.pcm = pcm
         self.position = 0
 
@@ -354,6 +369,7 @@ class PCMSource(
         if self.position >= len(
             self.pcm
         ):
+
             return b""
 
         frame = self.pcm[
@@ -366,6 +382,7 @@ class PCMSource(
         )
 
         if len(frame) < self.frame_size:
+
             frame += b"\x00" * (
                 self.frame_size
                 - len(frame)
@@ -377,6 +394,7 @@ class PCMSource(
         return False
 
     def cleanup(self) -> None:
+
         self.pcm = b""
         self.position = 0
 
@@ -391,7 +409,7 @@ class VoiceAISink(
     """
     Receives decoded Discord PCM,
     detects speech,
-    buffers audio,
+    buffers speech,
     and sends completed speech
     to the AI pipeline.
     """
@@ -400,6 +418,7 @@ class VoiceAISink(
         self,
         session: "VoiceSession",
     ):
+
         super().__init__()
 
         self.session = session
@@ -442,6 +461,7 @@ class VoiceAISink(
         """
         False = receive decoded PCM.
         """
+
         return False
 
     # ========================================================
@@ -460,6 +480,14 @@ class VoiceAISink(
         if self.closed:
             return
 
+        # ----------------------------------------------------
+        # Do not capture anything while the bot is speaking.
+        # This prevents TTS echo from going back into STT.
+        # ----------------------------------------------------
+
+        if self.session.is_speaking:
+            return
+
         try:
 
             if user is None:
@@ -472,6 +500,22 @@ class VoiceAISink(
             )
 
             if user_id is None:
+                return
+
+            # ------------------------------------------------
+            # Ignore the bot's own Discord user.
+            # ------------------------------------------------
+
+            bot_user = self.session.bot.user
+
+            if (
+                bot_user is not None
+                and getattr(
+                    bot_user,
+                    "id",
+                    None,
+                ) == user_id
+            ):
                 return
 
             # ------------------------------------------------
@@ -496,6 +540,7 @@ class VoiceAISink(
                     raw_data,
                     bytes,
                 ):
+
                     pcm = raw_data
 
             if not pcm:
@@ -505,6 +550,7 @@ class VoiceAISink(
                 pcm,
                 bytes,
             ):
+
                 pcm = bytes(
                     pcm
                 )
@@ -529,7 +575,18 @@ class VoiceAISink(
             )
 
             # ------------------------------------------------
-            # BUFFER
+            # IMPORTANT:
+            # Never buffer silence.
+            #
+            # This prevents long empty regions from being
+            # passed to Whisper and causing hallucinations.
+            # ------------------------------------------------
+
+            if not is_speech:
+                return
+
+            # ------------------------------------------------
+            # BUFFER SPEECH
             # ------------------------------------------------
 
             buffer = (
@@ -567,11 +624,9 @@ class VoiceAISink(
             # SPEECH TIMER
             # ------------------------------------------------
 
-            if is_speech:
-
-                self.last_speech_time[
-                    user_id
-                ] = time.monotonic()
+            self.last_speech_time[
+                user_id
+            ] = time.monotonic()
 
             duration = pcm_duration(
                 bytes(buffer),
@@ -631,6 +686,9 @@ class VoiceAISink(
         if self.closed:
             return
 
+        if self.session.is_speaking:
+            return
+
         if user_id in self.processing:
             return
 
@@ -644,6 +702,14 @@ class VoiceAISink(
         def schedule() -> None:
 
             if self.closed:
+
+                self.scheduled.discard(
+                    user_id
+                )
+
+                return
+
+            if self.session.is_speaking:
 
                 self.scheduled.discard(
                     user_id
@@ -692,6 +758,9 @@ class VoiceAISink(
                 await asyncio.sleep(
                     0.10
                 )
+
+                if self.session.is_speaking:
+                    continue
 
                 now = time.monotonic()
 
@@ -746,6 +815,7 @@ class VoiceAISink(
                         )
 
         except asyncio.CancelledError:
+
             pass
 
         except Exception:
@@ -768,6 +838,9 @@ class VoiceAISink(
         )
 
         if self.closed:
+            return
+
+        if self.session.is_speaking:
             return
 
         if user_id in self.processing:
@@ -939,6 +1012,7 @@ class VoiceAISink(
             if not is_valid_voice(
                 voice_name
             ):
+
                 voice_name = (
                     DEFAULT_GEMINI_VOICE
                 )
@@ -1023,7 +1097,7 @@ class VoiceAISink(
             )
 
             # ------------------------------------------------
-            # PLAY PIPER AUDIO
+            # PLAY GROQ ORPHEUS AUDIO
             # ------------------------------------------------
 
             if audio:
@@ -1040,6 +1114,7 @@ class VoiceAISink(
                 )
 
         except asyncio.CancelledError:
+
             raise
 
         except Exception:
@@ -1055,19 +1130,8 @@ class VoiceAISink(
                 user_id
             )
 
-            # Audio received while AI was processing
-            # is kept for the next turn.
-
-            if (
-                not self.closed
-                and user_id in self.buffers
-                and self.buffers[user_id]
-            ):
-
-                self.last_speech_time.setdefault(
-                    user_id,
-                    time.monotonic(),
-                )
+            # Do not keep stale audio received during
+            # AI processing. A fresh turn starts cleanly.
 
     # ========================================================
     # CLEANUP
@@ -1127,6 +1191,7 @@ class VoiceSession:
         if not is_valid_voice(
             self.voice_name
         ):
+
             self.voice_name = (
                 DEFAULT_GEMINI_VOICE
             )
@@ -1148,6 +1213,10 @@ class VoiceSession:
         self._play_lock = (
             asyncio.Lock()
         )
+
+        # True while the bot is speaking.
+        # The receive sink uses this to prevent TTS echo.
+        self.is_speaking = False
 
         self._closed = False
 
@@ -1172,6 +1241,7 @@ class VoiceSession:
     ) -> None:
 
         if self._closed:
+
             raise RuntimeError(
                 "Voice session is closed."
             )
@@ -1180,6 +1250,7 @@ class VoiceSession:
             self.voice_client,
             voice_recv.VoiceRecvClient,
         ):
+
             raise RuntimeError(
                 "VoiceRecvClient is required "
                 "for voice receive."
@@ -1214,6 +1285,7 @@ class VoiceSession:
     ) -> str:
 
         if not ALLOW_VOICE_CHANGE:
+
             raise RuntimeError(
                 "Voice changing is disabled."
             )
@@ -1227,6 +1299,7 @@ class VoiceSession:
         if not is_valid_voice(
             normalized
         ):
+
             raise ValueError(
                 f"Invalid voice: {voice}"
             )
@@ -1236,10 +1309,13 @@ class VoiceSession:
         )
 
         try:
+
             self.engine.set_voice(
                 normalized
             )
+
         except Exception:
+
             # Keep session state valid even if
             # an external voice list changes.
             pass
@@ -1333,151 +1409,180 @@ class VoiceSession:
                 return
 
             # ------------------------------------------------
-            # Wait for previous audio
+            # Disable voice capture while TTS is playing.
             # ------------------------------------------------
 
-            while (
-                self.voice_client.is_playing()
-            ):
+            self.is_speaking = True
 
-                if self._closed:
-                    return
+            if self.sink is not None:
 
-                await asyncio.sleep(
-                    0.05
-                )
+                self.sink.buffers.clear()
+                self.sink.last_speech_time.clear()
 
-            # ------------------------------------------------
-            # Piper:
-            #
-            # 24kHz mono 16-bit
-            #
-            # ↓
-            #
-            # Discord:
-            #
-            # 48kHz stereo 16-bit
-            # ------------------------------------------------
+            try:
 
-            discord_pcm = resample_pcm(
-                audio,
-                source_rate=(
-                    GEMINI_TTS_SAMPLE_RATE
-                ),
-                target_rate=(
-                    DISCORD_SAMPLE_RATE
-                ),
-                source_channels=(
-                    GEMINI_TTS_CHANNELS
-                ),
-                target_channels=2,
-                sample_width=2,
-            )
+                # ------------------------------------------------
+                # Wait for previous audio
+                # ------------------------------------------------
 
-            if not discord_pcm:
+                while (
+                    self.voice_client.is_playing()
+                ):
 
-                logger.warning(
-                    "Converted TTS audio is empty"
-                )
-
-                return
-
-            source = PCMSource(
-                discord_pcm,
-                sample_rate=(
-                    DISCORD_SAMPLE_RATE
-                ),
-                channels=2,
-                sample_width=2,
-            )
-
-            loop = (
-                asyncio.get_running_loop()
-            )
-
-            finished = (
-                loop.create_future()
-            )
-
-            def after_playback(
-                error: Exception | None,
-            ) -> None:
-
-                def finish() -> None:
-
-                    if finished.done():
+                    if self._closed:
                         return
 
-                    if error:
-
-                        finished.set_exception(
-                            error
-                        )
-
-                    else:
-
-                        finished.set_result(
-                            None
-                        )
-
-                try:
-
-                    loop.call_soon_threadsafe(
-                        finish
+                    await asyncio.sleep(
+                        0.05
                     )
 
-                except RuntimeError:
-                    pass
+                # ------------------------------------------------
+                # Groq Orpheus:
+                #
+                # 24kHz mono 16-bit
+                #
+                # ↓
+                #
+                # Discord:
+                #
+                # 48kHz stereo 16-bit
+                # ------------------------------------------------
 
-            logger.info(
-                "Playing TTS | Piper | bytes=%s",
-                len(discord_pcm),
-            )
-
-            try:
-
-                self.voice_client.play(
-                    source,
-                    after=after_playback,
+                discord_pcm = resample_pcm(
+                    audio,
+                    source_rate=(
+                        GEMINI_TTS_SAMPLE_RATE
+                    ),
+                    target_rate=(
+                        DISCORD_SAMPLE_RATE
+                    ),
+                    source_channels=(
+                        GEMINI_TTS_CHANNELS
+                    ),
+                    target_channels=2,
+                    sample_width=2,
                 )
 
-            except Exception:
+                if not discord_pcm:
 
-                source.cleanup()
+                    logger.warning(
+                        "Converted TTS audio is empty"
+                    )
 
-                raise
+                    return
 
-            try:
+                source = PCMSource(
+                    discord_pcm,
+                    sample_rate=(
+                        DISCORD_SAMPLE_RATE
+                    ),
+                    channels=2,
+                    sample_width=2,
+                )
 
-                await finished
+                loop = (
+                    asyncio.get_running_loop()
+                )
+
+                finished = (
+                    loop.create_future()
+                )
+
+                def after_playback(
+                    error: Exception | None,
+                ) -> None:
+
+                    def finish() -> None:
+
+                        if finished.done():
+                            return
+
+                        if error:
+
+                            finished.set_exception(
+                                error
+                            )
+
+                        else:
+
+                            finished.set_result(
+                                None
+                            )
+
+                    try:
+
+                        loop.call_soon_threadsafe(
+                            finish
+                        )
+
+                    except RuntimeError:
+
+                        pass
 
                 logger.info(
-                    "TTS playback finished"
+                    "Playing TTS | Groq Orpheus | bytes=%s",
+                    len(discord_pcm),
                 )
-
-            except asyncio.CancelledError:
 
                 try:
 
-                    if (
-                        self.voice_client.is_playing()
-                    ):
-                        self.voice_client.stop()
+                    self.voice_client.play(
+                        source,
+                        after=after_playback,
+                    )
 
                 except Exception:
-                    pass
 
-                raise
+                    source.cleanup()
 
-            except Exception:
+                    raise
 
-                logger.exception(
-                    "TTS playback failed"
-                )
+                try:
+
+                    await finished
+
+                    logger.info(
+                        "TTS playback finished"
+                    )
+
+                except asyncio.CancelledError:
+
+                    try:
+
+                        if (
+                            self.voice_client.is_playing()
+                        ):
+
+                            self.voice_client.stop()
+
+                    except Exception:
+
+                        pass
+
+                    raise
+
+                except Exception:
+
+                    logger.exception(
+                        "TTS playback failed"
+                    )
+
+                finally:
+
+                    source.cleanup()
 
             finally:
 
-                source.cleanup()
+                # ------------------------------------------------
+                # Re-enable receive.
+                # ------------------------------------------------
+
+                self.is_speaking = False
+
+                if self.sink is not None:
+
+                    self.sink.buffers.clear()
+                    self.sink.last_speech_time.clear()
 
     # ========================================================
     # CLOSE
@@ -1491,10 +1596,12 @@ class VoiceSession:
             return
 
         self._closed = True
+        self.is_speaking = True
 
         try:
 
             if self.sink:
+
                 self.sink.cleanup()
 
         except Exception:
@@ -1510,9 +1617,11 @@ class VoiceSession:
             if (
                 self.voice_client.is_playing()
             ):
+
                 self.voice_client.stop()
 
         except Exception:
+
             pass
 
         try:
@@ -1597,6 +1706,7 @@ class VoiceSessionManager:
                     existing.channel.id
                     == channel.id
                 ):
+
                     return existing
 
                 self.sessions.pop(
@@ -1697,6 +1807,7 @@ class VoiceSessionManager:
                     )
 
                 except Exception:
+
                     pass
 
                 raise RuntimeError(
@@ -1740,6 +1851,7 @@ class VoiceSessionManager:
                     )
 
                 except Exception:
+
                     pass
 
                 raise
@@ -1855,6 +1967,7 @@ class VoiceSessionManager:
 # ============================================================
 
 def get_voice_names() -> list[str]:
+
     return list(
         GEMINI_VOICES
     )
