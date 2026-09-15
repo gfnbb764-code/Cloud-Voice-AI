@@ -3,11 +3,9 @@
 # Cloud Voice AI
 #
 # Pipeline:
-# Discord Voice PCM
+# Discord Voice PCM / WAV
 #     ↓
-# Groq Whisper Large V3
-#     ↓
-# Light / Natural STT Cleanup
+# Local faster-whisper STT
 #     ↓
 # Groq GPT-OSS 120B
 #     ↓
@@ -17,7 +15,17 @@
 #     ↓
 # Discord
 #
+# STT:
+#     faster-whisper (LOCAL)
+#
+# Chat:
+#     Groq GPT-OSS 120B
+#
+# TTS:
+#     Groq Orpheus Arabic Saudi
+#
 # Gemini / Claude / Piper are completely removed.
+# Groq Whisper STT is completely removed.
 # ============================================================
 
 from __future__ import annotations
@@ -26,7 +34,6 @@ import asyncio
 import audioop
 import logging
 import os
-import re
 import tempfile
 import wave
 from collections import deque
@@ -65,13 +72,162 @@ GROQ_API_KEY = os.getenv(
 # MODELS
 # ============================================================
 
-GROQ_STT_MODEL = (
+# ------------------------------------------------------------
+# Local faster-whisper model.
+#
+# Recommended for a normal CPU server:
+#     small
+#
+# Other possible values:
+#     base
+#     medium
+#     large-v3
+#
+# "small" is selected by default because the goal is to keep
+# the voice bot reasonably light and responsive.
+# ------------------------------------------------------------
+
+FASTER_WHISPER_MODEL = (
     os.getenv(
-        "GROQ_STT_MODEL",
-        "whisper-large-v3",
+        "FASTER_WHISPER_MODEL",
+        "small",
     ).strip()
-    or "whisper-large-v3"
+    or "small"
 )
+
+FASTER_WHISPER_DEVICE = (
+    os.getenv(
+        "FASTER_WHISPER_DEVICE",
+        "cpu",
+    ).strip().lower()
+    or "cpu"
+)
+
+FASTER_WHISPER_COMPUTE_TYPE = (
+    os.getenv(
+        "FASTER_WHISPER_COMPUTE_TYPE",
+        "int8",
+    ).strip().lower()
+    or "int8"
+)
+
+# Number of CPU threads used by CTranslate2.
+#
+# 0 = let the library decide.
+# On shared hosting, a modest number is usually better than
+# aggressively consuming every CPU thread.
+try:
+
+    FASTER_WHISPER_CPU_THREADS = max(
+        int(
+            os.getenv(
+                "FASTER_WHISPER_CPU_THREADS",
+                "4",
+            )
+        ),
+        0,
+    )
+
+except (TypeError, ValueError):
+
+    FASTER_WHISPER_CPU_THREADS = 4
+
+
+# ------------------------------------------------------------
+# Beam search.
+#
+# A moderate beam size keeps recognition quality decent
+# without making short voice messages unnecessarily heavy.
+# ------------------------------------------------------------
+
+try:
+
+    FASTER_WHISPER_BEAM_SIZE = max(
+        int(
+            os.getenv(
+                "FASTER_WHISPER_BEAM_SIZE",
+                "5",
+            )
+        ),
+        1,
+    )
+
+except (TypeError, ValueError):
+
+    FASTER_WHISPER_BEAM_SIZE = 5
+
+
+# ------------------------------------------------------------
+# Voice recognition settings.
+# ------------------------------------------------------------
+
+FASTER_WHISPER_LANGUAGE = (
+    os.getenv(
+        "FASTER_WHISPER_LANGUAGE",
+        "ar",
+    ).strip().lower()
+    or "ar"
+)
+
+# Keep VAD enabled so pure silence/noise is less likely to
+# become text.
+FASTER_WHISPER_VAD = (
+    os.getenv(
+        "FASTER_WHISPER_VAD",
+        "true",
+    ).strip().lower()
+    not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+)
+
+# 500 ms minimum silence duration for the VAD stage.
+try:
+
+    FASTER_WHISPER_MIN_SILENCE_MS = max(
+        int(
+            os.getenv(
+                "FASTER_WHISPER_MIN_SILENCE_MS",
+                "500",
+            )
+        ),
+        0,
+    )
+
+except (TypeError, ValueError):
+
+    FASTER_WHISPER_MIN_SILENCE_MS = 500
+
+
+# ------------------------------------------------------------
+# Do not condition transcription on previous text.
+#
+# This is particularly useful in a voice assistant because
+# every Discord speech turn should be treated as its own
+# independent utterance rather than continuing a hallucinated
+# phrase from a previous segment.
+# ------------------------------------------------------------
+
+FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT = (
+    os.getenv(
+        "FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
+        "false",
+    ).strip().lower()
+    not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+)
+
+
+# ------------------------------------------------------------
+# Groq chat model.
+# ------------------------------------------------------------
 
 GROQ_CHAT_MODEL = (
     os.getenv(
@@ -80,6 +236,11 @@ GROQ_CHAT_MODEL = (
     ).strip()
     or "openai/gpt-oss-120b"
 )
+
+
+# ------------------------------------------------------------
+# Groq TTS model.
+# ------------------------------------------------------------
 
 GROQ_TTS_MODEL = (
     os.getenv(
@@ -154,50 +315,13 @@ DEFAULT_SPEECH_SPEED = 1.0
 
 
 # ============================================================
-# LIGHT STT CLEANUP
-# ============================================================
-
-# This is intentionally NOT a strong filter.
-#
-# The goal is:
-# - Do not rewrite what Whisper heard.
-# - Do not reject normal Arabic.
-# - Do not reject short phrases.
-# - Do not force Arabic-only output.
-# - Only remove obvious formatting/noise artifacts.
-#
-# Whisper itself decides what the user said.
-
-_ZERO_WIDTH_RE = re.compile(
-    r"[\u200B\u200C\u200D\uFEFF]"
-)
-
-_SPACE_RE = re.compile(
-    r"\s+"
-)
-
-_REPEATED_PUNCTUATION_RE = re.compile(
-    r"([،؛,.!?؟])\1+"
-)
-
-# Only obvious Whisper subtitle-style hallucinations.
-# These are checked as complete/near-complete phrases,
-# not arbitrary word filtering.
-_OBVIOUS_HALLUCINATIONS = (
-    "thank you for watching",
-    "thanks for watching",
-    "شكرا على المشاهدة",
-    "شكراً على المشاهدة",
-    "اشتركوا في القناة",
-    "لا تنسى الاشتراك",
-)
-
-
-# ============================================================
 # TEXT HELPERS
 # ============================================================
 
-def _clean_text(value: Any) -> str:
+def _clean_text(
+    value: Any,
+) -> str:
+
     if value is None:
         return ""
 
@@ -207,74 +331,43 @@ def _clean_text(value: Any) -> str:
 def _normalize_transcript(
     text: str,
 ) -> str:
-
-    text = _clean_text(text)
-
-    if not text:
-        return ""
-
-    # Remove zero-width characters only.
-    text = _ZERO_WIDTH_RE.sub(
-        "",
-        text,
-    )
-
-    # Normalize whitespace only.
-    text = _SPACE_RE.sub(
-        " ",
-        text,
-    )
-
-    return text.strip()
-
-
-def _light_filter_transcript(
-    text: str,
-) -> str:
     """
-    Very light STT cleanup.
+    Minimal transcript cleanup.
 
     IMPORTANT:
-    This function must not try to decide whether
-    Whisper's transcription is "correct".
+    This is deliberately NOT an STT correction engine.
 
-    It only removes obvious formatting artifacts.
+    faster-whisper is now responsible for transcription.
+    We only clean surrounding whitespace/control artifacts.
     """
 
-    text = _normalize_transcript(
+    text = _clean_text(
         text
     )
 
     if not text:
         return ""
 
-    # Remove repeated punctuation:
-    # ؟؟؟؟ -> ؟
-    # !!!! -> !
-    text = _REPEATED_PUNCTUATION_RE.sub(
-        r"\1",
-        text,
+    # Remove zero-width/control formatting characters commonly
+    # introduced by text serialization.
+    for character in (
+        "\u200b",
+        "\u200c",
+        "\u200d",
+        "\ufeff",
+    ):
+
+        text = text.replace(
+            character,
+            "",
+        )
+
+    # Normalize common whitespace.
+    text = " ".join(
+        text.split()
     )
 
-    text = text.strip()
-
-    # Only reject obvious subtitle-style hallucinations.
-    # Normal short speech such as:
-    # "السلام عليكم"
-    # "تسمعني؟"
-    # "هلا"
-    # "وش الأخبار؟"
-    # must remain untouched.
-    lowered = text.lower()
-
-    if lowered in _OBVIOUS_HALLUCINATIONS:
-        logger.warning(
-            "Obvious STT hallucination rejected | transcript=%r",
-            text,
-        )
-        return ""
-
-    return text
+    return text.strip()
 
 
 def _limit_text(
@@ -282,7 +375,9 @@ def _limit_text(
     maximum: int,
 ) -> str:
 
-    text = _clean_text(text)
+    text = _clean_text(
+        text
+    )
 
     if len(text) <= maximum:
         return text
@@ -399,21 +494,25 @@ def _build_character_prompt(
     ]
 
     if name:
+
         sections.append(
             f"Character name: {name}"
         )
 
     if personality:
+
         sections.append(
             f"Personality: {personality}"
         )
 
     if style:
+
         sections.append(
             f"Speaking style: {style}"
         )
 
     if instructions:
+
         sections.append(
             f"Character instructions: {instructions}"
         )
@@ -517,7 +616,9 @@ def _split_tts_text(
 
     while len(remaining) > maximum:
 
-        window = remaining[:maximum]
+        window = remaining[
+            :maximum
+        ]
 
         split_at = -1
 
@@ -528,6 +629,7 @@ def _split_tts_text(
             )
 
             if position > split_at:
+
                 split_at = position
 
         if split_at < 80:
@@ -545,6 +647,7 @@ def _split_tts_text(
         ].strip()
 
         if chunk:
+
             chunks.append(
                 chunk
             )
@@ -554,6 +657,7 @@ def _split_tts_text(
         ].strip()
 
     if remaining:
+
         chunks.append(
             remaining
         )
@@ -570,7 +674,7 @@ class GeminiEngine:
     Compatibility name retained for main.py / voice.py.
 
     STT:
-        Groq Whisper Large V3
+        Local faster-whisper
 
     Chat:
         Groq GPT-OSS 120B
@@ -588,6 +692,10 @@ class GeminiEngine:
         tts_model: str | None = None,
     ) -> None:
 
+        # ----------------------------------------------------
+        # GROQ
+        # ----------------------------------------------------
+
         self.groq_api_key = (
             api_key or GROQ_API_KEY
         ).strip()
@@ -597,11 +705,6 @@ class GeminiEngine:
             raise RuntimeError(
                 "GROQ_API_KEY is missing."
             )
-
-        self.transcribe_model = (
-            transcribe_model
-            or GROQ_STT_MODEL
-        )
 
         self.chat_model = (
             chat_model
@@ -613,9 +716,42 @@ class GeminiEngine:
             or GROQ_TTS_MODEL
         )
 
+        # ----------------------------------------------------
+        # STT MODEL
+        #
+        # Keep the old argument for compatibility with
+        # main.py / voice.py, but the actual STT backend is now
+        # faster-whisper.
+        # ----------------------------------------------------
+
+        self.transcribe_model = (
+            transcribe_model
+            or FASTER_WHISPER_MODEL
+        )
+
+        # ----------------------------------------------------
+        # GROQ CLIENT
+        # ----------------------------------------------------
+
         self.groq = Groq(
             api_key=self.groq_api_key
         )
+
+        # ----------------------------------------------------
+        # LOCAL WHISPER MODEL
+        #
+        # We load it lazily so the Discord bot can initialize
+        # without blocking startup for model download/loading.
+        # ----------------------------------------------------
+
+        self._whisper_model = None
+        self._whisper_lock = (
+            asyncio.Lock()
+        )
+
+        # ----------------------------------------------------
+        # VOICE
+        # ----------------------------------------------------
 
         self.current_voice = (
             normalize_voice_name(
@@ -623,22 +759,118 @@ class GeminiEngine:
             )
         )
 
+        # ----------------------------------------------------
+        # MEMORY
+        # ----------------------------------------------------
+
         self._memory: deque[
             dict[str, str]
         ] = deque(
             maxlen=VOICE_MEMORY_LIMIT
         )
 
+        # ----------------------------------------------------
+        # STATS
+        # ----------------------------------------------------
+
         self.processed_requests = 0
         self.failed_requests = 0
         self.quota_exhausted = False
+
+    # ========================================================
+    # WHISPER MODEL
+    # ========================================================
+
+    async def _get_whisper_model(self):
+        """
+        Lazily load faster-whisper.
+
+        The first voice message may take longer because the
+        model can need to download and initialize.
+        """
+
+        if self._whisper_model is not None:
+
+            return self._whisper_model
+
+        async with self._whisper_lock:
+
+            if self._whisper_model is not None:
+
+                return self._whisper_model
+
+            logger.info(
+                "Loading local faster-whisper | "
+                "model=%s | device=%s | compute_type=%s | "
+                "cpu_threads=%s",
+                self.transcribe_model,
+                FASTER_WHISPER_DEVICE,
+                FASTER_WHISPER_COMPUTE_TYPE,
+                FASTER_WHISPER_CPU_THREADS,
+            )
+
+            try:
+
+                from faster_whisper import (
+                    WhisperModel,
+                )
+
+            except ImportError as error:
+
+                raise RuntimeError(
+                    "faster-whisper is not installed. "
+                    "Add 'faster-whisper' to requirements.txt."
+                ) from error
+
+            def load_model():
+                return WhisperModel(
+                    self.transcribe_model,
+                    device=FASTER_WHISPER_DEVICE,
+                    compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+                    cpu_threads=(
+                        FASTER_WHISPER_CPU_THREADS
+                    ),
+                    num_workers=1,
+                )
+
+            try:
+
+                self._whisper_model = (
+                    await asyncio.to_thread(
+                        load_model
+                    )
+                )
+
+            except Exception as error:
+
+                logger.exception(
+                    "Failed to load faster-whisper model"
+                )
+
+                raise RuntimeError(
+                    "Could not load faster-whisper model "
+                    f"'{self.transcribe_model}': {error}"
+                ) from error
+
+            logger.info(
+                "Local faster-whisper loaded | "
+                "model=%s | device=%s | compute_type=%s",
+                self.transcribe_model,
+                FASTER_WHISPER_DEVICE,
+                FASTER_WHISPER_COMPUTE_TYPE,
+            )
+
+            return self._whisper_model
 
     # ========================================================
     # VOICE
     # ========================================================
 
     @property
-    def voice(self) -> str:
+    def voice(
+        self,
+    ) -> str:
+
         return self.current_voice
 
     def set_voice(
@@ -658,11 +890,15 @@ class GeminiEngine:
                 f"Invalid voice: {voice}"
             )
 
-        self.current_voice = normalized
+        self.current_voice = (
+            normalized
+        )
 
         return normalized
 
-    def _get_tts_voice(self) -> str:
+    def _get_tts_voice(
+        self,
+    ) -> str:
 
         mapped = (
             GROQ_TTS_VOICE_MAP.get(
@@ -671,12 +907,14 @@ class GeminiEngine:
         )
 
         if mapped in VALID_GROQ_TTS_VOICES:
+
             return mapped
 
         if (
             GROQ_TTS_VOICE
             in VALID_GROQ_TTS_VOICES
         ):
+
             return GROQ_TTS_VOICE
 
         return "fahad"
@@ -691,11 +929,13 @@ class GeminiEngine:
     ) -> str:
 
         try:
+
             return str(
                 error
             ).lower()
 
         except Exception:
+
             return ""
 
     @classmethod
@@ -799,6 +1039,7 @@ class GeminiEngine:
                         error
                     )
                 ):
+
                     break
 
                 delay = (
@@ -824,6 +1065,7 @@ class GeminiEngine:
         self.failed_requests += 1
 
         if last_error:
+
             raise last_error
 
         raise RuntimeError(
@@ -831,11 +1073,11 @@ class GeminiEngine:
         )
 
     # ========================================================
-    # RAW PCM -> WAV
+    # AUDIO PREPARATION
     # ========================================================
 
     @staticmethod
-    def _discord_pcm_to_wav(
+    def _ensure_wav_file(
         audio: bytes,
     ) -> str:
 
@@ -845,27 +1087,64 @@ class GeminiEngine:
                 "Empty audio."
             )
 
-        pcm = audio
-
-        pcm = audioop.tomono(
-            pcm,
-            2,
-            0.5,
-            0.5,
-        )
-
-        pcm, _ = audioop.ratecv(
-            pcm,
-            2,
-            1,
-            48000,
-            16000,
-            None,
-        )
-
         temp_path: str | None = None
 
         try:
+
+            # ------------------------------------------------
+            # Already WAV
+            # ------------------------------------------------
+
+            if audio.startswith(
+                b"RIFF"
+            ):
+
+                with tempfile.NamedTemporaryFile(
+                    suffix=".wav",
+                    delete=False,
+                ) as temp_file:
+
+                    temp_path = (
+                        temp_file.name
+                    )
+
+                    temp_file.write(
+                        audio
+                    )
+
+                return temp_path
+
+            # ------------------------------------------------
+            # Raw Discord PCM:
+            #
+            # 48kHz
+            # stereo
+            # 16-bit
+            #
+            # ↓
+            #
+            # 16kHz
+            # mono
+            # 16-bit
+            # ------------------------------------------------
+
+            pcm = audio
+
+            pcm = audioop.tomono(
+                pcm,
+                2,
+                0.5,
+                0.5,
+            )
+
+            pcm, _ = audioop.ratecv(
+                pcm,
+                2,
+                1,
+                48000,
+                16000,
+                None,
+            )
 
             with tempfile.NamedTemporaryFile(
                 suffix=".wav",
@@ -904,6 +1183,7 @@ class GeminiEngine:
             if temp_path:
 
                 try:
+
                     Path(
                         temp_path
                     ).unlink(
@@ -911,161 +1191,73 @@ class GeminiEngine:
                     )
 
                 except Exception:
+
                     pass
 
             raise
 
     # ========================================================
-    # GROQ STT
+    # LOCAL FASTER-WHISPER STT
     # ========================================================
 
-    def _transcribe_sync(
+    def _transcribe_local_sync(
         self,
-        audio: bytes,
-    ):
-
-        temp_path: str | None = None
-
-        try:
-
-            # voice.py normally sends WAV.
-            # Keep raw PCM compatibility too.
-
-            if audio.startswith(
-                b"RIFF"
-            ):
-
-                with tempfile.NamedTemporaryFile(
-                    suffix=".wav",
-                    delete=False,
-                ) as temp_file:
-
-                    temp_path = (
-                        temp_file.name
-                    )
-
-                    temp_file.write(
-                        audio
-                    )
-
-            else:
-
-                temp_path = (
-                    self._discord_pcm_to_wav(
-                        audio
-                    )
-                )
-
-            with open(
-                temp_path,
-                "rb",
-            ) as audio_file:
-
-                response = (
-                    self.groq.audio.transcriptions.create(
-                        file=(
-                            "discord_audio.wav",
-                            audio_file,
-                        ),
-                        model=self.transcribe_model,
-                        language="ar",
-                        temperature=0.0,
-                        prompt=(
-                            "كلام عربي باللهجة "
-                            "السعودية والعامية. "
-                            "اكتب الكلام كما نُطق، "
-                            "بدون ترجمة أو إضافة "
-                            "كلام غير مسموع."
-                        ),
-                        response_format="verbose_json",
-                        timestamp_granularities=[
-                            "segment",
-                        ],
-                    )
-                )
-
-            return response
-
-        finally:
-
-            if temp_path:
-
-                try:
-
-                    Path(
-                        temp_path
-                    ).unlink(
-                        missing_ok=True
-                    )
-
-                except Exception:
-                    pass
-
-    async def transcribe(
-        self,
-        audio: bytes,
-        *,
-        mime_type: str = DEFAULT_AUDIO_MIME_TYPE,
+        model,
+        wav_path: str,
     ) -> str:
 
-        if not audio:
-            return ""
+        # ----------------------------------------------------
+        # VAD SETTINGS
+        # ----------------------------------------------------
 
-        _ = mime_type
+        vad_parameters = None
 
-        response = await self._with_retry(
-            lambda: self._transcribe_sync(
-                audio
+        if FASTER_WHISPER_VAD:
+
+            vad_parameters = {
+                "min_silence_duration_ms": (
+                    FASTER_WHISPER_MIN_SILENCE_MS
+                ),
+            }
+
+        # ----------------------------------------------------
+        # TRANSCRIBE
+        # ----------------------------------------------------
+
+        kwargs: dict[str, Any] = {
+            "language": FASTER_WHISPER_LANGUAGE,
+            "beam_size": FASTER_WHISPER_BEAM_SIZE,
+            "condition_on_previous_text": (
+                FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT
             ),
-            operation_name="Groq STT",
-        )
+            "vad_filter": (
+                FASTER_WHISPER_VAD
+            ),
+            "temperature": 0.0,
+        }
 
-        raw_text = _normalize_transcript(
-            getattr(
-                response,
-                "text",
-                "",
+        if vad_parameters is not None:
+
+            kwargs[
+                "vad_parameters"
+            ] = vad_parameters
+
+        segments, info = (
+            model.transcribe(
+                wav_path,
+                **kwargs,
             )
         )
 
-        if not raw_text:
-
-            logger.warning(
-                "Groq STT returned no transcript."
-            )
-
-            return ""
-
-        # ----------------------------------------------------
-        # RAW WHISPER OUTPUT
-        # ----------------------------------------------------
-
-        logger.info(
-            "Groq STT RAW | model=%s | "
-            "language=ar | transcript=%r",
-            self.transcribe_model,
-            raw_text,
+        # faster-whisper returns a generator.
+        # We MUST iterate it for actual inference to happen.
+        segment_list = list(
+            segments
         )
 
-        # ----------------------------------------------------
-        # SEGMENT QUALITY CHECK
-        #
-        # This is intentionally light.
-        #
-        # We only ignore segments that Whisper itself
-        # strongly marks as silence/very low confidence.
-        # If no valid segments remain, raw_text is used.
-        # ----------------------------------------------------
+        parts: list[str] = []
 
-        segments = getattr(
-            response,
-            "segments",
-            None,
-        ) or []
-
-        valid_segments: list[str] = []
-
-        for segment in segments:
+        for segment in segment_list:
 
             segment_text = (
                 _normalize_transcript(
@@ -1080,69 +1272,122 @@ class GeminiEngine:
             if not segment_text:
                 continue
 
+            parts.append(
+                segment_text
+            )
+
+        transcript = _normalize_transcript(
+            " ".join(parts)
+        )
+
+        # ----------------------------------------------------
+        # LANGUAGE INFO
+        # ----------------------------------------------------
+
+        detected_language = getattr(
+            info,
+            "language",
+            None,
+        )
+
+        try:
+
+            language_probability = float(
+                getattr(
+                    info,
+                    "language_probability",
+                    0.0,
+                )
+                or 0.0
+            )
+
+        except Exception:
+
+            language_probability = 0.0
+
+        logger.info(
+            "faster-whisper STT | "
+            "model=%s | detected_language=%s | "
+            "language_probability=%.3f | "
+            "segments=%d | transcript=%r",
+            self.transcribe_model,
+            detected_language or FASTER_WHISPER_LANGUAGE,
+            language_probability,
+            len(segment_list),
+            transcript,
+        )
+
+        return transcript
+
+    async def transcribe(
+        self,
+        audio: bytes,
+        *,
+        mime_type: str = DEFAULT_AUDIO_MIME_TYPE,
+    ) -> str:
+
+        if not audio:
+            return ""
+
+        _ = mime_type
+
+        wav_path = (
+            self._ensure_wav_file(
+                audio
+            )
+        )
+
+        try:
+
+            model = (
+                await self._get_whisper_model()
+            )
+
+            transcript = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._transcribe_local_sync,
+                    model,
+                    wav_path,
+                ),
+                timeout=API_TIMEOUT_SECONDS,
+            )
+
+            transcript = _limit_text(
+                transcript,
+                MAX_TRANSCRIPT_LENGTH,
+            )
+
+            if not transcript:
+
+                logger.warning(
+                    "faster-whisper returned no transcript."
+                )
+
+                return ""
+
+            logger.info(
+                "Local STT transcript | transcript=%r",
+                transcript,
+            )
+
+            return transcript
+
+        finally:
+
             try:
 
-                no_speech_prob = float(
-                    getattr(
-                        segment,
-                        "no_speech_prob",
-                        0.0,
-                    )
-                    or 0.0
+                Path(
+                    wav_path
+                ).unlink(
+                    missing_ok=True
                 )
 
             except Exception:
 
-                no_speech_prob = 0.0
-
-            # Keep this threshold conservative.
-            # We do NOT reject based on log probability.
-            if no_speech_prob >= 0.90:
-
-                logger.debug(
-                    "Ignored likely-silence STT segment | "
-                    "no_speech_prob=%.2f | text=%r",
-                    no_speech_prob,
-                    segment_text,
+                logger.warning(
+                    "Failed to remove STT temp file: %s",
+                    wav_path,
                 )
-
-                continue
-
-            valid_segments.append(
-                segment_text
-            )
-
-        candidate_text = (
-            " ".join(
-                valid_segments
-            )
-            if valid_segments
-            else raw_text
-        )
-
-        # ----------------------------------------------------
-        # LIGHT CLEANUP
-        # ----------------------------------------------------
-
-        filtered_text = (
-            _light_filter_transcript(
-                candidate_text
-            )
-        )
-
-        filtered_text = _limit_text(
-            filtered_text,
-            MAX_TRANSCRIPT_LENGTH,
-        )
-
-        logger.info(
-            "Groq STT FILTERED | model=%s | "
-            "language=ar | transcript=%r",
-            self.transcribe_model,
-            filtered_text,
-        )
-
-        return filtered_text
 
     # ========================================================
     # MEMORY
@@ -1684,6 +1929,7 @@ class GeminiEngine:
             )
 
             if audio:
+
                 output_parts.append(
                     audio
                 )
@@ -1738,8 +1984,10 @@ class GeminiEngine:
                 if voice
                 else self.voice
             ),
-            "speed": normalize_speech_speed(
-                speed
+            "speed": (
+                normalize_speech_speed(
+                    speed
+                )
             ),
             "character": _character_value(
                 character,
@@ -1747,6 +1995,7 @@ class GeminiEngine:
                 None,
             ),
             "tts_model": self.tts_model,
+            "stt_model": self.transcribe_model,
             "error": None,
         }
 
@@ -1772,7 +2021,7 @@ class GeminiEngine:
             if not transcript:
 
                 result["error"] = (
-                    "Speech rejected by STT."
+                    "Speech rejected by local STT."
                 )
 
                 return result
@@ -1873,6 +2122,7 @@ class GeminiEngine:
         except Exception as error:
 
             self.failed_requests += 1
+
             result["error"] = str(
                 error
             )
@@ -1911,12 +2161,38 @@ class GeminiEngine:
             "processed_requests": self.processed_requests,
             "failed_requests": self.failed_requests,
             "quota_exhausted": self.quota_exhausted,
+
+            # ------------------------------------------------
+            # CHAT
+            # ------------------------------------------------
+
             "chat_provider": "Groq",
             "chat_model": self.chat_model,
-            "transcribe_provider": "Groq",
+
+            # ------------------------------------------------
+            # STT
+            # ------------------------------------------------
+
+            "transcribe_provider": "faster-whisper",
             "transcribe_model": self.transcribe_model,
-            "stt_language": "ar",
-            "stt_filter": "light",
+            "stt_language": FASTER_WHISPER_LANGUAGE,
+            "stt_device": FASTER_WHISPER_DEVICE,
+            "stt_compute_type": (
+                FASTER_WHISPER_COMPUTE_TYPE
+            ),
+            "stt_cpu_threads": (
+                FASTER_WHISPER_CPU_THREADS
+            ),
+            "stt_beam_size": (
+                FASTER_WHISPER_BEAM_SIZE
+            ),
+            "stt_vad": FASTER_WHISPER_VAD,
+            "stt_filter": "none",
+
+            # ------------------------------------------------
+            # TTS
+            # ------------------------------------------------
+
             "tts_provider": "Groq",
             "tts_model": self.tts_model,
             "tts_local": False,
@@ -1931,6 +2207,11 @@ class GeminiEngine:
         self,
     ) -> None:
 
+        # faster-whisper model is managed in-process by
+        # CTranslate2. There is no network client that needs
+        # an explicit async close here.
+
+        self._whisper_model = None
         self.groq = None
 
 
@@ -1939,8 +2220,13 @@ class GeminiEngine:
 # ============================================================
 
 def create_gemini_engine() -> GeminiEngine:
+
     return GeminiEngine()
 
+
+# ============================================================
+# EXPORTS
+# ============================================================
 
 __all__ = [
     "GeminiEngine",
