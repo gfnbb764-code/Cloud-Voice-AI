@@ -14,7 +14,8 @@
 # Discord playback
 #
 # Important:
-# - Silence is NOT buffered.
+# - Keeps a tiny pre-roll before speech starts.
+# - Silence is NOT added to the speech buffer.
 # - Bot audio is ignored.
 # - Voice receive is disabled while TTS is playing.
 # - Buffers are cleared between turns.
@@ -28,6 +29,7 @@ import io
 import logging
 import time
 import wave
+from collections import deque
 from typing import Any, Mapping
 
 import discord
@@ -89,6 +91,32 @@ logging.getLogger(
 # ============================================================
 
 SILENCE_RMS_THRESHOLD = 500
+
+# Keep a tiny amount of recent audio before speech starts.
+#
+# Discord receive audio is normally:
+#   48000 Hz
+#   stereo
+#   16-bit PCM
+#
+# This gives Whisper a little context before the detected
+# speech begins, which can help preserve the first syllables
+# of short phrases such as:
+#
+#   "السلام عليكم"
+#   "تسمعني؟"
+#   "هلا"
+#   "الو"
+#
+# Silence is still NOT added to the actual speech buffer.
+PRE_ROLL_SECONDS = 0.16
+
+PRE_ROLL_MAX_BYTES = int(
+    DISCORD_SAMPLE_RATE
+    * 2
+    * DISCORD_SAMPLE_WIDTH
+    * PRE_ROLL_SECONDS
+)
 
 
 # ============================================================
@@ -412,6 +440,10 @@ class VoiceAISink(
     buffers speech,
     and sends completed speech
     to the AI pipeline.
+
+    A tiny rolling pre-roll is maintained for each user.
+    Only when speech is detected is that recent audio attached
+    to the actual speech buffer.
     """
 
     def __init__(
@@ -428,10 +460,32 @@ class VoiceAISink(
             asyncio.get_running_loop()
         )
 
+        # ----------------------------------------------------
+        # Actual speech buffers.
+        # ----------------------------------------------------
+
         self.buffers: dict[
             int,
             bytearray,
         ] = {}
+
+        # ----------------------------------------------------
+        # Tiny rolling pre-roll buffers.
+        #
+        # This stores only recent frames and is never sent
+        # to Whisper unless speech actually starts.
+        # ----------------------------------------------------
+
+        self.pre_roll: dict[
+            int,
+            deque[bytes],
+        ] = {}
+
+        # ----------------------------------------------------
+        # Users currently inside a speech segment.
+        # ----------------------------------------------------
+
+        self.speech_active: set[int] = set()
 
         self.last_speech_time: dict[
             int,
@@ -450,7 +504,10 @@ class VoiceAISink(
         )
 
         logger.info(
-            "VoiceAISink initialized"
+            "VoiceAISink initialized | "
+            "threshold=%s | pre_roll=%.2fs",
+            SILENCE_RMS_THRESHOLD,
+            PRE_ROLL_SECONDS,
         )
 
     # ========================================================
@@ -475,6 +532,20 @@ class VoiceAISink(
     ) -> None:
         """
         Synchronous audio callback.
+
+        Flow:
+
+            Discord PCM
+                ↓
+            pre-roll
+                ↓
+            speech detection
+                ↓
+            actual speech buffer
+                ↓
+            silence timeout
+                ↓
+            STT
         """
 
         if self.closed:
@@ -482,7 +553,8 @@ class VoiceAISink(
 
         # ----------------------------------------------------
         # Do not capture anything while the bot is speaking.
-        # This prevents TTS echo from going back into STT.
+        #
+        # This prevents TTS echo from returning to STT.
         # ----------------------------------------------------
 
         if self.session.is_speaking:
@@ -575,18 +647,98 @@ class VoiceAISink(
             )
 
             # ------------------------------------------------
-            # IMPORTANT:
-            # Never buffer silence.
+            # PRE-ROLL
             #
-            # This prevents long empty regions from being
-            # passed to Whisper and causing hallucinations.
+            # Keep only a very small amount of recent audio.
+            #
+            # This happens even during silence, but the audio
+            # is never treated as speech by itself.
+            # ------------------------------------------------
+
+            pre_roll = self.pre_roll.setdefault(
+                user_id,
+                deque(),
+            )
+
+            pre_roll.append(
+                pcm
+            )
+
+            total_pre_roll = sum(
+                len(chunk)
+                for chunk in pre_roll
+            )
+
+            while (
+                total_pre_roll
+                > PRE_ROLL_MAX_BYTES
+                and pre_roll
+            ):
+
+                removed = pre_roll.popleft()
+
+                total_pre_roll -= len(
+                    removed
+                )
+
+            # ------------------------------------------------
+            # SILENCE
+            #
+            # Keep it only inside pre-roll.
+            # Do NOT add it to actual speech buffer.
             # ------------------------------------------------
 
             if not is_speech:
                 return
 
             # ------------------------------------------------
-            # BUFFER SPEECH
+            # SPEECH JUST STARTED
+            # ------------------------------------------------
+
+            if user_id not in self.speech_active:
+
+                buffer = (
+                    self.buffers.setdefault(
+                        user_id,
+                        bytearray(),
+                    )
+                )
+
+                previous_frames = list(
+                    pre_roll
+                )
+
+                # The final frame in pre_roll is the current
+                # frame. Add only the frames BEFORE current.
+                if len(previous_frames) > 1:
+
+                    for chunk in previous_frames[:-1]:
+
+                        if (
+                            len(buffer)
+                            + len(chunk)
+                            <= MAX_AUDIO_BUFFER_BYTES
+                        ):
+
+                            buffer.extend(
+                                chunk
+                            )
+
+                self.speech_active.add(
+                    user_id
+                )
+
+                logger.debug(
+                    "Speech started | user=%s | "
+                    "pre_roll=%.2fs | rms=%.1f | peak=%s",
+                    user_id,
+                    PRE_ROLL_SECONDS,
+                    rms,
+                    peak,
+                )
+
+            # ------------------------------------------------
+            # BUFFER CURRENT SPEECH FRAME
             # ------------------------------------------------
 
             buffer = (
@@ -866,6 +1018,16 @@ class VoiceAISink(
                 None,
             )
 
+            self.speech_active.discard(
+                user_id
+            )
+
+            # Start next turn cleanly.
+            self.pre_roll.pop(
+                user_id,
+                None,
+            )
+
             if not buffer:
                 return
 
@@ -915,7 +1077,7 @@ class VoiceAISink(
             #
             # ↓
             #
-            # STT WAV
+            # STT PCM
             #
             # 16kHz mono
             # ------------------------------------------------
@@ -938,6 +1100,10 @@ class VoiceAISink(
                 )
 
                 return
+
+            # ------------------------------------------------
+            # PCM -> WAV
+            # ------------------------------------------------
 
             wav_data = pcm_to_wav(
                 stt_pcm,
@@ -982,7 +1148,8 @@ class VoiceAISink(
             except Exception:
 
                 logger.debug(
-                    "Could not resolve member name | user=%s",
+                    "Could not resolve member name | "
+                    "user=%s",
                     user_id,
                     exc_info=True,
                 )
@@ -1068,6 +1235,10 @@ class VoiceAISink(
 
                 return
 
+            # ------------------------------------------------
+            # RESULT
+            # ------------------------------------------------
+
             transcript = str(
                 result.get(
                     "transcript",
@@ -1109,7 +1280,8 @@ class VoiceAISink(
             else:
 
                 logger.warning(
-                    "AI returned no TTS audio | user=%s",
+                    "AI returned no TTS audio | "
+                    "user=%s",
                     user_id,
                 )
 
@@ -1130,9 +1302,6 @@ class VoiceAISink(
                 user_id
             )
 
-            # Do not keep stale audio received during
-            # AI processing. A fresh turn starts cleanly.
-
     # ========================================================
     # CLEANUP
     # ========================================================
@@ -1150,9 +1319,11 @@ class VoiceAISink(
             self._silence_task = None
 
         self.buffers.clear()
+        self.pre_roll.clear()
         self.last_speech_time.clear()
         self.processing.clear()
         self.scheduled.clear()
+        self.speech_active.clear()
 
         logger.info(
             "Voice receive sink cleaned up"
@@ -1215,7 +1386,10 @@ class VoiceSession:
         )
 
         # True while the bot is speaking.
-        # The receive sink uses this to prevent TTS echo.
+        #
+        # The receive sink uses this to completely ignore
+        # incoming audio and prevent the TTS voice from
+        # feeding itself back into Whisper.
         self.is_speaking = False
 
         self._closed = False
@@ -1316,8 +1490,8 @@ class VoiceSession:
 
         except Exception:
 
-            # Keep session state valid even if
-            # an external voice list changes.
+            # Keep session state valid even if the engine
+            # does not expose voice configuration.
             pass
 
         logger.info(
@@ -1417,12 +1591,14 @@ class VoiceSession:
             if self.sink is not None:
 
                 self.sink.buffers.clear()
+                self.sink.pre_roll.clear()
                 self.sink.last_speech_time.clear()
+                self.sink.speech_active.clear()
 
             try:
 
                 # ------------------------------------------------
-                # Wait for previous audio
+                # Wait for previous audio, if any.
                 # ------------------------------------------------
 
                 while (
@@ -1471,6 +1647,10 @@ class VoiceSession:
 
                     return
 
+                # ------------------------------------------------
+                # Discord audio source.
+                # ------------------------------------------------
+
                 source = PCMSource(
                     discord_pcm,
                     sample_rate=(
@@ -1487,6 +1667,10 @@ class VoiceSession:
                 finished = (
                     loop.create_future()
                 )
+
+                # ------------------------------------------------
+                # Discord playback callback.
+                # ------------------------------------------------
 
                 def after_playback(
                     error: Exception | None,
@@ -1574,7 +1758,7 @@ class VoiceSession:
             finally:
 
                 # ------------------------------------------------
-                # Re-enable receive.
+                # Re-enable receive after TTS.
                 # ------------------------------------------------
 
                 self.is_speaking = False
@@ -1582,7 +1766,9 @@ class VoiceSession:
                 if self.sink is not None:
 
                     self.sink.buffers.clear()
+                    self.sink.pre_roll.clear()
                     self.sink.last_speech_time.clear()
+                    self.sink.speech_active.clear()
 
     # ========================================================
     # CLOSE
@@ -1693,7 +1879,7 @@ class VoiceSessionManager:
         async with self._lock:
 
             # ------------------------------------------------
-            # Existing session
+            # Existing Cloud Voice AI session
             # ------------------------------------------------
 
             existing = self.sessions.get(
@@ -1702,6 +1888,7 @@ class VoiceSessionManager:
 
             if existing:
 
+                # Already in requested channel.
                 if (
                     existing.channel.id
                     == channel.id
@@ -1709,6 +1896,7 @@ class VoiceSessionManager:
 
                     return existing
 
+                # Close old session before creating a new one.
                 self.sessions.pop(
                     guild.id,
                     None,
@@ -1721,7 +1909,8 @@ class VoiceSessionManager:
                 except Exception:
 
                     logger.exception(
-                        "Failed to close existing voice session"
+                        "Failed to close existing "
+                        "voice session"
                     )
 
                 try:
@@ -1754,6 +1943,7 @@ class VoiceSessionManager:
 
             if existing_client:
 
+                # Our system requires VoiceRecvClient.
                 if not isinstance(
                     existing_client,
                     voice_recv.VoiceRecvClient,
@@ -1816,7 +2006,7 @@ class VoiceSessionManager:
                 )
 
             # ------------------------------------------------
-            # SESSION
+            # CREATE SESSION
             # ------------------------------------------------
 
             session = VoiceSession(
@@ -1832,6 +2022,10 @@ class VoiceSessionManager:
             self.sessions[
                 guild.id
             ] = session
+
+            # ------------------------------------------------
+            # START RECEIVE
+            # ------------------------------------------------
 
             try:
 
