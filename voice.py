@@ -5,7 +5,7 @@
 # Pipeline:
 # Discord receive
 #     ↓
-# Groq Whisper STT
+# Local faster-whisper STT
 #     ↓
 # Groq Chat
 #     ↓
@@ -19,6 +19,8 @@
 # - Bot audio is ignored.
 # - Voice receive is disabled while TTS is playing.
 # - Buffers are cleared between turns.
+# - STT is processed locally by faster-whisper.
+# - Groq is used only for Chat + TTS.
 # ============================================================
 
 from __future__ import annotations
@@ -99,9 +101,9 @@ SILENCE_RMS_THRESHOLD = 500
 #   stereo
 #   16-bit PCM
 #
-# This gives Whisper a little context before the detected
-# speech begins, which can help preserve the first syllables
-# of short phrases such as:
+# This gives faster-whisper a little context before the
+# detected speech begins, which can help preserve the first
+# syllables of short phrases such as:
 #
 #   "السلام عليكم"
 #   "تسمعني؟"
@@ -439,7 +441,7 @@ class VoiceAISink(
     detects speech,
     buffers speech,
     and sends completed speech
-    to the AI pipeline.
+    to the local faster-whisper STT pipeline.
 
     A tiny rolling pre-roll is maintained for each user.
     Only when speech is detected is that recent audio attached
@@ -472,8 +474,8 @@ class VoiceAISink(
         # ----------------------------------------------------
         # Tiny rolling pre-roll buffers.
         #
-        # This stores only recent frames and is never sent
-        # to Whisper unless speech actually starts.
+        # This stores only recent audio and is never treated
+        # as speech unless a speech frame is detected.
         # ----------------------------------------------------
 
         self.pre_roll: dict[
@@ -545,7 +547,9 @@ class VoiceAISink(
                 ↓
             silence timeout
                 ↓
-            STT
+            WAV
+                ↓
+            local faster-whisper
         """
 
         if self.closed:
@@ -588,6 +592,7 @@ class VoiceAISink(
                     None,
                 ) == user_id
             ):
+
                 return
 
             # ------------------------------------------------
@@ -651,8 +656,10 @@ class VoiceAISink(
             #
             # Keep only a very small amount of recent audio.
             #
-            # This happens even during silence, but the audio
-            # is never treated as speech by itself.
+            # This includes silence, but that silence is not
+            # copied into the actual speech buffer unless it is
+            # part of the short pre-roll immediately before
+            # speech starts.
             # ------------------------------------------------
 
             pre_roll = self.pre_roll.setdefault(
@@ -708,8 +715,8 @@ class VoiceAISink(
                     pre_roll
                 )
 
-                # The final frame in pre_roll is the current
-                # frame. Add only the frames BEFORE current.
+                # The final frame is the current frame.
+                # Add only the older pre-roll frames here.
                 if len(previous_frames) > 1:
 
                     for chunk in previous_frames[:-1]:
@@ -1198,6 +1205,9 @@ class VoiceAISink(
 
             # ------------------------------------------------
             # AI PIPELINE
+            #
+            # gemini.py keeps the compatibility class name
+            # GeminiEngine, but STT is now local faster-whisper.
             # ------------------------------------------------
 
             result = (
@@ -1389,7 +1399,7 @@ class VoiceSession:
         #
         # The receive sink uses this to completely ignore
         # incoming audio and prevent the TTS voice from
-        # feeding itself back into Whisper.
+        # feeding itself back into STT.
         self.is_speaking = False
 
         self._closed = False
@@ -1399,11 +1409,17 @@ class VoiceSession:
     # ========================================================
 
     @property
-    def voice(self) -> str:
+    def voice(
+        self,
+    ) -> str:
+
         return self.voice_name
 
     @property
-    def speed(self) -> float:
+    def speed(
+        self,
+    ) -> float:
+
         return self.speech_speed
 
     # ========================================================
