@@ -7,7 +7,7 @@
 #     ↓
 # Groq Whisper Large V3
 #     ↓
-# Strong Arabic STT Filter
+# Light / Natural STT Cleanup
 #     ↓
 # Groq GPT-OSS 120B
 #     ↓
@@ -154,56 +154,41 @@ DEFAULT_SPEECH_SPEED = 1.0
 
 
 # ============================================================
-# ARABIC STT FILTER
+# LIGHT STT CLEANUP
 # ============================================================
 
-_ARABIC_RE = re.compile(
-    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
+# This is intentionally NOT a strong filter.
+#
+# The goal is:
+# - Do not rewrite what Whisper heard.
+# - Do not reject normal Arabic.
+# - Do not reject short phrases.
+# - Do not force Arabic-only output.
+# - Only remove obvious formatting/noise artifacts.
+#
+# Whisper itself decides what the user said.
+
+_ZERO_WIDTH_RE = re.compile(
+    r"[\u200B\u200C\u200D\uFEFF]"
 )
 
-_LATIN_RE = re.compile(
-    r"[A-Za-zÀ-ÖØ-öø-ÿ]"
+_SPACE_RE = re.compile(
+    r"\s+"
 )
 
-_BAD_FOREIGN_CHARS_RE = re.compile(
-    r"[ðþæœÐÞÆŒ]"
+_REPEATED_PUNCTUATION_RE = re.compile(
+    r"([،؛,.!?؟])\1+"
 )
 
-_WORD_RE = re.compile(
-    r"\S+"
-)
-
-_REPEAT_PHRASE_RE = re.compile(
-    r"\b(.{1,24})\s+\1\s+\1\b",
-    re.IGNORECASE,
-)
-
-_NOISE_WORDS = {
-    "uh",
-    "um",
-    "umm",
-    "hmm",
-    "hm",
-    "er",
-    "eh",
-    "mmm",
-    "mhm",
-}
-
-_KNOWN_HALLUCINATIONS = (
+# Only obvious Whisper subtitle-style hallucinations.
+# These are checked as complete/near-complete phrases,
+# not arbitrary word filtering.
+_OBVIOUS_HALLUCINATIONS = (
     "thank you for watching",
     "thanks for watching",
-    "subscribe",
-    "subtitles by",
-    "subtitle by",
-    "amara",
-    "copyright",
-    "please subscribe",
-    "ترجمة نانسي قنقر",
-    "ترجمة نانسي عجرم",
-    "اشتركوا في القناة",
     "شكرا على المشاهدة",
-    "شكرا للمشاهدة",
+    "شكراً على المشاهدة",
+    "اشتركوا في القناة",
     "لا تنسى الاشتراك",
 )
 
@@ -228,12 +213,14 @@ def _normalize_transcript(
     if not text:
         return ""
 
-    text = text.replace("\u200b", "")
-    text = text.replace("\u200c", "")
-    text = text.replace("\u200d", "")
+    # Remove zero-width characters only.
+    text = _ZERO_WIDTH_RE.sub(
+        "",
+        text,
+    )
 
-    text = re.sub(
-        r"\s+",
+    # Normalize whitespace only.
+    text = _SPACE_RE.sub(
         " ",
         text,
     )
@@ -241,141 +228,53 @@ def _normalize_transcript(
     return text.strip()
 
 
-def _arabic_ratio(
-    text: str,
-) -> float:
-
-    letters = re.findall(
-        r"[^\W\d_]",
-        text,
-        re.UNICODE,
-    )
-
-    if not letters:
-        return 0.0
-
-    return (
-        len(_ARABIC_RE.findall(text))
-        / max(len(letters), 1)
-    )
-
-
-def _latin_ratio(
-    text: str,
-) -> float:
-
-    letters = re.findall(
-        r"[^\W\d_]",
-        text,
-        re.UNICODE,
-    )
-
-    if not letters:
-        return 0.0
-
-    return (
-        len(_LATIN_RE.findall(text))
-        / max(len(letters), 1)
-    )
-
-
-def _looks_like_bad_transcript(
-    text: str,
-) -> bool:
-
-    text = _normalize_transcript(text)
-
-    if not text:
-        return True
-
-    lowered = text.lower()
-
-    if lowered in _NOISE_WORDS:
-        return True
-
-    if any(
-        phrase in lowered
-        for phrase in _KNOWN_HALLUCINATIONS
-    ):
-        return True
-
-    if _BAD_FOREIGN_CHARS_RE.search(text):
-        return True
-
-    arabic_chars = len(
-        _ARABIC_RE.findall(text)
-    )
-
-    if arabic_chars < 2:
-        return True
-
-    arabic_ratio = _arabic_ratio(text)
-    latin_ratio = _latin_ratio(text)
-
-    if (
-        arabic_ratio < 0.45
-        and latin_ratio > 0.35
-    ):
-        return True
-
-    if _REPEAT_PHRASE_RE.search(text):
-        return True
-
-    words = _WORD_RE.findall(text)
-
-    if len(words) >= 5:
-
-        counts: dict[str, int] = {}
-
-        for word in words:
-
-            key = word.strip(
-                "،؛,.!?؟:()[]{}\"'`"
-            )
-
-            if not key:
-                continue
-
-            counts[key] = (
-                counts.get(key, 0) + 1
-            )
-
-        highest = max(
-            counts.values(),
-            default=0,
-        )
-
-        if (
-            highest >= 4
-            and highest / len(words) >= 0.60
-        ):
-            return True
-
-    return False
-
-
-def _filter_transcript(
+def _light_filter_transcript(
     text: str,
 ) -> str:
+    """
+    Very light STT cleanup.
 
-    text = _normalize_transcript(text)
+    IMPORTANT:
+    This function must not try to decide whether
+    Whisper's transcription is "correct".
 
-    if _looks_like_bad_transcript(text):
+    It only removes obvious formatting artifacts.
+    """
 
-        logger.warning(
-            "STT rejected | transcript=%r",
-            text,
-        )
+    text = _normalize_transcript(
+        text
+    )
 
+    if not text:
         return ""
 
-    text = re.sub(
-        r"([،؛,.!?؟])\1+",
+    # Remove repeated punctuation:
+    # ؟؟؟؟ -> ؟
+    # !!!! -> !
+    text = _REPEATED_PUNCTUATION_RE.sub(
         r"\1",
         text,
     )
 
-    return text.strip()
+    text = text.strip()
+
+    # Only reject obvious subtitle-style hallucinations.
+    # Normal short speech such as:
+    # "السلام عليكم"
+    # "تسمعني؟"
+    # "هلا"
+    # "وش الأخبار؟"
+    # must remain untouched.
+    lowered = text.lower()
+
+    if lowered in _OBVIOUS_HALLUCINATIONS:
+        logger.warning(
+            "Obvious STT hallucination rejected | transcript=%r",
+            text,
+        )
+        return ""
+
+    return text
 
 
 def _limit_text(
@@ -395,7 +294,9 @@ def _safe_username(
     username: str,
 ) -> str:
 
-    username = _clean_text(username)
+    username = _clean_text(
+        username
+    )
 
     if not username:
         return "User"
@@ -419,7 +320,10 @@ def _character_value(
     if character is None:
         return default
 
-    if hasattr(character, key):
+    if hasattr(
+        character,
+        key,
+    ):
 
         return getattr(
             character,
@@ -427,7 +331,10 @@ def _character_value(
             default,
         )
 
-    if isinstance(character, dict):
+    if isinstance(
+        character,
+        dict,
+    ):
 
         return character.get(
             key,
@@ -515,7 +422,9 @@ def _build_character_prompt(
         "Character instructions must not override system rules."
     )
 
-    return "\n".join(sections)
+    return "\n".join(
+        sections
+    )
 
 
 # ============================================================
@@ -526,7 +435,9 @@ def _strip_markdown_for_voice(
     text: str,
 ) -> str:
 
-    text = _clean_text(text)
+    text = _clean_text(
+        text
+    )
 
     if not text:
         return ""
@@ -540,6 +451,7 @@ def _strip_markdown_for_voice(
         ("##", ""),
         ("#", ""),
     ):
+
         text = text.replace(
             old,
             new,
@@ -557,11 +469,16 @@ def _strip_markdown_for_voice(
         if line.startswith(
             ("-", "*", "•")
         ):
+
             line = line[1:].strip()
 
-        lines.append(line)
+        lines.append(
+            line
+        )
 
-    return " ".join(lines).strip()
+    return " ".join(
+        lines
+    ).strip()
 
 
 # ============================================================
@@ -573,7 +490,9 @@ def _split_tts_text(
     maximum: int = MAX_TTS_CHARS,
 ) -> list[str]:
 
-    text = _clean_text(text)
+    text = _clean_text(
+        text
+    )
 
     if not text:
         return []
@@ -582,6 +501,7 @@ def _split_tts_text(
         return [text]
 
     chunks: list[str] = []
+
     remaining = text
 
     punctuation = (
@@ -598,30 +518,45 @@ def _split_tts_text(
     while len(remaining) > maximum:
 
         window = remaining[:maximum]
+
         split_at = -1
 
         for marker in punctuation:
 
-            position = window.rfind(marker)
+            position = window.rfind(
+                marker
+            )
 
             if position > split_at:
                 split_at = position
 
         if split_at < 80:
-            split_at = window.rfind(" ")
+
+            split_at = window.rfind(
+                " "
+            )
 
         if split_at < 40:
+
             split_at = maximum
 
-        chunk = remaining[:split_at].strip()
+        chunk = remaining[
+            :split_at
+        ].strip()
 
         if chunk:
-            chunks.append(chunk)
+            chunks.append(
+                chunk
+            )
 
-        remaining = remaining[split_at:].strip()
+        remaining = remaining[
+            split_at:
+        ].strip()
 
     if remaining:
-        chunks.append(remaining)
+        chunks.append(
+            remaining
+        )
 
     return chunks
 
@@ -658,6 +593,7 @@ class GeminiEngine:
         ).strip()
 
         if not self.groq_api_key:
+
             raise RuntimeError(
                 "GROQ_API_KEY is missing."
             )
@@ -710,11 +646,14 @@ class GeminiEngine:
         voice: str,
     ) -> str:
 
-        normalized = normalize_voice_name(
-            voice
+        normalized = (
+            normalize_voice_name(
+                voice
+            )
         )
 
         if normalized not in GEMINI_VOICES:
+
             raise ValueError(
                 f"Invalid voice: {voice}"
             )
@@ -725,14 +664,19 @@ class GeminiEngine:
 
     def _get_tts_voice(self) -> str:
 
-        mapped = GROQ_TTS_VOICE_MAP.get(
-            self.current_voice
+        mapped = (
+            GROQ_TTS_VOICE_MAP.get(
+                self.current_voice
+            )
         )
 
         if mapped in VALID_GROQ_TTS_VOICES:
             return mapped
 
-        if GROQ_TTS_VOICE in VALID_GROQ_TTS_VOICES:
+        if (
+            GROQ_TTS_VOICE
+            in VALID_GROQ_TTS_VOICES
+        ):
             return GROQ_TTS_VOICE
 
         return "fahad"
@@ -747,7 +691,10 @@ class GeminiEngine:
     ) -> str:
 
         try:
-            return str(error).lower()
+            return str(
+                error
+            ).lower()
+
         except Exception:
             return ""
 
@@ -757,7 +704,9 @@ class GeminiEngine:
         error: Exception,
     ) -> bool:
 
-        text = cls._error_text(error)
+        text = cls._error_text(
+            error
+        )
 
         return any(
             marker in text
@@ -776,10 +725,14 @@ class GeminiEngine:
         error: Exception,
     ) -> bool:
 
-        if cls._is_quota_error(error):
+        if cls._is_quota_error(
+            error
+        ):
             return False
 
-        text = cls._error_text(error)
+        text = cls._error_text(
+            error
+        )
 
         return any(
             marker in text
@@ -827,7 +780,9 @@ class GeminiEngine:
 
                 last_error = error
 
-                if self._is_quota_error(error):
+                if self._is_quota_error(
+                    error
+                ):
 
                     self.quota_exhausted = True
 
@@ -850,7 +805,9 @@ class GeminiEngine:
                     float(
                         API_RETRY_DELAY_SECONDS
                     )
-                    * float(attempt + 1)
+                    * float(
+                        attempt + 1
+                    )
                 )
 
                 logger.warning(
@@ -883,6 +840,7 @@ class GeminiEngine:
     ) -> str:
 
         if not audio:
+
             raise ValueError(
                 "Empty audio."
             )
@@ -905,7 +863,6 @@ class GeminiEngine:
             None,
         )
 
-        fd = None
         temp_path: str | None = None
 
         try:
@@ -915,17 +872,30 @@ class GeminiEngine:
                 delete=False,
             ) as temp_file:
 
-                temp_path = temp_file.name
+                temp_path = (
+                    temp_file.name
+                )
 
             with wave.open(
                 temp_path,
                 "wb",
             ) as wav_file:
 
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(16000)
-                wav_file.writeframes(pcm)
+                wav_file.setnchannels(
+                    1
+                )
+
+                wav_file.setsampwidth(
+                    2
+                )
+
+                wav_file.setframerate(
+                    16000
+                )
+
+                wav_file.writeframes(
+                    pcm
+                )
 
             return temp_path
 
@@ -934,9 +904,12 @@ class GeminiEngine:
             if temp_path:
 
                 try:
-                    Path(temp_path).unlink(
+                    Path(
+                        temp_path
+                    ).unlink(
                         missing_ok=True
                     )
+
                 except Exception:
                     pass
 
@@ -956,21 +929,31 @@ class GeminiEngine:
         try:
 
             # voice.py normally sends WAV.
-            # Keep raw-PCM compatibility too.
-            if audio.startswith(b"RIFF"):
+            # Keep raw PCM compatibility too.
+
+            if audio.startswith(
+                b"RIFF"
+            ):
 
                 with tempfile.NamedTemporaryFile(
                     suffix=".wav",
                     delete=False,
                 ) as temp_file:
 
-                    temp_path = temp_file.name
-                    temp_file.write(audio)
+                    temp_path = (
+                        temp_file.name
+                    )
+
+                    temp_file.write(
+                        audio
+                    )
 
             else:
 
-                temp_path = self._discord_pcm_to_wav(
-                    audio
+                temp_path = (
+                    self._discord_pcm_to_wav(
+                        audio
+                    )
                 )
 
             with open(
@@ -988,14 +971,11 @@ class GeminiEngine:
                         language="ar",
                         temperature=0.0,
                         prompt=(
-                            "تفريغ كلام عربي باللهجة السعودية "
-                            "والعربية العامية. "
-                            "اكتب الكلام كما نُطق بالعربية. "
-                            "لا تترجم الكلام. "
-                            "لا تكتب العربية بأحرف لاتينية. "
-                            "لا تخمن كلامًا غير مسموع. "
-                            "إذا كان الصوت غير واضح فلا تضف كلامًا من عندك. "
-                            "لا تضف عبارات من عندك أو عبارات اشتراك وترجمة."
+                            "كلام عربي باللهجة "
+                            "السعودية والعامية. "
+                            "اكتب الكلام كما نُطق، "
+                            "بدون ترجمة أو إضافة "
+                            "كلام غير مسموع."
                         ),
                         response_format="verbose_json",
                         timestamp_granularities=[
@@ -1011,9 +991,13 @@ class GeminiEngine:
             if temp_path:
 
                 try:
-                    Path(temp_path).unlink(
+
+                    Path(
+                        temp_path
+                    ).unlink(
                         missing_ok=True
                     )
+
                 except Exception:
                     pass
 
@@ -1052,6 +1036,27 @@ class GeminiEngine:
 
             return ""
 
+        # ----------------------------------------------------
+        # RAW WHISPER OUTPUT
+        # ----------------------------------------------------
+
+        logger.info(
+            "Groq STT RAW | model=%s | "
+            "language=ar | transcript=%r",
+            self.transcribe_model,
+            raw_text,
+        )
+
+        # ----------------------------------------------------
+        # SEGMENT QUALITY CHECK
+        #
+        # This is intentionally light.
+        #
+        # We only ignore segments that Whisper itself
+        # strongly marks as silence/very low confidence.
+        # If no valid segments remain, raw_text is used.
+        # ----------------------------------------------------
+
         segments = getattr(
             response,
             "segments",
@@ -1062,52 +1067,42 @@ class GeminiEngine:
 
         for segment in segments:
 
-            segment_text = _normalize_transcript(
-                getattr(
-                    segment,
-                    "text",
-                    "",
+            segment_text = (
+                _normalize_transcript(
+                    getattr(
+                        segment,
+                        "text",
+                        "",
+                    )
                 )
             )
 
             if not segment_text:
                 continue
 
-            no_speech_prob = float(
-                getattr(
-                    segment,
-                    "no_speech_prob",
-                    0.0,
+            try:
+
+                no_speech_prob = float(
+                    getattr(
+                        segment,
+                        "no_speech_prob",
+                        0.0,
+                    )
+                    or 0.0
                 )
-                or 0.0
-            )
 
-            avg_logprob = float(
-                getattr(
-                    segment,
-                    "avg_logprob",
-                    0.0,
-                )
-                or 0.0
-            )
+            except Exception:
 
-            if no_speech_prob >= 0.75:
+                no_speech_prob = 0.0
 
-                logger.warning(
-                    "Rejected STT segment | "
+            # Keep this threshold conservative.
+            # We do NOT reject based on log probability.
+            if no_speech_prob >= 0.90:
+
+                logger.debug(
+                    "Ignored likely-silence STT segment | "
                     "no_speech_prob=%.2f | text=%r",
                     no_speech_prob,
-                    segment_text,
-                )
-
-                continue
-
-            if avg_logprob < -1.8:
-
-                logger.warning(
-                    "Rejected weak STT segment | "
-                    "avg_logprob=%.2f | text=%r",
-                    avg_logprob,
                     segment_text,
                 )
 
@@ -1118,13 +1113,21 @@ class GeminiEngine:
             )
 
         candidate_text = (
-            " ".join(valid_segments)
+            " ".join(
+                valid_segments
+            )
             if valid_segments
             else raw_text
         )
 
-        filtered_text = _filter_transcript(
-            candidate_text
+        # ----------------------------------------------------
+        # LIGHT CLEANUP
+        # ----------------------------------------------------
+
+        filtered_text = (
+            _light_filter_transcript(
+                candidate_text
+            )
         )
 
         filtered_text = _limit_text(
@@ -1133,10 +1136,10 @@ class GeminiEngine:
         )
 
         logger.info(
-            "Groq STT | model=%s | "
-            "language=ar | filtered=true | transcript=%s",
+            "Groq STT FILTERED | model=%s | "
+            "language=ar | transcript=%r",
             self.transcribe_model,
-            filtered_text or "<rejected>",
+            filtered_text,
         )
 
         return filtered_text
@@ -1157,7 +1160,9 @@ class GeminiEngine:
         if VOICE_MEMORY_LIMIT <= 0:
             return
 
-        content = _clean_text(content)
+        content = _clean_text(
+            content
+        )
 
         if not content:
             return
@@ -1166,6 +1171,7 @@ class GeminiEngine:
             "user",
             "assistant",
         }:
+
             role = "user"
 
         self._memory.append(
@@ -1195,10 +1201,16 @@ class GeminiEngine:
             content,
         )
 
-    def clear_memory(self) -> None:
+    def clear_memory(
+        self,
+    ) -> None:
+
         self._memory.clear()
 
-    def reset_memory(self) -> None:
+    def reset_memory(
+        self,
+    ) -> None:
+
         self.clear_memory()
 
     def get_memory(
@@ -1217,8 +1229,13 @@ class GeminiEngine:
 
         return self.get_memory()
 
-    def memory_size(self) -> int:
-        return len(self._memory)
+    def memory_size(
+        self,
+    ) -> int:
+
+        return len(
+            self._memory
+        )
 
     # ========================================================
     # GROQ CHAT
@@ -1264,6 +1281,7 @@ class GeminiEngine:
                 "user",
                 "assistant",
             }:
+
                 role = "user"
 
             messages.append(
@@ -1290,7 +1308,9 @@ class GeminiEngine:
 
     def _generate_response_sync(
         self,
-        messages: list[dict[str, str]],
+        messages: list[
+            dict[str, str]
+        ],
         system_prompt: str,
     ):
 
@@ -1324,11 +1344,13 @@ class GeminiEngine:
             "openai/gpt-oss"
         ):
 
-            kwargs["reasoning_effort"] = (
-                GROQ_REASONING_EFFORT
-            )
+            kwargs[
+                "reasoning_effort"
+            ] = GROQ_REASONING_EFFORT
 
-            kwargs["include_reasoning"] = False
+            kwargs[
+                "include_reasoning"
+            ] = False
 
         return self.groq.chat.completions.create(
             **kwargs
@@ -1346,7 +1368,9 @@ class GeminiEngine:
         system_prompt: str | None = None,
     ) -> str:
 
-        text = _clean_text(text)
+        text = _clean_text(
+            text
+        )
 
         if not text:
             return ""
@@ -1357,8 +1381,10 @@ class GeminiEngine:
             else AI_SYSTEM_PROMPT
         )
 
-        character_prompt = _build_character_prompt(
-            character
+        character_prompt = (
+            _build_character_prompt(
+                character
+            )
         )
 
         final_system_prompt = (
@@ -1443,20 +1469,28 @@ class GeminiEngine:
         speed: float,
     ) -> bytes:
 
-        text = _clean_text(text)
+        text = _clean_text(
+            text
+        )
 
         if not text:
             return b""
 
-        text = text[:MAX_TTS_CHARS]
+        text = text[
+            :MAX_TTS_CHARS
+        ]
 
-        response = self.groq.audio.speech.create(
-            model=self.tts_model,
-            voice=voice,
-            input=text,
-            response_format="wav",
+        response = (
+            self.groq.audio.speech.create(
+                model=self.tts_model,
+                voice=voice,
+                input=text,
+                response_format="wav",
+            )
         )
 
+        # Current Groq TTS endpoint does not
+        # use this value directly.
         _ = speed
 
         temp_path: str | None = None
@@ -1468,7 +1502,9 @@ class GeminiEngine:
                 delete=False,
             ) as temp_file:
 
-                temp_path = temp_file.name
+                temp_path = (
+                    temp_file.name
+                )
 
             response.write_to_file(
                 temp_path
@@ -1479,10 +1515,21 @@ class GeminiEngine:
                 "rb",
             ) as wav_file:
 
-                channels = wav_file.getnchannels()
-                sample_width = wav_file.getsampwidth()
-                sample_rate = wav_file.getframerate()
-                frame_count = wav_file.getnframes()
+                channels = (
+                    wav_file.getnchannels()
+                )
+
+                sample_width = (
+                    wav_file.getsampwidth()
+                )
+
+                sample_rate = (
+                    wav_file.getframerate()
+                )
+
+                frame_count = (
+                    wav_file.getnframes()
+                )
 
                 if frame_count <= 0:
                     return b""
@@ -1519,7 +1566,10 @@ class GeminiEngine:
                         0.0,
                     )
 
-            if sample_rate != TTS_OUTPUT_SAMPLE_RATE:
+            if (
+                sample_rate
+                != TTS_OUTPUT_SAMPLE_RATE
+            ):
 
                 pcm, _ = audioop.ratecv(
                     pcm,
@@ -1537,10 +1587,15 @@ class GeminiEngine:
             if temp_path:
 
                 try:
-                    Path(temp_path).unlink(
+
+                    Path(
+                        temp_path
+                    ).unlink(
                         missing_ok=True
                     )
+
                 except Exception:
+
                     logger.warning(
                         "Failed to remove TTS temp file: %s",
                         temp_path,
@@ -1554,22 +1609,30 @@ class GeminiEngine:
         speed: float = DEFAULT_SPEECH_SPEED,
     ) -> bytes:
 
-        text = _clean_text(text)
+        text = _clean_text(
+            text
+        )
 
         if not text:
             return b""
 
         selected_voice = (
-            self.set_voice(voice)
+            self.set_voice(
+                voice
+            )
             if voice
             else self.voice
         )
 
-        selected_speed = normalize_speech_speed(
-            speed
+        selected_speed = (
+            normalize_speech_speed(
+                speed
+            )
         )
 
-        groq_voice = self._get_tts_voice()
+        groq_voice = (
+            self._get_tts_voice()
+        )
 
         logger.info(
             "Groq TTS | model=%s | "
@@ -1587,7 +1650,9 @@ class GeminiEngine:
         if not chunks:
             return b""
 
-        output_parts: list[bytes] = []
+        output_parts: list[
+            bytes
+        ] = []
 
         started = (
             asyncio.get_running_loop().time()
@@ -1619,7 +1684,9 @@ class GeminiEngine:
             )
 
             if audio:
-                output_parts.append(audio)
+                output_parts.append(
+                    audio
+                )
 
         final_audio = b"".join(
             output_parts
@@ -1665,7 +1732,9 @@ class GeminiEngine:
             "response": "",
             "audio": b"",
             "voice": (
-                normalize_voice_name(voice)
+                normalize_voice_name(
+                    voice
+                )
                 if voice
                 else self.voice
             ),
@@ -1703,12 +1772,14 @@ class GeminiEngine:
             if not transcript:
 
                 result["error"] = (
-                    "Speech rejected by STT filter."
+                    "Speech rejected by STT."
                 )
 
                 return result
 
-            result["transcript"] = transcript
+            result["transcript"] = (
+                transcript
+            )
 
             # ------------------------------------------------
             # CHAT
@@ -1732,7 +1803,9 @@ class GeminiEngine:
 
                 return result
 
-            result["response"] = response
+            result["response"] = (
+                response
+            )
 
             # ------------------------------------------------
             # MEMORY
@@ -1752,17 +1825,23 @@ class GeminiEngine:
             # ------------------------------------------------
 
             selected_voice = (
-                self.set_voice(voice)
+                self.set_voice(
+                    voice
+                )
                 if voice
                 else self.voice
             )
 
-            result["voice"] = selected_voice
+            result["voice"] = (
+                selected_voice
+            )
 
-            speech = await self.generate_speech(
-                response,
-                voice=selected_voice,
-                speed=speed,
+            speech = (
+                await self.generate_speech(
+                    response,
+                    voice=selected_voice,
+                    speed=speed,
+                )
             )
 
             if not speech:
@@ -1794,9 +1873,13 @@ class GeminiEngine:
         except Exception as error:
 
             self.failed_requests += 1
-            result["error"] = str(error)
+            result["error"] = str(
+                error
+            )
 
-            if self._is_quota_error(error):
+            if self._is_quota_error(
+                error
+            ):
 
                 self.quota_exhausted = True
 
@@ -1833,7 +1916,7 @@ class GeminiEngine:
             "transcribe_provider": "Groq",
             "transcribe_model": self.transcribe_model,
             "stt_language": "ar",
-            "stt_filter": "strong",
+            "stt_filter": "light",
             "tts_provider": "Groq",
             "tts_model": self.tts_model,
             "tts_local": False,
@@ -1844,7 +1927,10 @@ class GeminiEngine:
     # CLOSE
     # ========================================================
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
+
         self.groq = None
 
 
