@@ -5,7 +5,7 @@
 # Pipeline:
 # Discord Voice PCM / WAV
 #     ↓
-# Local faster-whisper STT
+# Gladia STT
 #     ↓
 # Groq GPT-OSS 120B
 #     ↓
@@ -16,7 +16,7 @@
 # Discord
 #
 # STT:
-#     faster-whisper (LOCAL)
+#     Gladia
 #
 # Chat:
 #     Groq GPT-OSS 120B
@@ -26,15 +26,24 @@
 #
 # Gemini / Claude / Piper are completely removed.
 # Groq Whisper STT is completely removed.
+# faster-whisper is completely removed.
+#
+# IMPORTANT:
+# - No Gladia SDK is required.
+# - Gladia STT is accessed directly over HTTPS.
+# - This keeps the installation lightweight for small hosts.
 # ============================================================
 
 from __future__ import annotations
 
 import asyncio
 import audioop
+import json
 import logging
 import os
 import tempfile
+import urllib.error
+import urllib.request
 import wave
 from collections import deque
 from pathlib import Path
@@ -67,114 +76,74 @@ GROQ_API_KEY = os.getenv(
     "",
 ).strip()
 
+GLADIA_API_KEY = os.getenv(
+    "GLADIA_API_KEY",
+    "",
+).strip()
+
 
 # ============================================================
 # MODELS
 # ============================================================
 
-# ------------------------------------------------------------
-# Local faster-whisper model.
-#
-# Recommended for a normal CPU server:
-#     small
-#
-# Other possible values:
-#     base
-#     medium
-#     large-v3
-#
-# "small" is selected by default because the goal is to keep
-# the voice bot reasonably light and responsive.
-# ------------------------------------------------------------
-
-FASTER_WHISPER_MODEL = (
+GLADIA_STT_MODEL = (
     os.getenv(
-        "FASTER_WHISPER_MODEL",
-        "small",
+        "GLADIA_STT_MODEL",
+        "solaria-1",
     ).strip()
-    or "small"
+    or "solaria-1"
 )
 
-FASTER_WHISPER_DEVICE = (
+GLADIA_STT_LANGUAGE = (
     os.getenv(
-        "FASTER_WHISPER_DEVICE",
-        "cpu",
-    ).strip().lower()
-    or "cpu"
-)
-
-FASTER_WHISPER_COMPUTE_TYPE = (
-    os.getenv(
-        "FASTER_WHISPER_COMPUTE_TYPE",
-        "int8",
-    ).strip().lower()
-    or "int8"
-)
-
-# Number of CPU threads used by CTranslate2.
-#
-# 0 = let the library decide.
-# On shared hosting, a modest number is usually better than
-# aggressively consuming every CPU thread.
-try:
-
-    FASTER_WHISPER_CPU_THREADS = max(
-        int(
-            os.getenv(
-                "FASTER_WHISPER_CPU_THREADS",
-                "4",
-            )
-        ),
-        0,
-    )
-
-except (TypeError, ValueError):
-
-    FASTER_WHISPER_CPU_THREADS = 4
-
-
-# ------------------------------------------------------------
-# Beam search.
-#
-# A moderate beam size keeps recognition quality decent
-# without making short voice messages unnecessarily heavy.
-# ------------------------------------------------------------
-
-try:
-
-    FASTER_WHISPER_BEAM_SIZE = max(
-        int(
-            os.getenv(
-                "FASTER_WHISPER_BEAM_SIZE",
-                "5",
-            )
-        ),
-        1,
-    )
-
-except (TypeError, ValueError):
-
-    FASTER_WHISPER_BEAM_SIZE = 5
-
-
-# ------------------------------------------------------------
-# Voice recognition settings.
-# ------------------------------------------------------------
-
-FASTER_WHISPER_LANGUAGE = (
-    os.getenv(
-        "FASTER_WHISPER_LANGUAGE",
+        "GLADIA_STT_LANGUAGE",
         "ar",
-    ).strip().lower()
+    ).strip()
     or "ar"
 )
 
-# Keep VAD enabled so pure silence/noise is less likely to
-# become text.
-FASTER_WHISPER_VAD = (
+GLADIA_STT_ENDPOINT = (
     os.getenv(
-        "FASTER_WHISPER_VAD",
-        "true",
+        "GLADIA_STT_ENDPOINT",
+        "https://api.gladia.io/v2/pre-recorded",
+    ).strip()
+    or "https://api.gladia.io/v2/pre-recorded"
+)
+
+GLADIA_UPLOAD_ENDPOINT = (
+    os.getenv(
+        "GLADIA_UPLOAD_ENDPOINT",
+        "https://api.gladia.io/v2/upload",
+    ).strip()
+    or "https://api.gladia.io/v2/upload"
+)
+
+GLADIA_POLL_INTERVAL = 0.25
+
+try:
+    GLADIA_MAX_POLL_SECONDS = max(
+        float(
+            os.getenv(
+                "GLADIA_MAX_POLL_SECONDS",
+                "30",
+            )
+        ),
+        5.0,
+    )
+except (TypeError, ValueError):
+    GLADIA_MAX_POLL_SECONDS = 30.0
+
+
+# ------------------------------------------------------------
+# Gladia options.
+#
+# Keep the processing intentionally simple.
+# ------------------------------------------------------------
+
+GLADIA_DIARIZATION = (
+    os.getenv(
+        "GLADIA_DIARIZATION",
+        "false",
     ).strip().lower()
     not in {
         "0",
@@ -184,36 +153,9 @@ FASTER_WHISPER_VAD = (
     }
 )
 
-# 500 ms minimum silence duration for the VAD stage.
-try:
-
-    FASTER_WHISPER_MIN_SILENCE_MS = max(
-        int(
-            os.getenv(
-                "FASTER_WHISPER_MIN_SILENCE_MS",
-                "500",
-            )
-        ),
-        0,
-    )
-
-except (TypeError, ValueError):
-
-    FASTER_WHISPER_MIN_SILENCE_MS = 500
-
-
-# ------------------------------------------------------------
-# Do not condition transcription on previous text.
-#
-# This is particularly useful in a voice assistant because
-# every Discord speech turn should be treated as its own
-# independent utterance rather than continuing a hallucinated
-# phrase from a previous segment.
-# ------------------------------------------------------------
-
-FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT = (
+GLADIA_SUBTITLES = (
     os.getenv(
-        "FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
+        "GLADIA_SUBTITLES",
         "false",
     ).strip().lower()
     not in {
@@ -325,20 +267,19 @@ def _clean_text(
     if value is None:
         return ""
 
-    return str(value).strip()
+    return str(
+        value
+    ).strip()
 
 
 def _normalize_transcript(
     text: str,
 ) -> str:
     """
-    Minimal transcript cleanup.
+    Very light transcript cleanup.
 
-    IMPORTANT:
-    This is deliberately NOT an STT correction engine.
-
-    faster-whisper is now responsible for transcription.
-    We only clean surrounding whitespace/control artifacts.
+    Gladia is responsible for the speech recognition.
+    We do not attempt to rewrite or guess words here.
     """
 
     text = _clean_text(
@@ -348,8 +289,6 @@ def _normalize_transcript(
     if not text:
         return ""
 
-    # Remove zero-width/control formatting characters commonly
-    # introduced by text serialization.
     for character in (
         "\u200b",
         "\u200c",
@@ -362,7 +301,6 @@ def _normalize_transcript(
             "",
         )
 
-    # Normalize common whitespace.
     text = " ".join(
         text.split()
     )
@@ -382,7 +320,9 @@ def _limit_text(
     if len(text) <= maximum:
         return text
 
-    return text[:maximum].rstrip()
+    return text[
+        :maximum
+    ].rstrip()
 
 
 def _safe_username(
@@ -569,7 +509,9 @@ def _strip_markdown_for_voice(
             ("-", "*", "•")
         ):
 
-            line = line[1:].strip()
+            line = line[
+                1:
+            ].strip()
 
         lines.append(
             line
@@ -674,7 +616,7 @@ class GeminiEngine:
     Compatibility name retained for main.py / voice.py.
 
     STT:
-        Local faster-whisper
+        Gladia
 
     Chat:
         Groq GPT-OSS 120B
@@ -706,6 +648,24 @@ class GeminiEngine:
                 "GROQ_API_KEY is missing."
             )
 
+        # ----------------------------------------------------
+        # GLADIA
+        # ----------------------------------------------------
+
+        self.gladia_api_key = (
+            GLADIA_API_KEY
+        ).strip()
+
+        if not self.gladia_api_key:
+
+            raise RuntimeError(
+                "GLADIA_API_KEY is missing."
+            )
+
+        # ----------------------------------------------------
+        # MODELS
+        # ----------------------------------------------------
+
         self.chat_model = (
             chat_model
             or GROQ_CHAT_MODEL
@@ -716,37 +676,17 @@ class GeminiEngine:
             or GROQ_TTS_MODEL
         )
 
-        # ----------------------------------------------------
-        # STT MODEL
-        #
-        # Keep the old argument for compatibility with
-        # main.py / voice.py, but the actual STT backend is now
-        # faster-whisper.
-        # ----------------------------------------------------
-
         self.transcribe_model = (
             transcribe_model
-            or FASTER_WHISPER_MODEL
+            or GLADIA_STT_MODEL
         )
 
         # ----------------------------------------------------
-        # GROQ CLIENT
+        # CLIENT
         # ----------------------------------------------------
 
         self.groq = Groq(
             api_key=self.groq_api_key
-        )
-
-        # ----------------------------------------------------
-        # LOCAL WHISPER MODEL
-        #
-        # We load it lazily so the Discord bot can initialize
-        # without blocking startup for model download/loading.
-        # ----------------------------------------------------
-
-        self._whisper_model = None
-        self._whisper_lock = (
-            asyncio.Lock()
         )
 
         # ----------------------------------------------------
@@ -776,91 +716,6 @@ class GeminiEngine:
         self.processed_requests = 0
         self.failed_requests = 0
         self.quota_exhausted = False
-
-    # ========================================================
-    # WHISPER MODEL
-    # ========================================================
-
-    async def _get_whisper_model(self):
-        """
-        Lazily load faster-whisper.
-
-        The first voice message may take longer because the
-        model can need to download and initialize.
-        """
-
-        if self._whisper_model is not None:
-
-            return self._whisper_model
-
-        async with self._whisper_lock:
-
-            if self._whisper_model is not None:
-
-                return self._whisper_model
-
-            logger.info(
-                "Loading local faster-whisper | "
-                "model=%s | device=%s | compute_type=%s | "
-                "cpu_threads=%s",
-                self.transcribe_model,
-                FASTER_WHISPER_DEVICE,
-                FASTER_WHISPER_COMPUTE_TYPE,
-                FASTER_WHISPER_CPU_THREADS,
-            )
-
-            try:
-
-                from faster_whisper import (
-                    WhisperModel,
-                )
-
-            except ImportError as error:
-
-                raise RuntimeError(
-                    "faster-whisper is not installed. "
-                    "Add 'faster-whisper' to requirements.txt."
-                ) from error
-
-            def load_model():
-                return WhisperModel(
-                    self.transcribe_model,
-                    device=FASTER_WHISPER_DEVICE,
-                    compute_type=FASTER_WHISPER_COMPUTE_TYPE,
-                    cpu_threads=(
-                        FASTER_WHISPER_CPU_THREADS
-                    ),
-                    num_workers=1,
-                )
-
-            try:
-
-                self._whisper_model = (
-                    await asyncio.to_thread(
-                        load_model
-                    )
-                )
-
-            except Exception as error:
-
-                logger.exception(
-                    "Failed to load faster-whisper model"
-                )
-
-                raise RuntimeError(
-                    "Could not load faster-whisper model "
-                    f"'{self.transcribe_model}': {error}"
-                ) from error
-
-            logger.info(
-                "Local faster-whisper loaded | "
-                "model=%s | device=%s | compute_type=%s",
-                self.transcribe_model,
-                FASTER_WHISPER_DEVICE,
-                FASTER_WHISPER_COMPUTE_TYPE,
-            )
-
-            return self._whisper_model
 
     # ========================================================
     # VOICE
@@ -956,6 +811,10 @@ class GeminiEngine:
                 "quota",
                 "too many requests",
                 "429",
+                "credit",
+                "credits",
+                "payment required",
+                "insufficient balance",
             )
         )
 
@@ -968,6 +827,7 @@ class GeminiEngine:
         if cls._is_quota_error(
             error
         ):
+
             return False
 
         text = cls._error_text(
@@ -982,6 +842,8 @@ class GeminiEngine:
                 "temporarily unavailable",
                 "service unavailable",
                 "internal server error",
+                "bad gateway",
+                "gateway timeout",
                 "500",
                 "502",
                 "503",
@@ -1073,13 +935,13 @@ class GeminiEngine:
         )
 
     # ========================================================
-    # AUDIO PREPARATION
+    # AUDIO
     # ========================================================
 
     @staticmethod
-    def _ensure_wav_file(
+    def _ensure_wav_bytes(
         audio: bytes,
-    ) -> str:
+    ) -> bytes:
 
         if not audio:
 
@@ -1087,237 +949,722 @@ class GeminiEngine:
                 "Empty audio."
             )
 
-        temp_path: str | None = None
-
-        try:
-
-            # ------------------------------------------------
-            # Already WAV
-            # ------------------------------------------------
-
-            if audio.startswith(
-                b"RIFF"
-            ):
-
-                with tempfile.NamedTemporaryFile(
-                    suffix=".wav",
-                    delete=False,
-                ) as temp_file:
-
-                    temp_path = (
-                        temp_file.name
-                    )
-
-                    temp_file.write(
-                        audio
-                    )
-
-                return temp_path
-
-            # ------------------------------------------------
-            # Raw Discord PCM:
-            #
-            # 48kHz
-            # stereo
-            # 16-bit
-            #
-            # ↓
-            #
-            # 16kHz
-            # mono
-            # 16-bit
-            # ------------------------------------------------
-
-            pcm = audio
-
-            pcm = audioop.tomono(
-                pcm,
-                2,
-                0.5,
-                0.5,
-            )
-
-            pcm, _ = audioop.ratecv(
-                pcm,
-                2,
-                1,
-                48000,
-                16000,
-                None,
-            )
-
-            with tempfile.NamedTemporaryFile(
-                suffix=".wav",
-                delete=False,
-            ) as temp_file:
-
-                temp_path = (
-                    temp_file.name
-                )
-
-            with wave.open(
-                temp_path,
-                "wb",
-            ) as wav_file:
-
-                wav_file.setnchannels(
-                    1
-                )
-
-                wav_file.setsampwidth(
-                    2
-                )
-
-                wav_file.setframerate(
-                    16000
-                )
-
-                wav_file.writeframes(
-                    pcm
-                )
-
-            return temp_path
-
-        except Exception:
-
-            if temp_path:
-
-                try:
-
-                    Path(
-                        temp_path
-                    ).unlink(
-                        missing_ok=True
-                    )
-
-                except Exception:
-
-                    pass
-
-            raise
-
-    # ========================================================
-    # LOCAL FASTER-WHISPER STT
-    # ========================================================
-
-    def _transcribe_local_sync(
-        self,
-        model,
-        wav_path: str,
-    ) -> str:
-
         # ----------------------------------------------------
-        # VAD SETTINGS
+        # Already WAV.
         # ----------------------------------------------------
 
-        vad_parameters = None
+        if audio.startswith(
+            b"RIFF"
+        ):
 
-        if FASTER_WHISPER_VAD:
-
-            vad_parameters = {
-                "min_silence_duration_ms": (
-                    FASTER_WHISPER_MIN_SILENCE_MS
-                ),
-            }
+            return audio
 
         # ----------------------------------------------------
-        # TRANSCRIBE
+        # Raw Discord PCM:
+        #
+        # 48kHz stereo 16-bit
+        #
+        # ↓
+        #
+        # 16kHz mono 16-bit
         # ----------------------------------------------------
 
-        kwargs: dict[str, Any] = {
-            "language": FASTER_WHISPER_LANGUAGE,
-            "beam_size": FASTER_WHISPER_BEAM_SIZE,
-            "condition_on_previous_text": (
-                FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT
-            ),
-            "vad_filter": (
-                FASTER_WHISPER_VAD
-            ),
-            "temperature": 0.0,
-        }
+        pcm = audio
 
-        if vad_parameters is not None:
-
-            kwargs[
-                "vad_parameters"
-            ] = vad_parameters
-
-        segments, info = (
-            model.transcribe(
-                wav_path,
-                **kwargs,
-            )
+        pcm = audioop.tomono(
+            pcm,
+            2,
+            0.5,
+            0.5,
         )
 
-        # faster-whisper returns a generator.
-        # We MUST iterate it for actual inference to happen.
-        segment_list = list(
-            segments
-        )
-
-        parts: list[str] = []
-
-        for segment in segment_list:
-
-            segment_text = (
-                _normalize_transcript(
-                    getattr(
-                        segment,
-                        "text",
-                        "",
-                    )
-                )
-            )
-
-            if not segment_text:
-                continue
-
-            parts.append(
-                segment_text
-            )
-
-        transcript = _normalize_transcript(
-            " ".join(parts)
-        )
-
-        # ----------------------------------------------------
-        # LANGUAGE INFO
-        # ----------------------------------------------------
-
-        detected_language = getattr(
-            info,
-            "language",
+        pcm, _ = audioop.ratecv(
+            pcm,
+            2,
+            1,
+            48000,
+            16000,
             None,
         )
 
-        try:
+        import io
 
-            language_probability = float(
-                getattr(
-                    info,
-                    "language_probability",
-                    0.0,
-                )
-                or 0.0
+        buffer = io.BytesIO()
+
+        with wave.open(
+            buffer,
+            "wb",
+        ) as wav_file:
+
+            wav_file.setnchannels(
+                1
             )
 
-        except Exception:
+            wav_file.setsampwidth(
+                2
+            )
 
-            language_probability = 0.0
+            wav_file.setframerate(
+                16000
+            )
 
-        logger.info(
-            "faster-whisper STT | "
-            "model=%s | detected_language=%s | "
-            "language_probability=%.3f | "
-            "segments=%d | transcript=%r",
-            self.transcribe_model,
-            detected_language or FASTER_WHISPER_LANGUAGE,
-            language_probability,
-            len(segment_list),
-            transcript,
+            wav_file.writeframes(
+                pcm
+            )
+
+        return buffer.getvalue()
+
+    # ========================================================
+    # GLADIA HTTP HELPER
+    # ========================================================
+
+    @staticmethod
+    def _json_request(
+        url: str,
+        *,
+        method: str,
+        headers: dict[str, str],
+        data: bytes | None = None,
+    ) -> dict[str, Any]:
+
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers=headers,
         )
 
-        return transcript
+        try:
+
+            with urllib.request.urlopen(
+                request,
+                timeout=API_TIMEOUT_SECONDS,
+            ) as response:
+
+                body = response.read()
+
+        except urllib.error.HTTPError as error:
+
+            try:
+
+                error_body = (
+                    error.read()
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                    .strip()
+                )
+
+            except Exception:
+
+                error_body = ""
+
+            if error_body:
+
+                raise RuntimeError(
+                    f"Gladia HTTP {error.code}: "
+                    f"{error_body}"
+                ) from error
+
+            raise RuntimeError(
+                f"Gladia HTTP {error.code}: "
+                f"{error.reason}"
+            ) from error
+
+        except urllib.error.URLError as error:
+
+            raise RuntimeError(
+                "Gladia connection failed: "
+                f"{error.reason}"
+            ) from error
+
+        except TimeoutError as error:
+
+            raise RuntimeError(
+                "Gladia request timed out."
+            ) from error
+
+        try:
+
+            decoded = body.decode(
+                "utf-8"
+            )
+
+            payload = json.loads(
+                decoded
+            )
+
+        except Exception as error:
+
+            raise RuntimeError(
+                "Gladia returned invalid JSON."
+            ) from error
+
+        if not isinstance(
+            payload,
+            dict,
+        ):
+
+            raise RuntimeError(
+                "Gladia returned an unexpected response."
+            )
+
+        return payload
+
+    # ========================================================
+    # GLADIA PRE-RECORDED STT
+    # ========================================================
+
+    def _upload_to_gladia_sync(
+        self,
+        wav_data: bytes,
+    ) -> str:
+
+        # ----------------------------------------------------
+        # Upload WAV to Gladia.
+        # ----------------------------------------------------
+
+        headers = {
+            "x-gladia-key": (
+                self.gladia_api_key
+            ),
+            "Content-Type": "audio/wav",
+            "Accept": "application/json",
+            "User-Agent": "CloudVoiceAI/1.0",
+        }
+
+        request = urllib.request.Request(
+            GLADIA_UPLOAD_ENDPOINT,
+            data=wav_data,
+            method="POST",
+            headers=headers,
+        )
+
+        try:
+
+            with urllib.request.urlopen(
+                request,
+                timeout=API_TIMEOUT_SECONDS,
+            ) as response:
+
+                body = response.read()
+
+        except urllib.error.HTTPError as error:
+
+            try:
+
+                error_body = (
+                    error.read()
+                    .decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                    .strip()
+                )
+
+            except Exception:
+
+                error_body = ""
+
+            if error_body:
+
+                raise RuntimeError(
+                    f"Gladia upload HTTP "
+                    f"{error.code}: {error_body}"
+                ) from error
+
+            raise RuntimeError(
+                f"Gladia upload HTTP "
+                f"{error.code}: {error.reason}"
+            ) from error
+
+        except urllib.error.URLError as error:
+
+            raise RuntimeError(
+                "Gladia upload connection failed: "
+                f"{error.reason}"
+            ) from error
+
+        except TimeoutError as error:
+
+            raise RuntimeError(
+                "Gladia upload request timed out."
+            ) from error
+
+        try:
+
+            payload = json.loads(
+                body.decode(
+                    "utf-8"
+                )
+            )
+
+        except Exception as error:
+
+            raise RuntimeError(
+                "Gladia upload returned invalid JSON."
+            ) from error
+
+        if not isinstance(
+            payload,
+            dict,
+        ):
+
+            raise RuntimeError(
+                "Gladia upload returned an unexpected response."
+            )
+
+        audio_url = (
+            payload.get(
+                "audio_url"
+            )
+            or payload.get(
+                "url"
+            )
+        )
+
+        if not audio_url:
+
+            raise RuntimeError(
+                "Gladia upload did not return an audio URL."
+            )
+
+        return str(
+            audio_url
+        )
+
+    def _start_gladia_transcription_sync(
+        self,
+        audio_url: str,
+    ) -> dict[str, Any]:
+
+        # ----------------------------------------------------
+        # Create a pre-recorded transcription job.
+        # ----------------------------------------------------
+
+        payload: dict[str, Any] = {
+            "audio_url": audio_url,
+            "language_config": {
+                "languages": [
+                    GLADIA_STT_LANGUAGE,
+                ],
+            },
+        }
+
+        if GLADIA_DIARIZATION:
+
+            payload[
+                "diarization"
+            ] = True
+
+        if GLADIA_SUBTITLES:
+
+            payload[
+                "subtitles"
+            ] = True
+
+        request_data = json.dumps(
+            payload,
+            ensure_ascii=False,
+        ).encode(
+            "utf-8"
+        )
+
+        headers = {
+            "x-gladia-key": (
+                self.gladia_api_key
+            ),
+            "Content-Type": (
+                "application/json"
+            ),
+            "Accept": "application/json",
+            "User-Agent": "CloudVoiceAI/1.0",
+        }
+
+        result = self._json_request(
+            GLADIA_STT_ENDPOINT,
+            method="POST",
+            headers=headers,
+            data=request_data,
+        )
+
+        return result
+
+    def _get_gladia_result_sync(
+        self,
+        result_url: str,
+    ) -> dict[str, Any]:
+
+        headers = {
+            "x-gladia-key": (
+                self.gladia_api_key
+            ),
+            "Accept": "application/json",
+            "User-Agent": "CloudVoiceAI/1.0",
+        }
+
+        return self._json_request(
+            result_url,
+            method="GET",
+            headers=headers,
+        )
+
+    @staticmethod
+    def _extract_gladia_transcript(
+        payload: dict[str, Any],
+    ) -> str:
+
+        # ----------------------------------------------------
+        # Common v2 response locations.
+        # ----------------------------------------------------
+
+        candidates: list[Any] = []
+
+        result = payload.get(
+            "result"
+        )
+
+        if isinstance(
+            result,
+            dict,
+        ):
+
+            candidates.extend(
+                (
+                    result.get(
+                        "transcription",
+                        {},
+                    ),
+                    result.get(
+                        "transcript",
+                        "",
+                    ),
+                )
+            )
+
+        candidates.extend(
+            (
+                payload.get(
+                    "transcription",
+                    {},
+                ),
+                payload.get(
+                    "transcript",
+                    "",
+                ),
+            )
+        )
+
+        # ----------------------------------------------------
+        # Search likely nested transcript fields.
+        # ----------------------------------------------------
+
+        for candidate in candidates:
+
+            if isinstance(
+                candidate,
+                str,
+            ):
+
+                text = _normalize_transcript(
+                    candidate
+                )
+
+                if text:
+
+                    return text
+
+            if isinstance(
+                candidate,
+                dict,
+            ):
+
+                for key in (
+                    "full_transcript",
+                    "text",
+                    "transcript",
+                ):
+
+                    value = candidate.get(
+                        key
+                    )
+
+                    if isinstance(
+                        value,
+                        str,
+                    ):
+
+                        text = _normalize_transcript(
+                            value
+                        )
+
+                        if text:
+
+                            return text
+
+        # ----------------------------------------------------
+        # Recursive fallback for unexpected response shapes.
+        # ----------------------------------------------------
+
+        def find_text(
+            value: Any,
+        ) -> str:
+
+            if isinstance(
+                value,
+                dict,
+            ):
+
+                for key in (
+                    "full_transcript",
+                    "transcript",
+                    "text",
+                ):
+
+                    item = value.get(
+                        key
+                    )
+
+                    if isinstance(
+                        item,
+                        str,
+                    ):
+
+                        normalized = (
+                            _normalize_transcript(
+                                item
+                            )
+                        )
+
+                        if normalized:
+
+                            return normalized
+
+                for item in value.values():
+
+                    found = find_text(
+                        item
+                    )
+
+                    if found:
+
+                        return found
+
+            elif isinstance(
+                value,
+                list,
+            ):
+
+                for item in value:
+
+                    found = find_text(
+                        item
+                    )
+
+                    if found:
+
+                        return found
+
+            return ""
+
+        return find_text(
+            payload
+        )
+
+    def _transcribe_gladia_sync(
+        self,
+        wav_data: bytes,
+    ) -> str:
+
+        logger.info(
+            "Gladia STT upload | model=%s | "
+            "language=%s | bytes=%d",
+            self.transcribe_model,
+            GLADIA_STT_LANGUAGE,
+            len(wav_data),
+        )
+
+        audio_url = (
+            self._upload_to_gladia_sync(
+                wav_data
+            )
+        )
+
+        logger.debug(
+            "Gladia upload complete"
+        )
+
+        result = (
+            self._start_gladia_transcription_sync(
+                audio_url
+            )
+        )
+
+        # ----------------------------------------------------
+        # Depending on the API response, a polling URL may
+        # be returned.
+        # ----------------------------------------------------
+
+        result_url = (
+            result.get(
+                "result_url"
+            )
+            or result.get(
+                "url"
+            )
+            or result.get(
+                "result",
+                {},
+            ).get(
+                "url",
+            )
+            if isinstance(
+                result.get(
+                    "result",
+                    {},
+                ),
+                dict,
+            )
+            else None
+        )
+
+        transcript = (
+            self._extract_gladia_transcript(
+                result
+            )
+        )
+
+        if transcript:
+
+            return transcript
+
+        if not result_url:
+
+            status = str(
+                result.get(
+                    "status",
+                    "",
+                )
+                or ""
+            ).lower()
+
+            result_id = (
+                result.get(
+                    "id"
+                )
+            )
+
+            if result_id:
+
+                result_url = (
+                    f"{GLADIA_STT_ENDPOINT}/"
+                    f"{result_id}"
+                )
+
+            elif status in {
+                "done",
+                "completed",
+                "success",
+            }:
+
+                raise RuntimeError(
+                    "Gladia finished but no transcript "
+                    "was found in the response."
+                )
+
+        if not result_url:
+
+            raise RuntimeError(
+                "Gladia did not provide a transcription result URL."
+            )
+
+        started = (
+            asyncio.get_event_loop_policy()
+            .time()
+            if hasattr(
+                asyncio.get_event_loop_policy(),
+                "time",
+            )
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # Poll until final result.
+        #
+        # This function runs in a worker thread, so ordinary
+        # time.monotonic is preferable here.
+        # ----------------------------------------------------
+
+        import time as _time
+
+        polling_started = _time.monotonic()
+
+        while (
+            _time.monotonic()
+            - polling_started
+            < GLADIA_MAX_POLL_SECONDS
+        ):
+
+            current = (
+                self._get_gladia_result_sync(
+                    str(result_url)
+                )
+            )
+
+            transcript = (
+                self._extract_gladia_transcript(
+                    current
+                )
+            )
+
+            if transcript:
+
+                status = str(
+                    current.get(
+                        "status",
+                        "",
+                    )
+                    or ""
+                ).lower()
+
+                if status in {
+                    "",
+                    "done",
+                    "completed",
+                    "success",
+                    "finished",
+                }:
+
+                    return transcript
+
+            status = str(
+                current.get(
+                    "status",
+                    "",
+                )
+                or ""
+            ).lower()
+
+            if status in {
+                "error",
+                "failed",
+                "failure",
+                "cancelled",
+            }:
+
+                raise RuntimeError(
+                    "Gladia transcription failed: "
+                    f"{current}"
+                )
+
+            _time.sleep(
+                GLADIA_POLL_INTERVAL
+            )
+
+        raise RuntimeError(
+            "Gladia transcription timed out."
+        )
 
     async def transcribe(
         self,
@@ -1331,63 +1678,44 @@ class GeminiEngine:
 
         _ = mime_type
 
-        wav_path = (
-            self._ensure_wav_file(
-                audio
+        wav_data = (
+            await asyncio.to_thread(
+                self._ensure_wav_bytes,
+                audio,
             )
         )
 
-        try:
+        transcript = await self._with_retry(
+            lambda: self._transcribe_gladia_sync(
+                wav_data
+            ),
+            operation_name="Gladia STT",
+        )
 
-            model = (
-                await self._get_whisper_model()
+        transcript = _limit_text(
+            _normalize_transcript(
+                transcript
+            ),
+            MAX_TRANSCRIPT_LENGTH,
+        )
+
+        if not transcript:
+
+            logger.warning(
+                "Gladia STT returned empty transcript."
             )
 
-            transcript = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._transcribe_local_sync,
-                    model,
-                    wav_path,
-                ),
-                timeout=API_TIMEOUT_SECONDS,
-            )
+            return ""
 
-            transcript = _limit_text(
-                transcript,
-                MAX_TRANSCRIPT_LENGTH,
-            )
+        logger.info(
+            "Gladia STT FINAL | "
+            "model=%s | language=%s | transcript=%r",
+            self.transcribe_model,
+            GLADIA_STT_LANGUAGE,
+            transcript,
+        )
 
-            if not transcript:
-
-                logger.warning(
-                    "faster-whisper returned no transcript."
-                )
-
-                return ""
-
-            logger.info(
-                "Local STT transcript | transcript=%r",
-                transcript,
-            )
-
-            return transcript
-
-        finally:
-
-            try:
-
-                Path(
-                    wav_path
-                ).unlink(
-                    missing_ok=True
-                )
-
-            except Exception:
-
-                logger.warning(
-                    "Failed to remove STT temp file: %s",
-                    wav_path,
-                )
+        return transcript
 
     # ========================================================
     # MEMORY
@@ -1734,8 +2062,6 @@ class GeminiEngine:
             )
         )
 
-        # Current Groq TTS endpoint does not
-        # use this value directly.
         _ = speed
 
         temp_path: str | None = None
@@ -1777,6 +2103,7 @@ class GeminiEngine:
                 )
 
                 if frame_count <= 0:
+
                     return b""
 
                 pcm = wav_file.readframes(
@@ -2021,7 +2348,7 @@ class GeminiEngine:
             if not transcript:
 
                 result["error"] = (
-                    "Speech rejected by local STT."
+                    "Speech rejected by STT."
                 )
 
                 return result
@@ -2134,7 +2461,7 @@ class GeminiEngine:
                 self.quota_exhausted = True
 
                 logger.error(
-                    "API rate limit/quota reached."
+                    "API rate limit/quota/credit limit reached."
                 )
 
             else:
@@ -2155,12 +2482,22 @@ class GeminiEngine:
 
         return {
             "voice": self.voice,
+
             "memory_size": self.memory_size(),
             "memory_limit": VOICE_MEMORY_LIMIT,
             "memory_enabled": MEMORY_ENABLED,
-            "processed_requests": self.processed_requests,
-            "failed_requests": self.failed_requests,
-            "quota_exhausted": self.quota_exhausted,
+
+            "processed_requests": (
+                self.processed_requests
+            ),
+
+            "failed_requests": (
+                self.failed_requests
+            ),
+
+            "quota_exhausted": (
+                self.quota_exhausted
+            ),
 
             # ------------------------------------------------
             # CHAT
@@ -2173,21 +2510,20 @@ class GeminiEngine:
             # STT
             # ------------------------------------------------
 
-            "transcribe_provider": "faster-whisper",
-            "transcribe_model": self.transcribe_model,
-            "stt_language": FASTER_WHISPER_LANGUAGE,
-            "stt_device": FASTER_WHISPER_DEVICE,
-            "stt_compute_type": (
-                FASTER_WHISPER_COMPUTE_TYPE
+            "transcribe_provider": "Gladia",
+            "transcribe_model": (
+                self.transcribe_model
             ),
-            "stt_cpu_threads": (
-                FASTER_WHISPER_CPU_THREADS
+            "stt_language": (
+                GLADIA_STT_LANGUAGE
             ),
-            "stt_beam_size": (
-                FASTER_WHISPER_BEAM_SIZE
-            ),
-            "stt_vad": FASTER_WHISPER_VAD,
             "stt_filter": "none",
+            "stt_diarization": (
+                GLADIA_DIARIZATION
+            ),
+            "stt_subtitles": (
+                GLADIA_SUBTITLES
+            ),
 
             # ------------------------------------------------
             # TTS
@@ -2207,11 +2543,6 @@ class GeminiEngine:
         self,
     ) -> None:
 
-        # faster-whisper model is managed in-process by
-        # CTranslate2. There is no network client that needs
-        # an explicit async close here.
-
-        self._whisper_model = None
         self.groq = None
 
 
